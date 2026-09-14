@@ -81,6 +81,115 @@ for profile in quality balanced compact mini; do
     fi
 done
 
+# apex configs (pre-date shortconv support; committed files use mixed-case type
+# names, e.g. q6_K, while the generator now emits Q6_K). Treat them like qwen36.
+# NOTE: apex_mini.txt and apex_tq_mini.txt were hand-tuned (NEAR experts set to
+# iq2_s instead of generator's Q3_K) so they cannot serve as strict oracles.
+for profile in quality balanced compact; do
+    committed="${REPO_ROOT}/configs/apex_${profile}.txt"
+    [ -f "$committed" ] || continue
+    "$GEN" --profile "$profile" --layers 40 --dense-layers 0 -o "$TMP/regen.txt" 2>/dev/null
+    if diff <(grep -v 'shortconv' "$committed" | tr '[:upper:]' '[:lower:]') \
+            <(grep -v 'shortconv' "$TMP/regen.txt" | tr '[:upper:]' '[:lower:]') >/dev/null 2>&1; then
+        ok "apex_${profile} matches apart from known shortconv/case drift"
+    else
+        bad "apex_${profile} drifted beyond shortconv/case" \
+            "$(diff <(grep -v 'shortconv' "$committed" | tr '[:upper:]' '[:lower:]') <(grep -v 'shortconv' "$TMP/regen.txt" | tr '[:upper:]' '[:lower:]') | head -3 | tr '\n' ' ')"
+    fi
+done
+
+for profile in tq-quality tq-balanced tq-compact; do
+    committed="${REPO_ROOT}/configs/apex_${profile}.txt"
+    [ -f "$committed" ] || continue
+    "$GEN" --profile "$profile" --layers 40 -o "$TMP/regen.txt" 2>/dev/null
+    if diff <(grep -v 'shortconv' "$committed" | tr '[:upper:]' '[:lower:]') \
+            <(grep -v 'shortconv' "$TMP/regen.txt" | tr '[:upper:]' '[:lower:]') >/dev/null 2>&1; then
+        ok "apex_${profile} matches apart from known shortconv/case drift"
+    else
+        bad "apex_${profile} drifted beyond shortconv/case" \
+            "$(diff <(grep -v 'shortconv' "$committed" | tr '[:upper:]' '[:lower:]') <(grep -v 'shortconv' "$TMP/regen.txt" | tr '[:upper:]' '[:lower:]') | head -3 | tr '\n' ' ')"
+    fi
+done
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TQ profile behavioural tests
+# ─────────────────────────────────────────────────────────────────────────────
+echo
+echo "TQ profile behaviour (TurboQuant attention types)"
+
+L40=40
+
+# tq-quality: mid-layer attention must be tq4_1s, edge must be Q6_K
+"$GEN" --profile tq-quality --layers "$L40" -o "$TMP/tq_quality.txt" 2>/dev/null
+mid_attn=$(grep 'blk\.10\.attn_q=' "$TMP/tq_quality.txt" | sed 's/.*=//')
+edge_attn=$(grep 'blk\.0\.attn_q=' "$TMP/tq_quality.txt" | sed 's/.*=//')
+if [ "$mid_attn" = tq4_1s ] && [ "$edge_attn" = Q6_K ]; then
+    ok "tq-quality: mid attn=tq4_1s, edge attn=Q6_K"
+else
+    bad "tq-quality: mid attn=$mid_attn, edge attn=$edge_attn"
+fi
+
+# tq-balanced: same TQ type pattern
+"$GEN" --profile tq-balanced --layers "$L40" -o "$TMP/tq_balanced.txt" 2>/dev/null
+mid_attn=$(grep 'blk\.15\.attn_q=' "$TMP/tq_balanced.txt" | sed 's/.*=//')
+if [ "$mid_attn" = tq4_1s ]; then
+    ok "tq-balanced: mid attn=tq4_1s"
+else
+    bad "tq-balanced: mid attn=$mid_attn (expected tq4_1s)"
+fi
+
+# tq-compact: mid-layer attention must be tq4_1s
+"$GEN" --profile tq-compact --layers "$L40" -o "$TMP/tq_compact.txt" 2>/dev/null
+mid_attn=$(grep 'blk\.20\.attn_q=' "$TMP/tq_compact.txt" | sed 's/.*=//')
+if [ "$mid_attn" = tq4_1s ]; then
+    ok "tq-compact: mid attn=tq4_1s"
+else
+    bad "tq-compact: mid attn=$mid_attn (expected tq4_1s)"
+fi
+
+# tq-mini: mid-layer attention must be TQ3_1S
+"$GEN" --profile tq-mini --layers "$L40" -o "$TMP/tq_mini.txt" 2>/dev/null
+mid_attn=$(grep 'blk\.20\.attn_q=' "$TMP/tq_mini.txt" | sed 's/.*=//')
+if [ "$mid_attn" = TQ3_1S ]; then
+    ok "tq-mini: mid attn=TQ3_1S"
+else
+    bad "tq-mini: mid attn=$mid_attn (expected TQ3_1S)"
+fi
+
+# tq-nano: mid-layer attention must be TQ3_1S, mid experts must be iq2_xxs
+"$GEN" --profile tq-nano --layers "$L40" -o "$TMP/tq_nano.txt" 2>/dev/null
+mid_attn=$(grep 'blk\.20\.attn_q=' "$TMP/tq_nano.txt" | sed 's/.*=//')
+mid_exp=$(grep 'blk\.20\.ffn_gate_exps=' "$TMP/tq_nano.txt" | sed 's/.*=//')
+if [ "$mid_attn" = TQ3_1S ] && [ "$mid_exp" = iq2_xxs ]; then
+    ok "tq-nano: mid attn=TQ3_1S, mid exp=iq2_xxs"
+else
+    bad "tq-nano: mid attn=$mid_attn, mid exp=$mid_exp (expected TQ3_1S, iq2_xxs)"
+fi
+
+# tq-micro: mid-layer attention must be TQ3_1S, mid experts must be iq1_m
+"$GEN" --profile tq-micro --layers "$L40" -o "$TMP/tq_micro.txt" 2>/dev/null
+mid_attn=$(grep 'blk\.20\.attn_q=' "$TMP/tq_micro.txt" | sed 's/.*=//')
+mid_exp=$(grep 'blk\.20\.ffn_gate_exps=' "$TMP/tq_micro.txt" | sed 's/.*=//')
+if [ "$mid_attn" = TQ3_1S ] && [ "$mid_exp" = iq1_m ]; then
+    ok "tq-micro: mid attn=TQ3_1S, mid exp=iq1_m"
+else
+    bad "tq-micro: mid attn=$mid_attn, mid exp=$mid_exp (expected TQ3_1S, iq1_m)"
+fi
+
+# ATTN_WIDE_BOUNDS: edge layers 3,4 must use EDGE_ATTN (not MID_ATTN)
+for profile in tq-quality tq-balanced tq-compact tq-mini tq-nano tq-micro; do
+    "$GEN" --profile "$profile" --layers "$L40" -o "$TMP/tt.txt" 2>/dev/null
+    l3_attn=$(grep 'blk\.3\.attn_q=' "$TMP/tt.txt" | sed 's/.*=//')
+    l3_exp=$(grep 'blk\.3\.ffn_gate_exps=' "$TMP/tt.txt" | sed 's/.*=//')
+    # L3 is in EDGE zone (0..4), so attn should equal EDGE_ATTN, not MID_ATTN
+    l5_attn=$(grep 'blk\.5\.attn_q=' "$TMP/tt.txt" | sed 's/.*=//')
+    if [ "$l3_attn" != "$l5_attn" ]; then
+        ok "wide bounds: ${profile} layer 3 attn ($l3_attn) differs from layer 5 ($l5_attn)"
+    else
+        bad "wide bounds: ${profile} layer 3 and 5 both use $l3_attn — ATTN_WIDE_BOUNDS not applied"
+    fi
+done
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Dense/hybrid mode
 # ─────────────────────────────────────────────────────────────────────────────

@@ -21,6 +21,12 @@
 #   mini        Q3_K edge / IQ2_S mid experts, Q5_K/Q4_K shared, Q4_K/Q3_K attn
 #   nano        Q3_K edge / IQ2_S near / IQ2_XXS mid experts (2.06 bpw mid) — needs imatrix
 #   micro       Q3_K edge / IQ2_XS near / IQ1_M mid experts (1.75 bpw mid) — needs imatrix, experimental
+#   tq-quality  quality + TurboQuant attention (tq4_1s) in mid layers — uses wide attention bounds
+#   tq-balanced balanced + TurboQuant attention (tq4_1s) in mid layers — uses wide attention bounds
+#   tq-compact  compact + TurboQuant attention (tq4_1s) in mid layers — uses wide attention bounds
+#   tq-mini     mini + TurboQuant attention (TQ3_1S) in mid layers — needs imatrix, no i-variant
+#   tq-nano     nano + TurboQuant attention (TQ3_1S) in mid layers — needs imatrix, no i-variant
+#   tq-micro    micro + TurboQuant attention (TQ3_1S) in mid layers — needs imatrix, no i-variant
 #   custom      Specify each type manually via flags
 #
 # Dense/hybrid profiles (--arch dense is implied; for models whose FFN is dense,
@@ -45,6 +51,7 @@ LAYERS=40
 OUTPUT=""
 DENSE_LAYERS=0                    # leading dense (non-MoE) FFN layers, e.g. LFM2-MoE
 ARCH=moe                          # moe | dense — selects which emitter runs
+ATTN_WIDE_BOUNDS=0                # 1 = attention uses expert-zone boundaries (TQ profiles)
 # Custom mode overrides
 EDGE_EXP="" NEAR_EXP="" MID_EXP=""
 EDGE_SHARED="" MID_SHARED=""
@@ -155,6 +162,66 @@ case "$PROFILE" in
         EDGE_ATTN="${EDGE_ATTN:-Q4_K}"
         MID_ATTN="${MID_ATTN:-Q3_K}"
         ;;
+    tq-quality|i-tq-quality)
+        ATTN_WIDE_BOUNDS=1
+        EDGE_EXP="${EDGE_EXP:-Q6_K}"
+        NEAR_EXP="${NEAR_EXP:-Q5_K}"
+        MID_EXP="${MID_EXP:-iq4_xs}"
+        EDGE_SHARED="${EDGE_SHARED:-Q8_0}"
+        MID_SHARED="${MID_SHARED:-Q8_0}"
+        EDGE_ATTN="${EDGE_ATTN:-Q6_K}"
+        MID_ATTN="${MID_ATTN:-tq4_1s}"
+        ;;
+    tq-balanced|i-tq-balanced)
+        ATTN_WIDE_BOUNDS=1
+        EDGE_EXP="${EDGE_EXP:-Q6_K}"
+        NEAR_EXP="${NEAR_EXP:-Q5_K}"
+        MID_EXP="${MID_EXP:-Q5_K}"
+        EDGE_SHARED="${EDGE_SHARED:-Q8_0}"
+        MID_SHARED="${MID_SHARED:-Q8_0}"
+        EDGE_ATTN="${EDGE_ATTN:-Q6_K}"
+        MID_ATTN="${MID_ATTN:-tq4_1s}"
+        ;;
+    tq-compact|i-tq-compact)
+        ATTN_WIDE_BOUNDS=1
+        EDGE_EXP="${EDGE_EXP:-Q4_K}"
+        NEAR_EXP="${NEAR_EXP:-Q3_K}"
+        MID_EXP="${MID_EXP:-Q3_K}"
+        EDGE_SHARED="${EDGE_SHARED:-Q6_K}"
+        MID_SHARED="${MID_SHARED:-Q6_K}"
+        EDGE_ATTN="${EDGE_ATTN:-Q4_K}"
+        MID_ATTN="${MID_ATTN:-tq4_1s}"
+        ;;
+    tq-mini)
+        ATTN_WIDE_BOUNDS=1
+        EDGE_EXP="${EDGE_EXP:-Q3_K}"
+        NEAR_EXP="${NEAR_EXP:-Q3_K}"
+        MID_EXP="${MID_EXP:-iq2_s}"
+        EDGE_SHARED="${EDGE_SHARED:-Q5_K}"
+        MID_SHARED="${MID_SHARED:-Q4_K}"
+        EDGE_ATTN="${EDGE_ATTN:-Q4_K}"
+        MID_ATTN="${MID_ATTN:-TQ3_1S}"
+        ;;
+    tq-nano)
+        ATTN_WIDE_BOUNDS=1
+        EDGE_EXP="${EDGE_EXP:-Q3_K}"
+        NEAR_EXP="${NEAR_EXP:-iq2_s}"
+        MID_EXP="${MID_EXP:-iq2_xxs}"
+        EDGE_SHARED="${EDGE_SHARED:-Q5_K}"
+        MID_SHARED="${MID_SHARED:-Q4_K}"
+        EDGE_ATTN="${EDGE_ATTN:-Q4_K}"
+        MID_ATTN="${MID_ATTN:-TQ3_1S}"
+        ;;
+    tq-micro)
+        ATTN_WIDE_BOUNDS=1
+        EDGE_EXP="${EDGE_EXP:-Q3_K}"
+        NEAR_EXP="${NEAR_EXP:-iq2_xs}"
+        MID_EXP="${MID_EXP:-iq1_m}"
+        EDGE_SHARED="${EDGE_SHARED:-Q5_K}"
+        MID_SHARED="${MID_SHARED:-Q4_K}"
+        EDGE_ATTN="${EDGE_ATTN:-Q4_K}"
+        MID_ATTN="${MID_ATTN:-TQ3_1S}"
+        ;;
     dense-flat|dense-grad|dense-hybrid|dense-hybrid-quality)
         ARCH=dense
         # Shared across the three Q4-band arms: attention/embedding allocation
@@ -204,7 +271,7 @@ case "$PROFILE" in
         ;;
     *)
         echo "Error: unknown profile '$PROFILE'" >&2
-        echo "Available: quality, i-quality, balanced, i-balanced, compact, i-compact, mini, nano, i-nano, micro, i-micro, custom" >&2
+        echo "Available: quality, i-quality, balanced, i-balanced, compact, i-compact, mini, nano, i-nano, micro, i-micro, tq-quality, i-tq-quality, tq-balanced, i-tq-balanced, tq-compact, i-tq-compact, tq-mini, tq-nano, tq-micro, custom" >&2
         echo "Dense:     dense-flat, dense-grad, dense-hybrid, dense-hybrid-quality" >&2
         exit 1
         ;;
@@ -245,10 +312,18 @@ generate() {
         fi
 
         # Attention type based on layer position
-        if (( i <= 2 || i >= LAYERS - 3 )); then
-            attn_type="$EDGE_ATTN"
+        if [ "$ATTN_WIDE_BOUNDS" -eq 1 ]; then
+            if (( i <= EDGE_HI || i >= EDGE_LO )); then
+                attn_type="$EDGE_ATTN"
+            else
+                attn_type="$MID_ATTN"
+            fi
         else
-            attn_type="$MID_ATTN"
+            if (( i <= 2 || i >= LAYERS - 3 )); then
+                attn_type="$EDGE_ATTN"
+            else
+                attn_type="$MID_ATTN"
+            fi
         fi
 
         if (( i < DENSE_LAYERS )); then
