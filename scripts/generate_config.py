@@ -48,14 +48,15 @@ import sys
 
 # Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn)
 PROFILES = {
-    "quality":      ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "Q6_K"),
     "balanced":     ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "Q6_K"),
+    "quality":      ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "Q6_K"),
     "compact":      ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "Q4_K"),
     "mini":         ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "Q3_K"),
     "nano":         ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "Q3_K"),
     "micro":        ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "Q3_K"),
-    "tq-quality":   ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "tq4_1s"),
+
     "tq-balanced":  ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "tq4_1s"),
+    "tq-quality":   ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "tq4_1s"),
     "tq-compact":   ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "tq4_1s"),
     "tq-mini":      ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "TQ3_1S"),
     "tq-nano":      ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "TQ3_1S"),
@@ -241,10 +242,11 @@ def resolve_dense_profile(profile, layers, args):
 
 def get_zone(i, layers):
     """Return zone name for layer index: 'edge', 'near', or 'mid'."""
-    edge_hi = 4
-    edge_lo = layers - 5
-    near_hi = 9
-    near_lo = layers - 10
+    zone_size = max(1, round(layers * 5 / 40))
+    edge_hi = zone_size - 1
+    edge_lo = layers - zone_size
+    near_hi = 2 * zone_size - 1
+    near_lo = layers - 2 * zone_size
 
     if i <= edge_hi or i >= edge_lo:
         return "edge"
@@ -281,7 +283,8 @@ def generate_moe(cfg):
             else:
                 attn_type = types["mid_attn"]
         else:
-            if i <= 2 or i >= layers - 3:
+            attn_edge_size = max(1, round(layers * 3 / 40))
+            if i < attn_edge_size or i >= layers - attn_edge_size:
                 attn_type = types["edge_attn"]
             else:
                 attn_type = types["mid_attn"]
