@@ -55,6 +55,11 @@ PROFILES = {
     "nano":         ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "Q3_K"),
     "micro":        ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "Q3_K"),
 
+    "tier1":        ("Q8_K",   "Q8_K",   "Q5_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0"),
+    "tier2":        ("Q8_K",   "Q5_K",   "Q4_K",   "Q8_0", "Q5_K", "Q8_0", "Q5_K"),
+    "tier3":        ("Q5_K",   "Q4_K",   "Q3_K",   "Q8_0", "Q5_K", "Q5_K", "Q4_K"),
+    "tier4":        ("Q4_K",   "Q3_K",   "Q2_K",   "Q5_K", "Q4_K", "Q4_K", "Q3_K"),
+
     "tq-balanced":  ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "tq4_1s"),
     "tq-quality":   ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "tq4_1s"),
     "tq-compact":   ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "tq4_1s"),
@@ -263,7 +268,10 @@ def generate_moe(cfg):
     dense_layers = cfg["dense_layers"]
     types = cfg["types"]
     attn_wide = cfg["attn_wide"]
+    embd_type = "Q8_0"
 
+    lines.append(f"token_embd.weight={embd_type}")
+    
     for i in range(layers):
         zone = get_zone(i, layers)
 
