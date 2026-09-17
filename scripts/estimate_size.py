@@ -219,9 +219,11 @@ def main():
         print(f"tensors:   {len(tensors)}, {total_params / 1e9:.2f} B params total")
         print(f"rules:     {len(rules)} (uncovered fall back to {base}: {uncovered})")
         print(f"\nestimated output size: {size_gb:.2f} GB\n")
-        print(f"{'type':<14}{'params':>12}{'share':>9}")
+        print(f"{'type':<14}{'params':>12}{'share':>9}{'size':>10}")
         for qtype, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
-            print(f"{qtype:<14}{n / 1e9:>10.3f} B{100 * n / total_params:>8.1f}%")
+            bpw = BPW.get(qtype, 32.0)
+            gb = n * bpw / 8 / 1e9
+            print(f"{qtype:<14}{n / 1e9:>10.3f} B{100 * n / total_params:>8.1f}%{gb:>9.2f} GB")
     finally:
         if tmpfile:
             os.unlink(tmpfile.name)
