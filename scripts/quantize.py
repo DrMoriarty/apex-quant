@@ -14,6 +14,9 @@ Usage:
   # Generate config only (no quantization)
   ./scripts/quantize.py --profile quality --generate-config -o config.txt
 
+  # Estimate output size (no quantization)
+  ./scripts/quantize.py --profile balanced --dry-run input.gguf
+
 Profiles: quality, i-quality, balanced, i-balanced, compact, i-compact, mini, custom
 
 Environment:
@@ -83,6 +86,8 @@ def main():
                         help="Number of transformer layers (default: 40)")
     parser.add_argument("--generate-config", action="store_true",
                         help="Generate config only (no quantization)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Estimate output size without quantizing")
     parser.add_argument("-o", "--output",
                         help="Output config file (for --generate-config)")
     parser.add_argument("input", nargs="?", help="Input GGUF file")
@@ -135,13 +140,31 @@ def main():
     if args.generate_config:
         sys.exit(0)
 
-    # Need input and output
-    if not args.input or not args.output_file:
-        parser.error("Usage: quantize.py --profile <profile> <input.gguf> <output.gguf>")
+    # Need at least input
+    if not args.input:
+        parser.error("Input GGUF file is required")
 
     if not os.path.isfile(args.input):
         print(f"ERROR: Input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
+
+    # Dry-run: estimate size without quantizing
+    if args.dry_run:
+        est_cmd = [sys.executable, os.path.join(SCRIPT_DIR, "estimate_size.py"),
+                   "--profile", args.profile, "--layers", str(args.layers),
+                   "--base-type", args.base_type, args.input]
+        if config_file:
+            est_cmd.extend(["--config", config_file])
+        try:
+            subprocess.run(est_cmd, check=True)
+        finally:
+            if tmpfile:
+                os.unlink(tmpfile.name)
+        sys.exit(0)
+
+    # Need output for actual quantization
+    if not args.output_file:
+        parser.error("Output GGUF file is required (or use --dry-run / --generate-config)")
 
     # Find llama-quantize
     quantize_bin = find_quantize()
