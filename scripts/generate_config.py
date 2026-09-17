@@ -44,6 +44,7 @@ allocations is only interpretable if the arms are the same size.
 """
 
 import argparse
+import math
 import sys
 
 # Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn)
@@ -246,17 +247,30 @@ def resolve_dense_profile(profile, layers, args):
     }
 
 
-def get_zone(i, layers):
-    """Return zone name for layer index: 'edge', 'near', or 'mid'."""
-    zone_size = max(1, round(layers * 5 / 40))
-    edge_hi = zone_size - 1
-    edge_lo = layers - zone_size
-    near_hi = 2 * zone_size - 1
-    near_lo = layers - 2 * zone_size
+def get_zone(i, layers, dense_layers=0):
+    """Return zone name for layer index: 'edge', 'near', or 'mid'.
 
-    if i <= edge_hi or i >= edge_lo:
+    Dense layers (indices 0..dense_layers-1) are always 'edge'.
+    The remaining layers are split into edge/near/mid with ceil rounding
+    for edge and near per-side sizes.
+    """
+    non_dense = layers - dense_layers
+    zone_size = max(1, math.ceil(non_dense * 5 / 40))
+
+    # Dense layers are always edge
+    if i < dense_layers:
         return "edge"
-    elif i <= near_hi or i >= near_lo:
+
+    # Virtual index within non-dense layers
+    j = i - dense_layers
+    edge_hi = zone_size - 1
+    edge_lo = non_dense - zone_size
+    near_hi = 2 * zone_size - 1
+    near_lo = non_dense - 2 * zone_size
+
+    if j <= edge_hi or j >= edge_lo:
+        return "edge"
+    elif j <= near_hi or j >= near_lo:
         return "near"
     else:
         return "mid"
@@ -274,7 +288,7 @@ def generate_moe(cfg):
     lines.append(f"token_embd.weight={embd_type}")
     
     for i in range(layers):
-        zone = get_zone(i, layers)
+        zone = get_zone(i, layers, dense_layers)
 
         # Expert type
         exp_type = types[f"{zone}_exp"]
@@ -292,8 +306,9 @@ def generate_moe(cfg):
             else:
                 attn_type = types["mid_attn"]
         else:
-            attn_edge_size = max(1, round(layers * 3 / 40))
-            if i < attn_edge_size or i >= layers - attn_edge_size:
+            non_dense = layers - dense_layers
+            attn_edge_size = max(1, math.ceil(non_dense * 3 / 40))
+            if i < dense_layers + attn_edge_size or i >= layers - attn_edge_size:
                 attn_type = types["edge_attn"]
             else:
                 attn_type = types["mid_attn"]
