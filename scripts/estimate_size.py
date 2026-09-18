@@ -124,6 +124,7 @@ def estimate(tensors, rules, base):
     total_bits = 0.0
     by_type = defaultdict(int)
     uncovered = 0
+    uncovered_names = []
 
     for name, numel in tensors:
         if numel < F32_FLOOR:
@@ -135,6 +136,7 @@ def estimate(tensors, rules, base):
         if qtype is None:
             qtype = base
             uncovered += 1
+            uncovered_names.append(name)
 
         if qtype not in BPW:
             raise SystemExit(f"Unknown quant type {qtype!r} (tensor {name})")
@@ -143,7 +145,7 @@ def estimate(tensors, rules, base):
         by_type[qtype] += numel
 
     size_gb = total_bits / 8 / 1e9
-    return size_gb, by_type, uncovered
+    return size_gb, by_type, uncovered, uncovered_names
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -163,6 +165,8 @@ def main():
                         help="Number of transformer layers (default: 40)")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Print size in GB only")
+    parser.add_argument("--verbose", "-v", action="store_true",
+                        help="Print list of tensors not covered by rules")
     parser.add_argument("input", help="Input GGUF file")
 
     args = parser.parse_args()
@@ -204,7 +208,7 @@ def main():
     try:
         tensors = read_gguf_tensor_list(args.input)
         rules = load_config(config_file)
-        size_gb, by_type, uncovered = estimate(tensors, rules, base)
+        size_gb, by_type, uncovered, uncovered_names = estimate(tensors, rules, base)
 
         total_params = sum(n for _, n in tensors)
 
@@ -224,6 +228,10 @@ def main():
             bpw = BPW.get(qtype, 32.0)
             gb = n * bpw / 8 / 1e9
             print(f"{qtype:<14}{n / 1e9:>10.3f} B{100 * n / total_params:>8.1f}%{gb:>9.2f} GB")
+        if args.verbose and uncovered_names:
+            print(f"\nuncovered tensors ({len(uncovered_names)}):")
+            for name in uncovered_names:
+                print(f"  {name}")
     finally:
         if tmpfile:
             os.unlink(tmpfile.name)
