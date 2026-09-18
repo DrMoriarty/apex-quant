@@ -94,7 +94,14 @@ BPW = {
     "TQ4_1S": 4.5, "TQ3_1S": 3.4375,
 }
 
-F32_FLOOR = 100_000
+ALWAYS_F32 = [
+    re.compile(r"blk\.\d+\.ffn_norm\.weight$"),
+    re.compile(r"blk\.\d+\.attn_k_norm\.weight$"),
+    re.compile(r"blk\.\d+\.attn_norm\.weight$"),
+    re.compile(r"blk\.\d+\.attn_q_norm\.weight$"),
+    re.compile(r"blk\.\d+\.ffn_gate_inp\.weight$"),
+    re.compile(r"output_norm\.weight$"),
+]
 
 
 def load_config(path):
@@ -127,9 +134,9 @@ def estimate(tensors, rules, base):
     uncovered_names = []
 
     for name, numel in tensors:
-        if numel < F32_FLOOR:
+        if any(p.fullmatch(name) for p in ALWAYS_F32):
             total_bits += numel * 32.0
-            by_type["F32 (norms)"] += numel
+            by_type["F32"] += numel
             continue
 
         qtype = match_type(name, rules)
