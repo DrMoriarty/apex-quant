@@ -47,28 +47,28 @@ import argparse
 import math
 import sys
 
-# Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn)
+# Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn, embd_type)
 PROFILES = {
-    "balanced":     ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "Q6_K"),
-    "quality":      ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "Q6_K"),
-    "compact":      ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "Q4_K"),
-    "mini":         ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "Q3_K"),
-    "nano":         ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "Q3_K"),
-    "micro":        ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "Q3_K"),
+    "balanced":     ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "Q6_K",   "Q8_0"),
+    "quality":      ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "Q6_K",   "Q8_0"),
+    "compact":      ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "Q4_K",   "Q8_0"),
+    "mini":         ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "Q3_K",   "Q8_0"),
+    "nano":         ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "Q3_K",   "Q8_0"),
+    "micro":        ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "Q3_K",   "Q8_0"),
 
-    "tier1":        ("Q8_0",   "Q6_K",   "Q5_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0"),
-    "tier2":        ("Q6_K",   "Q6_K",   "Q4_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0"),
-    "tier3":        ("Q6_K",   "Q5_K",   "Q3_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0"),
-    "tier4":        ("Q5_K",   "Q4_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K"),
-    "tier5":        ("Q4_K",   "Q3_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K"),
-    "tier6":        ("Q3_K",   "Q2_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K"),
+    "tier1":        ("Q8_0",   "Q6_K",   "Q5_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0",   "Q8_0"),
+    "tier2":        ("Q6_K",   "Q6_K",   "Q4_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0",   "Q8_0"),
+    "tier3":        ("Q6_K",   "Q5_K",   "Q3_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0",   "Q8_0"),
+    "tier4":        ("Q5_K",   "Q4_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K",   "Q8_0"),
+    "tier5":        ("Q4_K",   "Q3_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K",   "Q8_0"),
+    "tier6":        ("Q3_K",   "Q2_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K",   "Q8_0"),
 
-    "tq-balanced":  ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "tq4_1s"),
-    "tq-quality":   ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "tq4_1s"),
-    "tq-compact":   ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "tq4_1s"),
-    "tq-mini":      ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "TQ3_1S"),
-    "tq-nano":      ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "TQ3_1S"),
-    "tq-micro":     ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "TQ3_1S"),
+    "tq-balanced":  ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "tq4_1s", "Q8_0"),
+    "tq-quality":   ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "tq4_1s", "Q8_0"),
+    "tq-compact":   ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "tq4_1s", "Q8_0"),
+    "tq-mini":      ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "TQ3_1S", "Q8_0"),
+    "tq-nano":      ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "TQ3_1S", "Q8_0"),
+    "tq-micro":     ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "TQ3_1S", "Q8_0"),
 }
 
 TQ_PROFILES = {
@@ -106,6 +106,8 @@ def parse_args(argv=None):
     p.add_argument("--mid-shared", default="")
     p.add_argument("--edge-attn", default="")
     p.add_argument("--mid-attn", default="")
+    p.add_argument("--embd-type", dest="embd_type_moe", default="",
+                   help="Embedding/output tensor type for MoE profiles (default: Q8_0)")
 
     # Dense/hybrid overrides
     p.add_argument("--linattn", default="")
@@ -143,7 +145,7 @@ def resolve_profile(args):
 
     lookup = profile[2:] if profile.startswith("i-") else profile
     if lookup in PROFILES:
-        edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn = PROFILES[lookup]
+        edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn, embd_type = PROFILES[lookup]
         types = {
             "edge_exp": args.edge_exp or edge_exp,
             "near_exp": args.near_exp or near_exp,
@@ -152,6 +154,7 @@ def resolve_profile(args):
             "mid_shared": args.mid_shared or mid_shared,
             "edge_attn": args.edge_attn or edge_attn,
             "mid_attn": args.mid_attn or mid_attn,
+            "embd_type": getattr(args, "embd_type_moe", "") or embd_type,
         }
         attn_wide = lookup in TQ_PROFILES
         return {
@@ -178,6 +181,7 @@ def resolve_profile(args):
             "mid_shared": args.mid_shared or (args.edge_shared or "Q8_0"),
             "edge_attn": args.edge_attn or "Q6_K",
             "mid_attn": args.mid_attn or (args.edge_attn or "Q6_K"),
+            "embd_type": getattr(args, "embd_type_moe", "") or "Q8_0",
         }
         return {
             "arch": arch,
@@ -284,9 +288,10 @@ def generate_moe(cfg):
     dense_layers = cfg["dense_layers"]
     types = cfg["types"]
     attn_wide = cfg["attn_wide"]
-    embd_type = "Q8_0"
+    embd_type = types["embd_type"]
 
     lines.append(f"token_embd.weight={embd_type}")
+    lines.append(f"output.weight={embd_type}")
     
     for i in range(layers):
         zone = get_zone(i, layers, dense_layers)
