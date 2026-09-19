@@ -103,6 +103,17 @@ ALWAYS_F32 = [
     re.compile(r"output_norm\.weight$"),
 ]
 
+GROUP_EXPERTS = re.compile(r"blk\.\d+\.ffn_")
+GROUP_ATTENTION = re.compile(r"blk\.\d+\.attn_")
+
+
+def _classify_group(name):
+    if GROUP_EXPERTS.search(name):
+        return "Experts"
+    if GROUP_ATTENTION.search(name):
+        return "Attention"
+    return "Other"
+
 
 def load_config(path):
     rules = []
@@ -130,13 +141,20 @@ def match_type(name, rules):
 def estimate(tensors, rules, base):
     total_bits = 0.0
     by_type = defaultdict(int)
+    group_params = defaultdict(int)
+    group_bits = defaultdict(float)
     uncovered = 0
     uncovered_names = []
 
     for name, numel in tensors:
+        group = _classify_group(name)
+        group_params[group] += numel
+
         if any(p.fullmatch(name) for p in ALWAYS_F32):
-            total_bits += numel * 32.0
+            bits = numel * 32.0
+            total_bits += bits
             by_type["F32"] += numel
+            group_bits[group] += bits
             continue
 
         qtype = match_type(name, rules)
@@ -148,11 +166,13 @@ def estimate(tensors, rules, base):
         if qtype not in BPW:
             raise SystemExit(f"Unknown quant type {qtype!r} (tensor {name})")
 
-        total_bits += numel * BPW[qtype]
+        bits = numel * BPW[qtype]
+        total_bits += bits
         by_type[qtype] += numel
+        group_bits[group] += bits
 
     size_gb = total_bits / 8 / 1e9
-    return size_gb, by_type, uncovered, uncovered_names
+    return size_gb, by_type, uncovered, uncovered_names, group_params, group_bits
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -215,7 +235,7 @@ def main():
     try:
         tensors = read_gguf_tensor_list(args.input)
         rules = load_config(config_file)
-        size_gb, by_type, uncovered, uncovered_names = estimate(tensors, rules, base)
+        size_gb, by_type, uncovered, uncovered_names, group_params, group_bits = estimate(tensors, rules, base)
 
         total_params = sum(n for _, n in tensors)
 
@@ -230,7 +250,12 @@ def main():
         print(f"tensors:   {len(tensors)}, {total_params / 1e9:.2f} B params total")
         print(f"rules:     {len(rules)} (uncovered fall back to {base}: {uncovered})")
         print(f"\nestimated output size: {size_gb:.2f} GB\n")
-        print(f"{'type':<14}{'params':>12}{'share':>9}{'size':>10}")
+        print(f"{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
+        for grp in ("Experts", "Attention", "Other"):
+            gp = group_params.get(grp, 0)
+            gb = group_bits.get(grp, 0.0) / 8 / 1e9
+            print(f"{grp:<14}{gp / 1e9:>10.3f} B{100 * gp / total_params:>8.1f}%{gb:>9.2f} GB")
+        print(f"\n{'type':<14}{'params':>12}{'share':>9}{'size':>10}")
         for qtype, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
             bpw = BPW.get(qtype, 32.0)
             gb = n * bpw / 8 / 1e9
