@@ -7,8 +7,6 @@ Supports any number of layers and all APEX profiles.
 Usage:
   ./scripts/generate_config.py --profile balanced --layers 40 > config.txt
   ./scripts/generate_config.py --profile mini --layers 40 -o configs/my_config.txt
-  ./scripts/generate_config.py --custom --edge-exp Q6_K --mid-exp Q4_K \
-      --shared Q8_0 --attn Q6_K --layers 40 > config.txt
 
 Profiles:
   quality     Q6_K/Q5_K/IQ4_XS experts, Q8_0 shared, Q6_K attn
@@ -20,13 +18,6 @@ Profiles:
   mini        Q3_K edge / IQ2_S mid experts, Q5_K/Q4_K shared, Q4_K/Q3_K attn
   nano        Q3_K edge / IQ2_S near / IQ2_XXS mid experts (2.06 bpw mid) — needs imatrix
   micro       Q3_K edge / IQ2_XS near / IQ1_M mid experts (1.75 bpw mid) — needs imatrix, experimental
-  tq-quality  quality + TurboQuant attention (tq4_1s) in mid layers — uses wide attention bounds
-  tq-balanced balanced + TurboQuant attention (tq4_1s) in mid layers — uses wide attention bounds
-  tq-compact  compact + TurboQuant attention (tq4_1s) in mid layers — uses wide attention bounds
-  tq-mini     mini + TurboQuant attention (TQ3_1S) in mid layers — needs imatrix, no i-variant
-  tq-nano     nano + TurboQuant attention (TQ3_1S) in mid layers — needs imatrix, no i-variant
-  tq-micro    micro + TurboQuant attention (TQ3_1S) in mid layers — needs imatrix, no i-variant
-  custom      Specify each type manually via flags
 
 Dense/hybrid profiles (--arch dense is implied; for models whose FFN is dense,
 e.g. Qwen3.8-27B: 64 layers, 48 linear-attention + 16 full-attention):
@@ -39,6 +30,16 @@ e.g. Qwen3.8-27B: 64 layers, 48 linear-attention + 16 full-attention):
   dense-hybrid-quality  dense-hybrid rebuilt in the Q5/Q6 band, to check the
                         winning allocation still wins away from the Q4 band.
 
+Profile modifiers (used with profiles, positive = lower quality, negative = higher):
+  --edge-exp N      Shift edge-expert quality by N steps
+  --near-exp N      Shift near-expert quality by N steps
+  --mid-exp N       Shift mid-expert quality by N steps
+  --edge-shared N   Shift edge-shared quality by N steps
+  --mid-shared N    Shift mid-shared quality by N steps
+  --edge-attn N     Shift edge-attn quality by N steps
+  --mid-attn N      Shift mid-attn quality by N steps
+  --embd-type N     Shift embedding quality by N steps
+
 The three Q4-band profiles are deliberately size-matched: an A/B between
 allocations is only interpretable if the arms are the same size.
 """
@@ -47,38 +48,45 @@ import argparse
 import math
 import sys
 
+# Quantization types sorted by quality descending (index = quality rank).
+# Use ranked_quant(index) to convert an index to a quant string with clamping.
+QUANTS_RANKED = [
+    "Q8_0",       # 0
+    "Q6_K",       # 1
+    "Q5_K",       # 2
+    "Q4_K",       # 3
+    "Q3_K",       # 4
+    "Q2_K",       # 5
+    "IQ2_S",      # 6
+    "IQ2_XS",     # 7
+    "IQ2_XXS",    # 8
+    "IQ1_M",      # 9
+    "IQ1_S",      # 10
+]
+
+
+def ranked_quant(index):
+    """Return quant string for a quality-rank index, clamping to valid range."""
+    if index < 0:
+        return QUANTS_RANKED[0]
+    if index >= len(QUANTS_RANKED):
+        return QUANTS_RANKED[-1]
+    return QUANTS_RANKED[index]
+
+
 # Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn, embd_type)
+# Values are indices into QUANTS_RANKED (0=Q8_0, 1=Q6_K, 2=Q5_K, ...).
 PROFILES = {
-    "balanced":     ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "Q6_K",   "Q8_0"),
-    "quality":      ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "Q6_K",   "Q8_0"),
-    "compact":      ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "Q4_K",   "Q8_0"),
-    "mini":         ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "Q3_K",   "Q8_0"),
-    "nano":         ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "Q3_K",   "Q8_0"),
-    "micro":        ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "Q3_K",   "Q8_0"),
-
-    "tier1":        ("Q8_0",   "Q6_K",   "Q5_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0",   "Q8_0"),
-    "tier2":        ("Q6_K",   "Q6_K",   "Q4_K",   "Q8_0", "Q8_0", "Q8_0", "Q8_0",   "Q8_0"),
-    "tier3":        ("Q6_K",   "Q5_K",   "Q4_K",   "Q8_0", "Q8_0", "Q8_0", "Q6_K",   "Q6_K"),
-    "tier4":        ("Q5_K",   "Q4_K",   "Q3_K",   "Q8_K", "Q6_K", "Q6_K", "Q5_K",   "Q6_K"),
-
-    "tier5":        ("Q4_K",   "Q3_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K",   "Q8_0"),
-    "tier6":        ("Q3_K",   "Q2_K",   "Q2_K",   "Q8_0", "Q6_K", "Q8_0", "Q6_K",   "Q8_0"),
-
-
-    "tq-balanced":  ("Q6_K",   "Q5_K",   "Q5_K",   "Q8_0", "Q8_0", "Q6_K", "tq4_1s", "Q8_0"),
-    "tq-quality":   ("Q6_K",   "Q5_K",   "iq4_xs", "Q8_0", "Q8_0", "Q6_K", "tq4_1s", "Q8_0"),
-    "tq-compact":   ("Q4_K",   "Q3_K",   "Q3_K",   "Q6_K", "Q6_K", "Q4_K", "tq4_1s", "Q8_0"),
-    "tq-mini":      ("Q3_K",   "Q3_K",   "iq2_s",  "Q5_K", "Q4_K", "Q4_K", "TQ3_1S", "Q8_0"),
-    "tq-nano":      ("Q3_K",   "iq2_s",  "iq2_xxs","Q5_K", "Q4_K", "Q4_K", "TQ3_1S", "Q8_0"),
-    "tq-micro":     ("Q3_K",   "iq2_xs", "iq1_m",  "Q5_K", "Q4_K", "Q4_K", "TQ3_1S", "Q8_0"),
-}
-
-TQ_PROFILES = {
-    "tq-quality", "tq-balanced", "tq-compact", "tq-mini", "tq-nano", "tq-micro",
+    "tier1":        (0, 1, 2, 0, 0, 0, 0, 0),
+    "tier2":        (1, 1, 3, 0, 0, 0, 0, 0),
+    "tier3":        (1, 2, 3, 0, 0, 0, 1, 1),
+    "tier4":        (2, 3, 4, 0, 1, 1, 2, 1),
+    "tier5":        (3, 4, 5, 0, 1, 0, 1, 0),
+    "tier6":        (4, 5, 5, 0, 1, 0, 1, 0),
 }
 
 DENSE_PROFILES = {"dense-flat", "dense-grad", "dense-hybrid", "dense-hybrid-quality"}
-MOE_PROFILES = set(PROFILES.keys()) | {"custom"}
+MOE_PROFILES = set(PROFILES.keys())
 ALL_PROFILES = MOE_PROFILES | DENSE_PROFILES
 
 
@@ -97,19 +105,24 @@ def parse_args(argv=None):
                    help="Architecture: moe or dense (default: moe)")
     p.add_argument("--output", "-o",
                    help="Write config to file instead of stdout")
-    p.add_argument("--custom", action="store_true",
-                   help="Use custom mode (--edge-exp required)")
 
-    # Custom mode types
-    p.add_argument("--edge-exp", default="")
-    p.add_argument("--near-exp", default="")
-    p.add_argument("--mid-exp", default="")
-    p.add_argument("--edge-shared", default="")
-    p.add_argument("--mid-shared", default="")
-    p.add_argument("--edge-attn", default="")
-    p.add_argument("--mid-attn", default="")
-    p.add_argument("--embd-type", dest="embd_type_moe", default="",
-                   help="Embedding/output tensor type for MoE profiles (default: Q8_0)")
+    # Profile modifiers (integers)
+    p.add_argument("--edge-exp", type=int, default=None,
+                   help="Modifier for edge-expert quality (-N/+N shifts quality, default: 0)")
+    p.add_argument("--near-exp", type=int, default=None,
+                   help="Modifier for near-expert quality (-N/+N shifts quality, default: 0)")
+    p.add_argument("--mid-exp", type=int, default=None,
+                   help="Modifier for mid-expert quality (-N/+N shifts quality, default: 0)")
+    p.add_argument("--edge-shared", type=int, default=None,
+                   help="Modifier for edge-shared quality (-N/+N shifts quality, default: 0)")
+    p.add_argument("--mid-shared", type=int, default=None,
+                   help="Modifier for mid-shared quality (-N/+N shifts quality, default: 0)")
+    p.add_argument("--edge-attn", type=int, default=None,
+                   help="Modifier for edge-attn quality (-N/+N shifts quality, default: 0)")
+    p.add_argument("--mid-attn", type=int, default=None,
+                   help="Modifier for mid-attn quality (-N/+N shifts quality, default: 0)")
+    p.add_argument("--embd-type", dest="embd_type_moe", type=int, default=None,
+                   help="Modifier for embedding quality (-N/+N shifts quality, default: 0)")
 
     # Dense/hybrid overrides
     p.add_argument("--linattn", default="")
@@ -118,9 +131,6 @@ def parse_args(argv=None):
     p.add_argument("--output-type", dest="output_type", default="")
 
     args = p.parse_args(argv)
-
-    if args.custom:
-        args.profile = "custom"
 
     return args
 
@@ -147,57 +157,42 @@ def resolve_profile(args):
 
     lookup = profile[2:] if profile.startswith("i-") else profile
     if lookup in PROFILES:
-        edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn, embd_type = PROFILES[lookup]
-        types = {
-            "edge_exp": args.edge_exp or edge_exp,
-            "near_exp": args.near_exp or near_exp,
-            "mid_exp": args.mid_exp or mid_exp,
-            "edge_shared": args.edge_shared or edge_shared,
-            "mid_shared": args.mid_shared or mid_shared,
-            "edge_attn": args.edge_attn or edge_attn,
-            "mid_attn": args.mid_attn or mid_attn,
-            "embd_type": getattr(args, "embd_type_moe", "") or embd_type,
-        }
-        attn_wide = lookup in TQ_PROFILES
+        indices = list(PROFILES[lookup])
+        
+        # Apply modifiers from CLI arguments (positive = lower quality, negative = higher quality)
+        # Indices: 0=edge_exp, 1=near_exp, 2=mid_exp, 3=edge_shared, 4=mid_shared, 5=edge_attn, 6=mid_attn, 7=embd_type
+        if args.edge_exp is not None:
+            indices[0] += args.edge_exp
+        if args.near_exp is not None:
+            indices[1] += args.near_exp
+        if args.mid_exp is not None:
+            indices[2] += args.mid_exp
+        if args.edge_shared is not None:
+            indices[3] += args.edge_shared
+        if args.mid_shared is not None:
+            indices[4] += args.mid_shared
+        if args.edge_attn is not None:
+            indices[5] += args.edge_attn
+        if args.mid_attn is not None:
+            indices[6] += args.mid_attn
+        if args.embd_type_moe is not None:
+            indices[7] += args.embd_type_moe
+        
         return {
             "arch": arch,
             "layers": layers,
             "dense_layers": dense_layers,
-            "attn_wide": attn_wide,
             "profile": profile,
-            "types": types,
+            "indices": tuple(indices),
         }
 
     if profile in DENSE_PROFILES:
         return resolve_dense_profile(profile, layers, args)
 
-    if profile == "custom":
-        if not args.edge_exp:
-            print("Error: --custom requires --edge-exp", file=sys.stderr)
-            sys.exit(1)
-        types = {
-            "edge_exp": args.edge_exp,
-            "near_exp": args.near_exp or args.edge_exp,
-            "mid_exp": args.mid_exp or args.edge_exp,
-            "edge_shared": args.edge_shared or "Q8_0",
-            "mid_shared": args.mid_shared or (args.edge_shared or "Q8_0"),
-            "edge_attn": args.edge_attn or "Q6_K",
-            "mid_attn": args.mid_attn or (args.edge_attn or "Q6_K"),
-            "embd_type": getattr(args, "embd_type_moe", "") or "Q8_0",
-        }
-        return {
-            "arch": arch,
-            "layers": layers,
-            "dense_layers": dense_layers,
-            "attn_wide": False,
-            "profile": "custom",
-            "types": types,
-        }
-
-    available = ", ".join(sorted(MOE_PROFILES - {"custom"}))
+    available = ", ".join(sorted(MOE_PROFILES))
     dense_avail = ", ".join(sorted(DENSE_PROFILES))
     print("Error: unknown profile '{}'".format(profile), file=sys.stderr)
-    print("Available: {}, custom".format(available), file=sys.stderr)
+    print("Available: {}".format(available), file=sys.stderr)
     print("Dense:     {}".format(dense_avail), file=sys.stderr)
     sys.exit(1)
 
@@ -288,70 +283,63 @@ def generate_moe(cfg):
     lines = []
     layers = cfg["layers"]
     dense_layers = cfg["dense_layers"]
-    types = cfg["types"]
-    attn_wide = cfg["attn_wide"]
-    embd_type = types["embd_type"]
+    ei, ni, mi, esi, msi, eai, mai, emi = cfg["indices"]
 
-    lines.append(f"token_embd.weight={embd_type}")
-    lines.append(f"output.weight={embd_type}")
+    lines.append(f"token_embd.weight={ranked_quant(emi)}")
+    lines.append(f"output.weight={ranked_quant(emi)}")
     
     for i in range(layers):
         zone = get_zone(i, layers, dense_layers)
 
-        # Expert type
-        exp_type = types[f"{zone}_exp"]
-
-        # Shared type: edge uses edge_shared, near and mid use mid_shared
         if zone == "edge":
-            shared_type = types["edge_shared"]
+            exp = ei
+            sh = esi
+        elif zone == "near":
+            exp = ni
+            sh = msi
         else:
-            shared_type = types["mid_shared"]
+            exp = mi
+            sh = msi
 
-        # Attention type
-        if attn_wide:
-            if zone == "edge":
-                attn_type = types["edge_attn"]
-            else:
-                attn_type = types["mid_attn"]
+        # Attention index: narrower edge band (3/40 vs 5/40)
+        non_dense = layers - dense_layers
+        attn_edge_size = max(1, math.ceil(non_dense * 3 / 40))
+        if i < dense_layers + attn_edge_size or i >= layers - attn_edge_size:
+            ai = eai
         else:
-            non_dense = layers - dense_layers
-            attn_edge_size = max(1, math.ceil(non_dense * 3 / 40))
-            if i < dense_layers + attn_edge_size or i >= layers - attn_edge_size:
-                attn_type = types["edge_attn"]
-            else:
-                attn_type = types["mid_attn"]
+            ai = mai
 
         # Expert or dense FFN tensors
         if i < dense_layers:
-            lines.append(f"blk.{i}.ffn_gate.weight={shared_type}")
-            lines.append(f"blk.{i}.ffn_up.weight={shared_type}")
-            lines.append(f"blk.{i}.ffn_down.weight={shared_type}")
+            lines.append(f"blk.{i}.ffn_gate.weight={ranked_quant(sh)}")
+            lines.append(f"blk.{i}.ffn_up.weight={ranked_quant(sh)}")
+            lines.append(f"blk.{i}.ffn_down.weight={ranked_quant(sh - 1)}")
         else:
-            lines.append(f"blk.{i}.ffn_gate_exps={exp_type}")
-            lines.append(f"blk.{i}.ffn_up_exps={exp_type}")
-            lines.append(f"blk.{i}.ffn_down_exps={exp_type}")
+            lines.append(f"blk.{i}.ffn_gate_exps={ranked_quant(exp)}")
+            lines.append(f"blk.{i}.ffn_up_exps={ranked_quant(exp)}")
+            lines.append(f"blk.{i}.ffn_down_exps={ranked_quant(exp - 1)}")
 
         # Shared expert tensors
-        lines.append(f"blk.{i}.ffn_gate_shexp={shared_type}")
-        lines.append(f"blk.{i}.ffn_up_shexp={shared_type}")
-        lines.append(f"blk.{i}.ffn_down_shexp={shared_type}")
+        lines.append(f"blk.{i}.ffn_gate_shexp={ranked_quant(sh)}")
+        lines.append(f"blk.{i}.ffn_up_shexp={ranked_quant(sh)}")
+        lines.append(f"blk.{i}.ffn_down_shexp={ranked_quant(sh - 1)}")
 
         # Attention tensors
-        lines.append(f"blk.{i}.attn_q={attn_type}")
-        lines.append(f"blk.{i}.attn_k={attn_type}")
-        lines.append(f"blk.{i}.attn_v={attn_type}")
-        lines.append(f"blk.{i}.attn_output={attn_type}")
-        lines.append(f"blk.{i}.attn_gate={attn_type}")
-        lines.append(f"blk.{i}.attn_qkv={attn_type}")
+        lines.append(f"blk.{i}.attn_q={ranked_quant(ai)}")
+        lines.append(f"blk.{i}.attn_k={ranked_quant(ai)}")
+        lines.append(f"blk.{i}.attn_v={ranked_quant(ai - 2)}")
+        lines.append(f"blk.{i}.attn_output={ranked_quant(ai - 1)}")
+        lines.append(f"blk.{i}.attn_gate={ranked_quant(ai - 2)}")
+        lines.append(f"blk.{i}.attn_qkv={ranked_quant(ai - 2)}")
 
         # Short-convolution mixing tensors (LFM2 conv layers)
-        lines.append(f"blk.{i}.shortconv.in_proj={attn_type}")
-        lines.append(f"blk.{i}.shortconv.out_proj={attn_type}")
+        lines.append(f"blk.{i}.shortconv.in_proj={ranked_quant(ai)}")
+        lines.append(f"blk.{i}.shortconv.out_proj={ranked_quant(ai - 1)}")
 
         # SSM tensors (Mamba/hybrid archs)
-        lines.append(f"blk.{i}.ssm_alpha={attn_type}")
-        lines.append(f"blk.{i}.ssm_beta={attn_type}")
-        lines.append(f"blk.{i}.ssm_out={attn_type}")
+        lines.append(f"blk.{i}.ssm_alpha={ranked_quant(ai)}")
+        lines.append(f"blk.{i}.ssm_beta={ranked_quant(ai)}")
+        lines.append(f"blk.{i}.ssm_out={ranked_quant(ai)}")
 
     return lines
 
