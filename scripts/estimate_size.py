@@ -9,6 +9,8 @@ Usage:
     ./scripts/estimate_size.py --config configs/my_config.txt model.gguf
     ./scripts/estimate_size.py --profile compact --layers 64 model.gguf
     ./scripts/estimate_size.py --profile balanced --quiet model.gguf
+    ./scripts/estimate_size.py --compare model.gguf         # inspect tensor types x groups
+    ./scripts/estimate_size.py --compare model.gguf --config configs/my_config.txt
 
 Environment:
     NUM_LAYERS   Default layer count (default: 40)
@@ -28,6 +30,20 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # ── GGUF header parser ───────────────────────────────────────────────────────
 
 GGUF_MAGIC = 0x46554747  # "GGUF" in LE
+
+# ggml_type enum — source of truth: /usr/local/include/ggml.h
+GGML_TYPE = {
+    0: "F32", 1: "F16",
+    2: "Q4_0", 3: "Q4_1", 6: "Q5_0", 7: "Q5_1",
+    8: "Q8_0", 9: "Q8_1",
+    10: "Q2_K", 11: "Q3_K", 12: "Q4_K", 13: "Q5_K", 14: "Q6_K", 15: "Q8_K",
+    16: "IQ2_XXS", 17: "IQ2_XS", 18: "IQ3_XXS", 19: "IQ1_S", 20: "IQ4_NL",
+    21: "IQ3_S", 22: "IQ2_S", 23: "IQ4_XS",
+    29: "IQ1_M", 30: "BF16",
+    34: "TQ1_0", 35: "TQ2_0",
+    39: "MXFP4", 40: "NVFP4",
+    41: "Q1_0", 42: "Q2_0",
+}
 
 
 def _read_gguf_string(f):
@@ -51,7 +67,7 @@ def _read_gguf_value(f, vtype):
 
 
 def read_gguf_tensor_list(path):
-    """Return list of (name, numel) from a GGUF file header."""
+    """Return list of (name, numel, qtype) from a GGUF file header."""
     with open(path, "rb") as f:
         raw = f.read(24)
         magic, version, n_tensors, n_kv = struct.unpack("<4sIQQ", raw)
@@ -72,12 +88,13 @@ def read_gguf_tensor_list(path):
             name = _read_gguf_string(f)
             n_dims = struct.unpack("<I", f.read(4))[0]
             dims = struct.unpack(f"<{n_dims}Q", f.read(8 * n_dims))
-            f.read(4)   # type
+            type_id = struct.unpack("<I", f.read(4))[0]
             f.read(8)   # offset
             numel = 1
             for d in dims:
                 numel *= d
-            tensors.append((name, numel))
+            qtype = GGML_TYPE.get(type_id, f"?{type_id}")
+            tensors.append((name, numel, qtype))
     return tensors
 
 
@@ -146,7 +163,7 @@ def estimate(tensors, rules, base):
     uncovered = 0
     uncovered_names = []
 
-    for name, numel in tensors:
+    for name, numel, _ in tensors:
         group = _classify_group(name)
         group_params[group] += numel
 
@@ -175,13 +192,68 @@ def estimate(tensors, rules, base):
     return size_gb, by_type, uncovered, uncovered_names, group_params, group_bits
 
 
+# ── Compare: show actual GGUF breakdown ──────────────────────────────────────
+
+def print_gguf_breakdown(tensors):
+    total_params = 0
+    by_type = defaultdict(int)
+    type_params = defaultdict(int)
+    type_bits = defaultdict(float)
+    group_params = defaultdict(int)
+    group_bits = defaultdict(float)
+    cat_type_params = defaultdict(lambda: defaultdict(int))
+    cat_type_bits = defaultdict(lambda: defaultdict(float))
+
+    for name, numel, qtype in tensors:
+        total_params += numel
+        group = _classify_group(name)
+        bpw = BPW.get(qtype, 32.0)
+        bits = numel * bpw
+        by_type[qtype] += numel
+        type_params[qtype] += numel
+        type_bits[qtype] += bits
+        group_params[group] += numel
+        group_bits[group] += bits
+        cat_type_params[group][qtype] += numel
+        cat_type_bits[group][qtype] += bits
+
+    print(f"\n{'type':<14}{'params':>12}{'share':>9}{'size':>10}")
+    print("-" * 48)
+    for qtype, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
+        gb = type_bits[qtype] / 8 / 1e9
+        print(f"{qtype:<14}{n/1e9:>10.3f} B{100*n/total_params:>8.1f}%{gb:>9.2f} GB")
+    total_gb = sum(type_bits.values()) / 8 / 1e9
+    print(f"{'TOTAL':<14}{total_params/1e9:>10.3f} B{' ':>9}{total_gb:>9.2f} GB")
+
+    print(f"\n{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
+    print("-" * 48)
+    for grp in ("Experts", "Attention", "Other"):
+        gp = group_params.get(grp, 0)
+        gb = group_bits.get(grp, 0.0) / 8 / 1e9
+        print(f"{grp:<14}{gp/1e9:>10.3f} B{100*gp/total_params:>8.1f}%{gb:>9.2f} GB")
+
+    all_types = sorted({t for d in cat_type_bits.values() for t in d},
+                       key=lambda t: -sum(cat_type_bits[c].get(t, 0) for c in
+                                          ("Experts", "Attention", "Other")))
+    if len(all_types) > 1:
+        hdr = f"\n{'group':<14}" + "".join(f"{t:>10}" for t in all_types)
+        print(hdr)
+        print("-" * (14 + 10 * len(all_types)))
+        for grp in ("Experts", "Attention", "Other"):
+            row = f"{grp:<14}"
+            for t in all_types:
+                gb = cat_type_bits[grp].get(t, 0) / 8 / 1e9
+                row += f"{gb:>9.2f} "
+            print(row)
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
         description="Estimate quantized GGUF size without quantizing",
     )
-    parser.add_argument("--profile", "-p", default="balanced",
+    parser.add_argument("--profile", "-p",
                         help="Profile name (default: balanced)")
     parser.add_argument("--config", "-c",
                         help="Custom tensor-type file")
@@ -194,9 +266,13 @@ def main():
                         help="Print size in GB only")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Print list of tensors not covered by rules")
+    parser.add_argument("--compare", action="store_true",
+                        help="Show actual GGUF tensor breakdown by quant type x group")
     parser.add_argument("input", help="Input GGUF file")
 
     args = parser.parse_args()
+
+    profile = args.profile or "balanced"
 
     base_type_map = {
         "quality": "Q6_K", "i-quality": "Q6_K",
@@ -204,7 +280,7 @@ def main():
         "compact": "Q4_K", "i-compact": "Q4_K_M",
         "mini": "Q3_K",
     }
-    base = base_type_map.get(args.profile, args.base_type).upper()
+    base = base_type_map.get(profile, args.base_type).upper()
 
     if not os.path.isfile(args.input):
         print(f"ERROR: Input file not found: {args.input}", file=sys.stderr)
@@ -217,12 +293,15 @@ def main():
         if not os.path.isfile(config_file):
             print(f"ERROR: Config file not found: {config_file}", file=sys.stderr)
             sys.exit(1)
+    elif args.compare and not args.profile and not args.config:
+        # --compare without --config or --profile: just inspect the file
+        pass
     else:
         tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         tmpfile.close()
         config_file = tmpfile.name
         cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
-               "--profile", args.profile, "--layers", str(args.layers),
+               "--profile", profile, "--layers", str(args.layers),
                "-o", config_file]
         try:
             subprocess.run(cmd, check=True, capture_output=True)
@@ -234,10 +313,18 @@ def main():
 
     try:
         tensors = read_gguf_tensor_list(args.input)
+        total_params = sum(n for _, n, _ in tensors)
+
+        # ── Compare-only: no estimate, just inspect the file ──
+        if args.compare and not config_file:
+            print(f"input:  {args.input}")
+            print(f"tensors: {len(tensors)}, {total_params/1e9:.2f} B params")
+            print_gguf_breakdown(tensors)
+            return
+
+        # ── Estimate from config (with optional compare) ──
         rules = load_config(config_file)
         size_gb, by_type, uncovered, uncovered_names, group_params, group_bits = estimate(tensors, rules, base)
-
-        total_params = sum(n for _, n in tensors)
 
         if args.quiet:
             print(f"{size_gb:.3f}")
@@ -245,7 +332,7 @@ def main():
 
         file_size_gb = os.path.getsize(args.input) / 1e9
         print(f"input:     {args.input} ({file_size_gb:.2f} GB)")
-        print(f"profile:   {args.profile}")
+        print(f"profile:   {profile}")
         print(f"base type: {base}")
         print(f"tensors:   {len(tensors)}, {total_params / 1e9:.2f} B params total")
         print(f"rules:     {len(rules)} (uncovered fall back to {base}: {uncovered})")
@@ -264,6 +351,12 @@ def main():
             print(f"\nuncovered tensors ({len(uncovered_names)}):")
             for name in uncovered_names:
                 print(f"  {name}")
+
+        if args.compare:
+            print(f"\n{'=' * 64}")
+            print(f"ACTUAL GGUF FILE BREAKDOWN")
+            print(f"{'=' * 64}")
+            print_gguf_breakdown(tensors)
     finally:
         if tmpfile:
             os.unlink(tmpfile.name)
