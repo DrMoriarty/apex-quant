@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import re
 import struct
 import sys
 
@@ -33,6 +34,15 @@ GGML_TYPE = {
     39: "MXFP4", 40: "NVFP4",
     41: "Q1_0", 42: "Q2_0",
 }
+
+ALWAYS_F32 = [
+    re.compile(r"blk\.\d+\.ffn_norm\.weight$"),
+    re.compile(r"blk\.\d+\.attn_k_norm\.weight$"),
+    re.compile(r"blk\.\d+\.attn_norm\.weight$"),
+    re.compile(r"blk\.\d+\.attn_q_norm\.weight$"),
+    re.compile(r"blk\.\d+\.ffn_gate_inp\.weight$"),
+    re.compile(r"output_norm\.weight$"),
+]
 
 
 def _read_gguf_string(f):
@@ -101,9 +111,8 @@ def format_name_dense(name):
 def build_config(tensors, fmt):
     """Build config lines from tensor list.
 
-    Skips imatrix metadata (.in_sum2, .counts) and non-weight tensors.
-    Includes F32 tensors (norms, conv1d, biases) — they are real tensors
-    that the user may want to see or override.
+    Skips imatrix metadata (.in_sum2, .counts), non-weight tensors,
+    and tensors that are always read as F32 (norms, biases).
     """
     lines = []
     format_fn = format_name_moe if fmt == "moe" else format_name_dense
@@ -112,6 +121,8 @@ def build_config(tensors, fmt):
         if name.endswith(".in_sum2") or name.endswith(".counts"):
             continue
         if not name.endswith(".weight"):
+            continue
+        if any(p.fullmatch(name) for p in ALWAYS_F32):
             continue
         pattern = format_fn(name)
         lines.append(f"{pattern}={qtype}")
