@@ -54,14 +54,11 @@ QUANTS_RANKED = [
     "Q8_0",       # 0
     "Q6_K",       # 1
     "Q5_K",       # 2
-    "Q4_K",       # 3
-    "Q3_K",       # 4
-    "Q2_K",       # 5
-    "IQ2_S",      # 6
-    "IQ2_XS",     # 7
-    "IQ2_XXS",    # 8
-    "IQ1_M",      # 9
-    "IQ1_S",      # 10
+    "IQ4_NL",     # 3
+    "IQ3_S",      # 4
+    "IQ2_S",      # 5
+    "IQ1_M",      # 6
+    "IQ1_S",      # 7
 ]
 
 
@@ -77,16 +74,19 @@ def ranked_quant(index):
 # Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn, embd_type)
 # Values are indices into QUANTS_RANKED (0=Q8_0, 1=Q6_K, 2=Q5_K, ...).
 PROFILES = {
-    "tier1":        (0, 1, 2, 0, 0, 0, 0, 0),
-    "tier2":        (1, 1, 3, 0, 0, 0, 0, 0),
-    "tier3":        (1, 2, 3, 0, 0, 0, 1, 1),
-    "tier4":        (2, 3, 3, 0, 1, 1, 2, 1),
-    "tier5":        (2, 3, 4, 0, 1, 1, 2, 2),
-    "tier6":        (3, 4, 4, 0, 1, 1, 2, 2),
-    "tier7":        (3, 4, 5, 0, 1, 1, 2, 2),
-    "tier8":        (4, 4, 6, 0, 1, 1, 2, 3),
-    "tier9":        (4, 5, 6, 0, 1, 1, 2, 3),
-    "tier10":       (5, 6, 6, 0, 1, 1, 2, 3),
+    "tier1":        (0, 0, 1, 0, 0, 0, 0, 0),
+    "tier2":        (1, 1, 1, 0, 0, 0, 0, 0),
+    "tier3":        (1, 1, 2, 0, 0, 0, 0, 0),
+    "tier4":        (2, 2, 2, 0, 0, 1, 1, 0),
+    "tier5":        (2, 2, 3, 0, 0, 1, 1, 0),
+    "tier6":        (2, 3, 3, 0, 1, 1, 1, 0),
+    "tier7":        (3, 3, 3, 0, 1, 2, 2, 1),
+    "tier8":        (3, 3, 4, 0, 1, 2, 2, 1),
+    "tier9":        (3, 4, 4, 0, 1, 2, 2, 1),
+    "tier10":       (4, 4, 4, 0, 1, 3, 3, 2),
+    "tier11":       (4, 4, 5, 0, 1, 3, 3, 2),
+    "tier12":       (4, 5, 5, 0, 1, 3, 3, 2),
+    "tier13":       (5, 5, 5, 0, 1, 4, 4, 3),
 }
 
 DENSE_PROFILES = {"dense-flat", "dense-grad", "dense-hybrid", "dense-hybrid-quality"}
@@ -261,7 +261,7 @@ def get_zone(i, layers, dense_layers=0):
     for edge and near per-side sizes.
     """
     non_dense = layers - dense_layers
-    zone_size = max(1, math.ceil(non_dense * 5 / 40))
+    zone_size = max(1, math.ceil(non_dense * 0.1))  # 0.125
 
     # Dense layers are always edge
     if i < dense_layers:
@@ -317,22 +317,22 @@ def generate_moe(cfg):
         if i < dense_layers:
             lines.append(f"blk.{i}.ffn_gate.weight={ranked_quant(sh)}")
             lines.append(f"blk.{i}.ffn_up.weight={ranked_quant(sh)}")
-            lines.append(f"blk.{i}.ffn_down.weight={ranked_quant(sh - 1)}")
+            lines.append(f"blk.{i}.ffn_down.weight={ranked_quant(sh - 1)}")  # -1
         else:
-            lines.append(f"blk.{i}.ffn_gate_exps={ranked_quant(exp)}")
-            lines.append(f"blk.{i}.ffn_up_exps={ranked_quant(exp)}")
-            lines.append(f"blk.{i}.ffn_down_exps={ranked_quant(exp - 1)}")
+            lines.append(f"blk.{i}.ffn_gate_exps={ranked_quant(exp)}") 
+            lines.append(f"blk.{i}.ffn_up_exps={ranked_quant(exp)}")   
+            lines.append(f"blk.{i}.ffn_down_exps={ranked_quant(exp - 1)}")  # -1
 
         # Shared expert tensors
         lines.append(f"blk.{i}.ffn_gate_shexp={ranked_quant(sh)}")
         lines.append(f"blk.{i}.ffn_up_shexp={ranked_quant(sh)}")
-        lines.append(f"blk.{i}.ffn_down_shexp={ranked_quant(sh - 1)}")
+        lines.append(f"blk.{i}.ffn_down_shexp={ranked_quant(sh - 1)}")  # -1
 
         # Attention tensors
         lines.append(f"blk.{i}.attn_q={ranked_quant(ai)}")
         lines.append(f"blk.{i}.attn_k={ranked_quant(ai)}")
         lines.append(f"blk.{i}.attn_v={ranked_quant(ai - 2)}")
-        lines.append(f"blk.{i}.attn_output={ranked_quant(ai - 1)}")
+        lines.append(f"blk.{i}.attn_output={ranked_quant(ai - 1)}")   # always equal to output.weight
         lines.append(f"blk.{i}.attn_gate={ranked_quant(ai - 2)}")
         lines.append(f"blk.{i}.attn_qkv={ranked_quant(ai - 2)}")
 

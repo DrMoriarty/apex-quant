@@ -73,14 +73,14 @@ def main():
         description="APEX quantization for llama.cpp",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--profile", "-p", default="balanced",
-                        help="Profile name (default: balanced)")
+    parser.add_argument("--profile", "-p", default="tier1",
+                        help="Profile name (default: tier1)")
     parser.add_argument("--config", "-c",
                         help="Custom tensor-type file")
     parser.add_argument("--imatrix", "-i",
                         help="Importance matrix file")
-    parser.add_argument("--base-type", "-b", default="Q6_K",
-                        help="Base quant type (default: Q6_K)")
+    parser.add_argument("--base-type", "-b", default="Q8_0",
+                        help="Base quant type (default: Q8_0)")
     parser.add_argument("--layers", "-l", type=int,
                         default=int(os.environ.get("NUM_LAYERS", 40)),
                         help="Number of transformer layers (default: 40)")
@@ -97,18 +97,21 @@ def main():
 
     # Base type per profile
     base_type_map = {
-        "quality": "Q6_K", "i-quality": "Q6_K",
-        "balanced": "Q6_K", "i-balanced": "Q6_K",
-        "compact": "Q4_K_M", "i-compact": "Q4_K_M",
-        "mini": "Q3_K_M",
+        "tier1": "Q8_0", 
+        "tier2": "Q8_0", 
+        "tier3": "Q8_0", 
+        "tier4": "Q8_0", 
+        "tier5": "Q8_0", 
+        "tier6": "Q8_0", 
+        "tier7": "Q6_K", 
+        "tier8": "Q6_K", 
+        "tier9": "Q6_K", 
+        "tier10": "Q5_K_M", 
+        "tier11": "Q5_K_M", 
+        "tier12": "Q5_K_M", 
+        "tier13": "Q4_K_M", 
     }
     args.base_type = base_type_map.get(args.profile, args.base_type)
-
-    # I-profiles warn about missing imatrix
-    if args.profile in ("i-quality", "i-balanced", "i-compact", "mini"):
-        if not args.imatrix:
-            print(f"WARNING: Profile '{args.profile}' benefits from --imatrix. Continuing without it.",
-                  file=sys.stderr)
 
     # Generate config
     config_file = None
