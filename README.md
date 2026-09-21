@@ -1,3 +1,74 @@
+# _Modified_ APEX
+
+The original APEX quants have been modified for small and medium MoE models (this doesn't mean that it don't fit for big ones).
+
+## Comparison
+
+Comparison with standard quants on Mellum2-12B-A2.5B (all i-quants have been made with the same imatrix)
+
+![Mellum2-12B-A2.5B](Mellum2-12B-A2.5B-comparison.png)
+
+Comparison for LFM2.5-8B-A1B with standard and advanced quants (all with imatrix)
+
+![LFM2.5-8B-A1B](LFM2.5-8B-A1B-comparison.png)
+
+## Usage
+
+At first estimate the tier size for your model:
+
+```
+$ scripts/estimate_size.py --profile tier5 --layers 28 /mnt/sdc2/LLM/Mellum2-12B-A2.5B-Thinking-bf16.gguf 
+input:     /mnt/sdc2/LLM/Mellum2-12B-A2.5B-Thinking-bf16.gguf (24.31 GB)
+profile:   tier5
+base type: Q6_K
+tensors:   339, 12.15 B params total
+rules:     682 (uncovered fall back to Q6_K: 0)
+
+estimated output size: 8.17 GB
+
+group               params    share      size
+Experts           11.102 B    91.4%     7.13 GB
+Attention          0.595 B     4.9%     0.56 GB
+Other              0.453 B     3.7%     0.48 GB
+
+type                params    share      size
+IQ4_NL             5.285 B    43.5%     2.97 GB
+Q5_K               4.756 B    39.1%     3.27 GB
+Q6_K               1.354 B    11.1%     1.11 GB
+Q8_0               0.750 B     6.2%     0.80 GB
+F32                0.004 B     0.0%     0.02 GB
+```
+
+Than make a config file for your choice:
+
+```
+$ scripts/generate_config.py --profile tier3 --layers 24 --dense-layers 2 --output my-config-file.txt 
+Config written to: my-config-file.txt (410 lines, 24 layers, arch=moe)
+```
+
+Finally quant the model:
+```
+$ scripts/quantize.py --profile tier3 --config my-config-file.txt  /mnt/sdc2/LLM/LFM2.5-8B-A1B-BF16.gguf  my-quant.gguf                                              
+>>> Using config: my-config-file.txt                                                                                                                                                                
+=== APEX Quantize ===                                                                                                                                                                               
+Profile:    tier3                                                                                                                                                                                   
+Base type:  Q8_0                                                                                  
+Input:      /mnt/sdc2/LLM/LFM2.5-8B-A1B-BF16.gguf                                     
+Output:     my-quant.gguf                                                                         
+Config:     my-config-file.txt (410 lines)                                                                                                                                                          
+                                                                                                                                                                                                    
+main: build = 8681 (Debian)                                                                                                                                                                         
+main: built with GNU 15.2.0 for Linux x86_64                                                                                                                                                        
+main: quantizing '/mnt/sdc2/LLM/LFM2.5-8B-A1B-BF16.gguf' to 'my-quant.gguf' as Q8_0                                                                                                                 
+llama_model_loader: loaded meta data with 39 key-value pairs and 256 tensors from /mnt/sdc2/LLM/LFM2.5-8B-A1B-BF16.gguf (version GGUF V3 (latest))                                                  
+llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+llama_model_loader: - kv   0:                       general.architecture str              = lfm2moe                                                                                                 
+llama_model_loader: - kv   1:                               general.type str              = model
+...
+```
+
+---
+
 # APEX -- Adaptive Precision for EXpert Models
 
 **Brought to you by the [LocalAI](https://github.com/mudler/LocalAI) team** -- the creators of LocalAI the open-source AI engine that runs any model - LLMs, vision, voice, image, video - on any hardware. No GPU required.
