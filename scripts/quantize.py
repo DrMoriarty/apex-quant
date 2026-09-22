@@ -127,6 +127,8 @@ def main():
                         help="Generate config only (no quantization)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Estimate output size without quantizing")
+    parser.add_argument("--speed", action="store_true",
+                        help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) instead of QUANTS_RANKED")
     parser.add_argument("-o", "--output",
                         help="Output config file (for --generate-config)")
     parser.add_argument("input", nargs="?", help="Input GGUF file")
@@ -175,6 +177,8 @@ def main():
             cmd.extend(["--dense-layers", str(args.dense_layers)])
         if args.arch:
             cmd.extend(["--arch", args.arch])
+        if args.speed:
+            cmd.append("--speed")
         if args.output:
             cmd.extend(["-o", args.output])
         subprocess.run(cmd, check=True)
@@ -205,6 +209,8 @@ def main():
             cmd.extend(["--dense-layers", str(args.dense_layers)])
         if args.arch:
             cmd.extend(["--arch", args.arch])
+        if args.speed:
+            cmd.append("--speed")
         subprocess.run(cmd, check=True)
         print(f">>> Generated config for profile '{args.profile}' ({args.layers} layers)")
 

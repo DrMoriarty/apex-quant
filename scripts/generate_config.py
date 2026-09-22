@@ -61,14 +61,29 @@ QUANTS_RANKED = [
     "IQ1_S",      # 7
 ]
 
+QUANTS_RANKED_SPEED = [
+    "Q8_0",       # 0
+    "Q6_K",       # 1
+    "Q5_K",       # 2
+    "Q4_K",       # 3
+    "Q3_K",       # 4
+    "Q2_K",       # 5
+    "IQ1_M",      # 6
+    "IQ1_S",      # 7
+]
+
+
+_use_speed = False
+
 
 def ranked_quant(index):
     """Return quant string for a quality-rank index, clamping to valid range."""
+    quants = QUANTS_RANKED_SPEED if _use_speed else QUANTS_RANKED
     if index < 0:
-        return QUANTS_RANKED[0]
-    if index >= len(QUANTS_RANKED):
-        return QUANTS_RANKED[-1]
-    return QUANTS_RANKED[index]
+        return quants[0]
+    if index >= len(quants):
+        return quants[-1]
+    return quants[index]
 
 
 # Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn, embd_type)
@@ -109,6 +124,8 @@ def parse_args(argv=None):
                    help="Architecture: moe or dense (default: moe)")
     p.add_argument("--output", "-o",
                    help="Write config to file instead of stdout")
+    p.add_argument("--speed", action="store_true",
+                   help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) instead of QUANTS_RANKED")
 
     # Profile modifiers (integers)
     p.add_argument("--edge-exp", type=int, default=None,
@@ -391,7 +408,9 @@ def generate_dense(cfg):
 
 
 def main(argv=None):
+    global _use_speed
     args = parse_args(argv)
+    _use_speed = args.speed
     cfg = resolve_profile(args)
 
     if cfg["arch"] == "dense":

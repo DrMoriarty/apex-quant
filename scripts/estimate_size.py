@@ -299,6 +299,8 @@ def main():
                         help="Print list of tensors not covered by rules")
     parser.add_argument("--compare", action="store_true",
                         help="Show actual GGUF tensor breakdown by quant type x group")
+    parser.add_argument("--speed", action="store_true",
+                        help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) instead of QUANTS_RANKED")
     parser.add_argument("input", help="Input GGUF file")
 
     args = parser.parse_args()
@@ -362,6 +364,8 @@ def main():
             cmd.extend(["--dense-layers", str(args.dense_layers)])
         if args.arch:
             cmd.extend(["--arch", args.arch])
+        if args.speed:
+            cmd.append("--speed")
         try:
             subprocess.run(cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:
