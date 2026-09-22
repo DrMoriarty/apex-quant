@@ -12,11 +12,11 @@ Usage:
     ./scripts/estimate_size.py --compare model.gguf         # inspect tensor types x groups
     ./scripts/estimate_size.py --compare model.gguf --config configs/my_config.txt
 
-Environment:
-    NUM_LAYERS   Default layer count (default: 40)
+Layer count is explicitly set via --layers or auto-detected from the GGUF file.
 """
 
 import argparse
+import json
 import os
 import re
 import struct
@@ -265,6 +265,17 @@ def print_gguf_breakdown(tensors):
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
+def detect_gguf_params(gguf_path):
+    """Detect architecture parameters from a GGUF file."""
+    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "detect_gguf_params.py"), gguf_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"Warning: failed to detect GGUF params: {e}", file=sys.stderr)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Estimate quantized GGUF size without quantizing",
@@ -275,9 +286,12 @@ def main():
                         help="Custom tensor-type file")
     parser.add_argument("--base-type", "-b", default="Q8_0",
                         help="Base quant type (default: Q8_0)")
-    parser.add_argument("--layers", "-l", type=int,
-                        default=int(os.environ.get("NUM_LAYERS", 40)),
-                        help="Number of transformer layers (default: 40)")
+    parser.add_argument("--layers", "-l", type=int, default=None,
+                        help="Number of transformer layers (default: auto-detect from GGUF, fallback 40)")
+    parser.add_argument("--dense-layers", type=int, default=None,
+                        help="Leading dense (non-MoE) FFN layers (default: auto-detect)")
+    parser.add_argument("--arch", choices=["moe", "dense"], default=None,
+                        help="Architecture: moe or dense (default: auto-detect)")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Print size in GB only")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -287,6 +301,20 @@ def main():
     parser.add_argument("input", help="Input GGUF file")
 
     args = parser.parse_args()
+
+    # Auto-detect parameters from GGUF if not explicitly set
+    if os.path.isfile(args.input):
+        detected = detect_gguf_params(args.input)
+        if detected:
+            if args.layers is None:
+                args.layers = detected["layers"]
+            if args.dense_layers is None:
+                args.dense_layers = detected["dense_layers"]
+            if args.arch is None:
+                args.arch = detected["arch"]
+            print(f">>> Detected from GGUF: arch={detected['arch']}, layers={detected['layers']}, dense_layers={detected['dense_layers']}")
+    if args.layers is None:
+        args.layers = 40
 
     profile = args.profile or "balanced"
 
@@ -329,6 +357,10 @@ def main():
         cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
                "--profile", profile, "--layers", str(args.layers),
                "-o", config_file]
+        if args.dense_layers:
+            cmd.extend(["--dense-layers", str(args.dense_layers)])
+        if args.arch:
+            cmd.extend(["--arch", args.arch])
         try:
             subprocess.run(cmd, check=True, capture_output=True)
         except subprocess.CalledProcessError as e:

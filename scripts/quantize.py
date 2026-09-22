@@ -22,7 +22,7 @@ Profiles: quality, i-quality, balanced, i-balanced, compact, i-compact, mini, cu
 Environment:
   LLAMA_QUANTIZE    Path to llama-quantize binary (auto-detected)
   LLAMA_CPP_DIR     Path to llama.cpp build/bin directory
-  NUM_LAYERS        Number of transformer layers (default: 40)
+Layer count is explicitly set via --layers or auto-detected from the GGUF file.
 """
 
 import argparse
@@ -33,6 +33,30 @@ import sys
 import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT = os.path.join(SCRIPT_DIR, "..")
+
+
+def load_dotenv(path=None):
+    """Load .env file into os.environ (without overwriting existing vars)."""
+    if path is None:
+        path = os.path.join(PROJECT_ROOT, ".env")
+    if not os.path.isfile(path):
+        return
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip("\"'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+load_dotenv()
 
 
 def find_quantize():
@@ -93,9 +117,8 @@ def main():
                         help="Importance matrix file")
     parser.add_argument("--base-type", "-b", default="Q8_0",
                         help="Base quant type (default: Q8_0)")
-    parser.add_argument("--layers", "-l", type=int,
-                        default=int(os.environ.get("NUM_LAYERS", 40)),
-                        help="Number of transformer layers (default: 40)")
+    parser.add_argument("--layers", "-l", type=int, default=None,
+                        help="Number of transformer layers (default: auto-detect from GGUF)")
     parser.add_argument("--dense-layers", type=int, default=0,
                         help="Leading dense (non-MoE) FFN layers (default: 0)")
     parser.add_argument("--arch", choices=["moe", "dense"], default=None,
@@ -133,13 +156,33 @@ def main():
     if args.input and os.path.isfile(args.input):
         detected = detect_gguf_params(args.input)
         if detected:
-            if args.layers == int(os.environ.get("NUM_LAYERS", 40)):
+            if args.layers is None:
                 args.layers = detected["layers"]
             if args.dense_layers == 0:
                 args.dense_layers = detected["dense_layers"]
-            if not hasattr(args, 'arch') or not args.arch:
+            if not args.arch:
                 args.arch = detected["arch"]
             print(f">>> Detected from GGUF: arch={detected['arch']}, layers={detected['layers']}, dense_layers={detected['dense_layers']}")
+
+    if args.layers is None:
+        args.layers = 40
+
+    # Generate config only mode
+    if args.generate_config:
+        cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
+               "--profile", args.profile, "--layers", str(args.layers)]
+        if args.dense_layers:
+            cmd.extend(["--dense-layers", str(args.dense_layers)])
+        if args.arch:
+            cmd.extend(["--arch", args.arch])
+        if args.output:
+            cmd.extend(["-o", args.output])
+        subprocess.run(cmd, check=True)
+        sys.exit(0)
+
+    # Need at least input for quantization / dry-run
+    if not args.input:
+        parser.error("Input GGUF file is required (or use --generate-config)")
 
     # Generate config
     config_file = None
@@ -151,17 +194,6 @@ def main():
             sys.exit(1)
         config_file = args.config
         print(f">>> Using config: {config_file}")
-    elif args.generate_config:
-        cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
-               "--profile", args.profile, "--layers", str(args.layers)]
-        if args.dense_layers:
-            cmd.extend(["--dense-layers", str(args.dense_layers)])
-        if args.arch:
-            cmd.extend(["--arch", args.arch])
-        if args.output:
-            cmd.extend(["-o", args.output])
-        subprocess.run(cmd, check=True)
-        sys.exit(0)
     else:
         tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         tmpfile.close()
@@ -175,13 +207,6 @@ def main():
             cmd.extend(["--arch", args.arch])
         subprocess.run(cmd, check=True)
         print(f">>> Generated config for profile '{args.profile}' ({args.layers} layers)")
-
-    if args.generate_config:
-        sys.exit(0)
-
-    # Need at least input
-    if not args.input:
-        parser.error("Input GGUF file is required")
 
     if not os.path.isfile(args.input):
         print(f"ERROR: Input file not found: {args.input}", file=sys.stderr)
