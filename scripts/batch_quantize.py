@@ -1,0 +1,809 @@
+#!/usr/bin/env python3
+"""APEX Batch Quantization Pipeline.
+
+Downloads a source GGUF model (bf16/f16/f32) and an importance matrix from
+HuggingFace, quantizes through APEX tiers 1-13 using quantize.py, and
+uploads every resulting GGUF to HuggingFace.
+
+Supports **resumable** execution: state is persisted to a JSON file so that
+re-running with identical arguments only performs remaining work.
+
+Concurrency:
+  * model + imatrix downloads run in parallel
+  * tiers are quantized sequentially, but tier N upload overlaps with
+    tier N+1 quantization (upload runs in a background thread)
+
+Usage:
+  python3 scripts/batch_quantize.py \\
+      --model user/source-model-GGUF \\
+      --imatrix user/imatrix-repo \\
+      --output user/model-APEX
+
+Output repos: {output}-tier1 .. {output}-tier13
+
+Environment / .env:
+  HF_TOKEN   HuggingFace access token
+"""
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Setup
+# ---------------------------------------------------------------------------
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SCRIPT_DIR.parent
+
+_interruption_requested = False
+
+
+def _handle_sigint(sig, frame):
+    global _interruption_requested
+    _interruption_requested = True
+    print("\n⚠  Interrupt requested — finishing current step …")
+
+
+signal.signal(signal.SIGINT, _handle_sigint)
+
+
+def _load_dotenv():
+    path = PROJECT_ROOT / ".env"
+    if not path.is_file():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip().strip("\"'")
+        if k and k not in os.environ:
+            os.environ[k] = v
+
+
+_load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+TIERS = list(range(1, 14))
+
+TIER_BASE_TYPE = {
+    1: "Q8_0", 2: "Q8_0", 3: "Q8_0", 4: "Q8_0", 5: "Q8_0", 6: "Q8_0",
+    7: "Q6_K", 8: "Q6_K", 9: "Q6_K",
+    10: "Q5_K_M", 11: "Q5_K_M", 12: "Q5_K_M",
+    13: "Q4_K_M",
+}
+
+
+# ---------------------------------------------------------------------------
+# Logging helpers
+# ---------------------------------------------------------------------------
+
+def _ts() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def log(msg: str):
+    print(f"[{_ts()}] {msg}", flush=True)
+
+
+def log_err(msg: str):
+    print(f"[{_ts()}] ❌ {msg}", file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# State persistence
+# ---------------------------------------------------------------------------
+
+class BatchState:
+    """JSON-backed state for resumable batch processing."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data: dict = {}
+        if path.exists():
+            try:
+                self.data = json.loads(path.read_text())
+            except (json.JSONDecodeError, OSError):
+                pass
+
+    # -- persistence --
+    def save(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(self.data, indent=2))
+
+    # -- top-level keys --
+    def get(self, key: str, default=None):
+        return self.data.get(key, default)
+
+    def set(self, key: str, value):
+        self.data[key] = value
+        self.save()
+
+    # -- per-tier helpers --
+    def _t(self, tier: int) -> dict:
+        return self.data.setdefault("tiers", {}).setdefault(str(tier), {})
+
+    def tier_status(self, tier: int) -> str:
+        return self._t(tier).get("status", "pending")
+
+    def set_tier(self, tier: int, status: str, **extra):
+        t = self._t(tier)
+        t["status"] = status
+        t["updated"] = datetime.now().isoformat()
+        t.update(extra)
+        self.save()
+
+    # -- source / imatrix helpers --
+    def mark_source(self, path: str, fmt: str):
+        self.data["source"] = {"path": path, "format": fmt, "status": "downloaded"}
+        self.save()
+
+    def mark_imatrix(self, path: str):
+        self.data["imatrix"] = {"path": path, "status": "downloaded"}
+        self.save()
+
+    def source_info(self) -> Optional[dict]:
+        return self.data.get("source") if self.data.get("source", {}).get("status") == "downloaded" else None
+
+    def imatrix_info(self) -> Optional[dict]:
+        return self.data.get("imatrix") if self.data.get("imatrix", {}).get("status") == "downloaded" else None
+
+
+# ---------------------------------------------------------------------------
+# Rich display  (optional — falls back to plain text)
+# ---------------------------------------------------------------------------
+
+_HAS_RICH = False
+try:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
+    _HAS_RICH = True
+except ImportError:
+    pass
+
+console = Console() if _HAS_RICH else None
+
+_STATUS_STYLE = {
+    "pending":    "dim",
+    "quantizing": "yellow",
+    "quantized":  "cyan",
+    "uploading":  "magenta",
+    "uploaded":   "green",
+    "error":      "bold red",
+    "done":       "bold green",
+}
+
+_STATUS_ICON = {
+    "pending":    "○",
+    "quantizing": "◉",
+    "quantized":  "◇",
+    "uploading":  "↑",
+    "uploaded":   "✓",
+    "error":      "✗",
+    "done":       "✓",
+}
+
+
+def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool):
+    """Render the current status to the terminal."""
+    if _HAS_RICH:
+        from rich.text import Text
+        table = Table(show_lines=False, expand=False, padding=(0, 1))
+        table.add_column("Tier", justify="right", style="bold", width=6)
+        table.add_column("Base", width=7)
+        table.add_column("Status", min_width=26)
+        table.add_column("Info", min_width=16, style="dim")
+        for tier in TIERS:
+            base = TIER_BASE_TYPE[tier]
+            st = state.tier_status(tier)
+            icon = _STATUS_ICON.get(st, "?")
+            style = _STATUS_STYLE.get(st, "")
+            info = ""
+            if st == "error":
+                info = state._t(tier).get("error_short", "")
+            elif st == "uploaded":
+                sz = state._t(tier).get("size_mb")
+                if sz:
+                    info = f"{sz} MB"
+            table.add_row(
+                f"tier{tier}",
+                base,
+                Text(f" {icon} {st}", style=style),
+                info,
+            )
+        src_label = "✓ downloaded" if source_ok else "… pending"
+        imx_label = "✓ downloaded" if imatrix_ok else "… pending"
+        header = Text(f"Source:  {src_label}\nImatrix: {imx_label}", style="bold")
+        panel = Panel(table, title="[bold]APEX Batch Quantization[/bold]",
+                       subtitle=header, border_style="blue")
+        console.print(panel)
+    else:
+        print(f"\n  {'Tier':<6} {'Base':<8} {'Status'}")
+        print(f"  {'─'*6} {'─'*8} {'─'*20}")
+        for tier in TIERS:
+            base = TIER_BASE_TYPE[tier]
+            st = state.tier_status(tier)
+            icon = _STATUS_ICON.get(st, "?")
+            print(f"  {tier:<6} {base:<8} {icon} {st}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace helpers
+# ---------------------------------------------------------------------------
+
+def _get_hf_token() -> Optional[str]:
+    return os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+
+
+def _check_hf_import():
+    try:
+        import huggingface_hub  # noqa: F401
+    except ImportError:
+        log_err("huggingface_hub is not installed. Run: pip install huggingface_hub")
+        sys.exit(1)
+
+
+def _list_repo_gguf_files(repo_id: str, token: Optional[str]) -> list:
+    """Return list of .gguf filenames in a HF repo."""
+    from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+    return [f for f in files if f.endswith(".gguf")]
+
+
+def _pick_source_gguf(gguf_files: list) -> str:
+    """Pick the bf16/f16/f32 source file from a list of .gguf filenames."""
+    import re
+    # priority: bf16 > f16 > f32 (case-insensitive)
+    for pattern in (r"bf16", r"Bf16", r"BF16"):
+        for f in gguf_files:
+            if re.search(pattern, f):
+                return f
+    for pattern in (r"\bf16\b", r"\bF16\b"):
+        for f in gguf_files:
+            if re.search(pattern, f, re.IGNORECASE):
+                return f
+    for pattern in (r"\bf32\b", r"\bF32\b"):
+        for f in gguf_files:
+            if re.search(pattern, f, re.IGNORECASE):
+                return f
+    if gguf_files:
+        return gguf_files[0]
+    return ""
+
+
+def _pick_imatrix_file(files: list) -> str:
+    """Pick an imatrix file from a HF repo file list."""
+    import re
+    cands = [f for f in files if re.search(r"imatrix", f, re.IGNORECASE)]
+    if cands:
+        cands.sort(reverse=True)
+        return cands[0]
+    # Also accept .dat files
+    dat_files = [f for f in files if f.endswith(".dat")]
+    if dat_files:
+        dat_files.sort(reverse=True)
+        return dat_files[0]
+    return ""
+
+
+# ---------------------------------------------------------------------------
+# Download
+# ---------------------------------------------------------------------------
+
+def download_source_model(
+    repo_id: str,
+    workspace: Path,
+    token: Optional[str],
+    source_file: str,
+) -> Path:
+    """Download the source GGUF from HF, return local path."""
+    from huggingface_hub import snapshot_download
+    target_dir = workspace / "source_model"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Downloading source model {repo_id} → {target_dir}  (file: {source_file})")
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        local_dir=str(target_dir),
+        allow_patterns=[source_file],
+        token=token,
+    )
+    result = Path(local_dir) / source_file
+    if not result.exists():
+        # fallback: find any .gguf in the downloaded dir
+        ggufs = list(Path(local_dir).glob("*.gguf"))
+        if ggufs:
+            result = ggufs[0]
+        else:
+            raise FileNotFoundError(f"No .gguf found after downloading {repo_id}")
+    log(f"Source model ready: {result.name}  ({result.stat().st_size / (1024**3):.2f} GB)")
+    return result
+
+
+def download_imatrix(
+    repo_id: str,
+    workspace: Path,
+    token: Optional[str],
+    imatrix_file: str,
+) -> Path:
+    """Download the imatrix file from HF, return local path."""
+    from huggingface_hub import snapshot_download
+    target_dir = workspace / "imatrix"
+    target_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Downloading imatrix {repo_id} → {target_dir}  (file: {imatrix_file})")
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        repo_type="model",
+        local_dir=str(target_dir),
+        allow_patterns=[imatrix_file],
+        token=token,
+    )
+    result = Path(local_dir) / imatrix_file
+    if not result.exists():
+        cands = list(Path(local_dir).glob("*imatrix*")) + list(Path(local_dir).glob("*.dat"))
+        if cands:
+            result = cands[0]
+        else:
+            raise FileNotFoundError(f"No imatrix file found after downloading {repo_id}")
+    log(f"Imatrix ready: {result.name}  ({result.stat().st_size / (1024**2):.1f} MB)")
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Quantize
+# ---------------------------------------------------------------------------
+
+def run_quantize(
+    tier: int,
+    source_gguf: Path,
+    imatrix_path: Path,
+    output_gguf: Path,
+) -> None:
+    """Run quantize.py for a single tier. Raises on failure."""
+    cmd = [
+        sys.executable, str(SCRIPT_DIR / "quantize.py"),
+        "--profile", f"tier{tier}",
+        "--imatrix", str(imatrix_path),
+        str(source_gguf), str(output_gguf),
+    ]
+    log(f"Quantizing tier{tier} → {output_gguf.name}")
+    proc = subprocess.run(cmd, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(f"quantize.py exited with code {proc.returncode}")
+
+
+# ---------------------------------------------------------------------------
+# Upload
+# ---------------------------------------------------------------------------
+
+def upload_tier(
+    tier: int,
+    gguf_path: Path,
+    repo_id: str,
+    token: Optional[str],
+) -> None:
+    """Upload a quantized GGUF to HuggingFace."""
+    from huggingface_hub import create_repo, upload_folder
+    if not gguf_path.exists():
+        raise FileNotFoundError(f"GGUF file not found for upload: {gguf_path}")
+    if gguf_path.stat().st_size == 0:
+        raise ValueError(f"GGUF file is empty: {gguf_path}")
+
+    log(f"Uploading tier{tier} ({gguf_path.name}, "
+        f"{gguf_path.stat().st_size / (1024**3):.2f} GB) → {repo_id}")
+
+    create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=token)
+
+    with tempfile.TemporaryDirectory(prefix=f"apex_upload_t{tier}_") as tmpdir:
+        link = Path(tmpdir) / gguf_path.name
+        link.symlink_to(gguf_path.resolve())
+        upload_folder(
+            folder_path=tmpdir,
+            repo_id=repo_id,
+            repo_type="model",
+            token=token,
+            commit_message=f"APEX tier{tier} quantization",
+        )
+    log(f"✓ Uploaded tier{tier} → {repo_id}")
+
+
+# ---------------------------------------------------------------------------
+# Pipeline
+# ---------------------------------------------------------------------------
+
+def run_pipeline(args):
+    _check_hf_import()
+
+    token = args.token or _get_hf_token()
+    if not token:
+        log_err("No HF token found. Set HF_TOKEN in .env or pass --token.")
+        sys.exit(1)
+
+    workspace = Path(args.workspace).resolve()
+    workspace.mkdir(parents=True, exist_ok=True)
+    state_path = workspace / ".batch_quant_state.json"
+    state = BatchState(state_path)
+
+    # Parse output base repo id (org/name)
+    output_base = args.output.rstrip("/")
+    if not output_base or "/" not in output_base:
+        log_err("--output must be in the form org/name  (e.g. MyOrg/Model-APEX)")
+        sys.exit(1)
+
+    tiers = list(range(args.tiers[0], args.tiers[1] + 1))
+    output_dir = workspace / "quantized"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── header ──
+    log("=" * 60)
+    log("  APEX Batch Quantization Pipeline")
+    log("=" * 60)
+    log(f"  Model:    {args.model}")
+    log(f"  Imatrix:  {args.imatrix}")
+    log(f"  Output:   {output_base}-tierN")
+    log(f"  Tiers:    {tiers[0]}..{tiers[-1]}")
+    log(f"  Workspace: {workspace}")
+    log("=" * 60)
+
+    display_status(state, source_ok=state.source_info() is not None, imatrix_ok=state.imatrix_info() is not None)
+
+    # ── 1. Discover & download source model + imatrix ──
+    source_info = state.source_info()
+    if source_info:
+        source_gguf = Path(source_info["path"])
+        if source_gguf.exists():
+            log(f"✓ Source model already downloaded: {source_gguf.name}")
+        else:
+            source_info = None
+            state.data.pop("source", None)
+            state.save()
+
+    imatrix_info = state.imatrix_info()
+    if imatrix_info:
+        imatrix_path = Path(imatrix_info["path"])
+        if imatrix_path.exists():
+            log(f"✓ Imatrix already downloaded: {imatrix_path.name}")
+        else:
+            imatrix_info = None
+            state.data.pop("imatrix", None)
+            state.save()
+
+    # ── discover files + download both in parallel ──
+    if not source_info or not imatrix_info:
+        from huggingface_hub import HfApi
+        api = HfApi(token=token)
+        if not source_info:
+            src_files = api.list_repo_files(repo_id=args.model, repo_type="model")
+        else:
+            src_files = []
+        if not imatrix_info:
+            imx_files = api.list_repo_files(repo_id=args.imatrix, repo_type="model")
+        else:
+            imx_files = []
+
+        # resolve source file
+        if not source_info:
+            gguf_files = [f for f in src_files if f.endswith(".gguf")]
+            if not gguf_files:
+                log_err(f"No .gguf files found in {args.model}")
+                sys.exit(1)
+            source_file = (getattr(args, "source_file", None)
+                           or _pick_source_gguf(gguf_files))
+            if not source_file:
+                log_err(f"Could not determine source file in {args.model}. "
+                        f"Found: {gguf_files}")
+                sys.exit(1)
+            if len(gguf_files) > 1:
+                log(f"Found {len(gguf_files)} .gguf files, selected: {source_file}")
+
+        # resolve imatrix file
+        if not imatrix_info:
+            imatrix_file = (getattr(args, "imatrix_file", None)
+                            or _pick_imatrix_file(imx_files))
+            if not imatrix_file:
+                log_err(f"Could not find imatrix file in {args.imatrix}. "
+                        f"Files: {imx_files}")
+                sys.exit(1)
+            log(f"Selected imatrix file: {imatrix_file}")
+
+        # download both in parallel
+        dl_futures = {}
+        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="download") as dl_pool:
+            if not source_info:
+                dl_futures["source"] = dl_pool.submit(
+                    download_source_model, args.model, workspace, token, source_file)
+            if not imatrix_info:
+                dl_futures["imatrix"] = dl_pool.submit(
+                    download_imatrix, args.imatrix, workspace, token, imatrix_file)
+
+            # wait for both
+            for key, fut in dl_futures.items():
+                try:
+                    result = fut.result()
+                except Exception as exc:
+                    log_err(f"Download failed ({key}): {exc}")
+                    sys.exit(1)
+                if key == "source":
+                    source_gguf = result
+                    state.mark_source(str(result), source_file)
+                else:
+                    imatrix_path = result
+                    state.mark_imatrix(str(result))
+
+        log("✓ Both downloads complete.")
+
+    # ── Determine which tiers need work ──
+    display_status(state, source_ok=True, imatrix_ok=True)
+
+    needs_work = []
+    for tier in tiers:
+        st = state.tier_status(tier)
+        if st == "uploaded":
+            log(f"✓ tier{tier}: already uploaded, skipping")
+            continue
+        needs_work.append(tier)
+
+    if not needs_work:
+        log("\n✅ All tiers completed. Nothing to do.")
+        _print_summary(state, tiers, output_base)
+        return
+
+    log(f"\nTiers to process: {needs_work}")
+
+    # ── 3. Quantize + Upload pipeline ──
+    # upload N-1 overlaps with quantize N
+    upload_executor = ThreadPoolExecutor(max_workers=1)
+    pending_upload: Optional[tuple] = None  # (tier, Future)
+
+    def _wait_pending_upload():
+        nonlocal pending_upload
+        if pending_upload is None:
+            return
+        tier_p, fut = pending_upload
+        try:
+            fut.result()
+            state.set_tier(tier_p, "uploaded",
+                           size_mb=round(
+                               (output_dir / f"tier{tier_p}.gguf").stat().st_size
+                               / (1024**2), 1
+                           ) if (output_dir / f"tier{tier_p}.gguf").exists() else None)
+        except Exception as exc:
+            err = str(exc)[:120]
+            log_err(f"tier{tier_p} upload failed: {err}")
+            state.set_tier(tier_p, "error", error=str(exc)[:300],
+                           error_short=err[:40])
+        pending_upload = None
+
+    processed = []
+    failed = []
+
+    try:
+        for tier in needs_work:
+            if _interruption_requested:
+                log("⚠ Pipeline interrupted by user.")
+                break
+
+            output_gguf = output_dir / f"tier{tier}.gguf"
+            st = state.tier_status(tier)
+
+            # ── quantize ──
+            if st in ("pending", "error", "quantized"):
+                # If quantized but file missing, re-quantize
+                if st == "quantized" and output_gguf.exists() and output_gguf.stat().st_size > 0:
+                    log(f"✓ tier{tier}: quantized file exists, skipping quantize")
+                else:
+                    state.set_tier(tier, "quantizing")
+                    display_status(state, True, True)
+                    t0 = time.time()
+                    try:
+                        run_quantize(tier, source_gguf, imatrix_path, output_gguf)
+                    except Exception as exc:
+                        err = str(exc)[:120]
+                        log_err(f"tier{tier} quantize failed: {err}")
+                        state.set_tier(tier, "error", error=str(exc)[:300],
+                                       error_short=err[:40])
+                        failed.append(tier)
+                        if output_gguf.exists() and output_gguf.stat().st_size == 0:
+                            output_gguf.unlink(missing_ok=True)
+                        continue
+                    elapsed = time.time() - t0
+                    m, s = divmod(int(elapsed), 60)
+                    h, m = divmod(m, 60)
+                    sz_mb = output_gguf.stat().st_size / (1024**2)
+                    log(f"✓ tier{tier}: quantized in {h:02d}:{m:02d}:{s:02d}  "
+                        f"({sz_mb:.1f} MB)")
+                    state.set_tier(tier, "quantized", size_mb=round(sz_mb, 1))
+            elif st == "uploading":
+                # interrupted during upload — re-upload below
+                log(f"tier{tier}: was uploading, will retry")
+            else:
+                log(f"tier{tier}: status={st}, will proceed to upload")
+
+            display_status(state, True, True)
+
+            # ── wait for previous upload to finish ──
+            _wait_pending_upload()
+
+            # ── skip upload if interrupted ──
+            if _interruption_requested:
+                break
+
+            # ── start upload in background ──
+            repo_id = f"{output_base}-tier{tier}"
+            state.set_tier(tier, "uploading")
+            display_status(state, True, True)
+
+            def _do_upload(t=tier, rid=repo_id, p=output_gguf):
+                upload_tier(t, p, rid, token)
+
+            pending_upload = (tier, upload_executor.submit(_do_upload))
+            processed.append(tier)
+
+        # ── wait for the very last upload ──
+        _wait_pending_upload()
+        upload_executor.shutdown(wait=True)
+
+    except KeyboardInterrupt:
+        log_err("Forced interrupt — saving state and cleaning up.")
+        _wait_pending_upload()
+        upload_executor.shutdown(wait=False, cancel_futures=True)
+    except Exception as exc:
+        log_err(f"Unexpected error: {exc}")
+        _wait_pending_upload()
+        upload_executor.shutdown(wait=False, cancel_futures=True)
+
+    # ── 4. Cleanup incomplete outputs ──
+    _cleanup_incomplete(state, output_dir)
+
+    # ── 5. Final report ──
+    _print_summary(state, tiers, output_base)
+
+
+def _cleanup_incomplete(state: BatchState, output_dir: Path):
+    """Delete quantized GGUFs for tiers that are not fully uploaded."""
+    count = 0
+    for tier in TIERS:
+        st = state.tier_status(tier)
+        if st in ("uploaded", "done"):
+            continue
+        gguf = output_dir / f"tier{tier}.gguf"
+        if gguf.exists():
+            sz = gguf.stat().st_size / (1024**3)
+            gguf.unlink()
+            log(f"🗑  Removed incomplete file: {gguf.name}  ({sz:.2f} GB)")
+            count += 1
+    if count:
+        log(f"Cleaned up {count} incomplete file(s).")
+
+
+def _print_summary(state: BatchState, tiers: list, output_base: str):
+    """Print a final summary table."""
+    log("\n" + "=" * 60)
+    log("  Final Report")
+    log("=" * 60)
+
+    uploaded = []
+    quantized_pending = []
+    errors = []
+
+    for tier in tiers:
+        st = state.tier_status(tier)
+        info = state._t(tier)
+        repo = f"{output_base}-tier{tier}"
+        sz = info.get("size_mb", "?")
+        if st == "uploaded":
+            uploaded.append((tier, repo, sz))
+        elif st in ("quantized", "quantizing", "uploading"):
+            quantized_pending.append((tier, st))
+        elif st == "error":
+            errors.append((tier, info.get("error_short", "unknown")))
+        # pending tiers just sit in neither list
+
+    pending_count = len(tiers) - len(uploaded) - len(quantized_pending) - len(errors)
+
+    if uploaded:
+        log(f"\n  ✅ Uploaded ({len(uploaded)}):")
+        for tier, repo, sz in uploaded:
+            log(f"     tier{tier:<3}  {sz} MB  →  https://huggingface.co/{repo}")
+
+    if quantized_pending:
+        log(f"\n  📦 Quantized but not uploaded ({len(quantized_pending)}):")
+        for tier, st in quantized_pending:
+            log(f"     tier{tier:<3}  (status: {st})")
+
+    if errors:
+        log(f"\n  ❌ Errors ({len(errors)}):")
+        for tier, err in errors:
+            log(f"     tier{tier:<3}  {err}")
+
+    if pending_count > 0:
+        log(f"\n  ○  Not started: {pending_count}")
+
+    failed_quant = [t for t, _ in errors]
+    not_uploaded = [t for t, _ in quantized_pending]
+    if failed_quant or not_uploaded:
+        log(f"\n  ⚠  Incomplete tiers: {sorted(failed_quant + not_uploaded)}")
+        log("     Re-run the script with the same arguments to retry.")
+
+    log("\n" + "=" * 60)
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def _parse_tiers(s: str) -> tuple:
+    """Parse '1-13', '1,5,7', '3-8' into (start, end)."""
+    s = s.strip()
+    if "-" in s:
+        a, b = s.split("-", 1)
+        return int(a), int(b)
+    if "," in s:
+        nums = [int(x) for x in s.split(",")]
+        return min(nums), max(nums)
+    n = int(s)
+    return n, n
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="APEX Batch Quantization Pipeline",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  python3 scripts/batch_quantize.py \\\n"
+            "    --model bullerwins/Qwen3.5-35B-A3B-GGUF \\\n"
+            "    --imatrix bullerwins/Qwen3.5-35B-A3B-imatrix-GGUF \\\n"
+            "    --output user/Qwen3.5-35B-A3B-APEX\n"
+        ),
+    )
+    parser.add_argument("--model", "-m", required=True,
+                        help="HF repo with source GGUF  (e.g. user/model-GGUF)")
+    parser.add_argument("--imatrix", "-i", required=True,
+                        help="HF repo with imatrix file (e.g. user/imatrix-GGUF)")
+    parser.add_argument("--output", "-o", required=True,
+                        help="Base repo id for output (org/name). Tier repos will be "
+                             "{output}-tier1 .. {output}-tier13")
+    parser.add_argument("--tiers", default="1-13",
+                        help="Tier range, e.g. '1-13' or '3-8' (default: 1-13)")
+    parser.add_argument("--workspace", "-w",
+                        default=str(Path.home() / "apex_batch"),
+                        help="Workspace directory for state & intermediate files "
+                             "(default: ~/apex_batch)")
+    parser.add_argument("--token", "-t",
+                        help="HF token (default: $HF_TOKEN from env / .env)")
+    parser.add_argument("--source-file",
+                        help="Explicit source GGUF filename (skip auto-detection)")
+    parser.add_argument("--imatrix-file",
+                        help="Explicit imatrix filename (skip auto-detection)")
+
+    args = parser.parse_args()
+    args.tiers = _parse_tiers(args.tiers)
+
+    if not (1 <= args.tiers[0] <= args.tiers[1] <= 13):
+        log_err("--tiers must be in range 1-13")
+        sys.exit(1)
+
+    run_pipeline(args)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+# ── Core (batch quantization pipeline) ──────────────────────
+huggingface_hub>=0.20.0        # download/upload models from HuggingFace
+rich>=13.0                     # rich terminal display (optional, falls back to plain text)
+
+# ── Plotting (benchmark visualization scripts) ─────────────
+# matplotlib>=3.7
+# numpy>=1.24
+# adjustText>=0.8
+
+# ── Calibration (generate_imatrix_calibration.py) ──────────
+transformers>=4.30
