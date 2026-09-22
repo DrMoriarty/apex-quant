@@ -84,6 +84,8 @@ def main():
     parser.add_argument("--layers", "-l", type=int,
                         default=int(os.environ.get("NUM_LAYERS", 40)),
                         help="Number of transformer layers (default: 40)")
+    parser.add_argument("--dense-layers", type=int, default=0,
+                        help="Leading dense (non-MoE) FFN layers (default: 0)")
     parser.add_argument("--generate-config", action="store_true",
                         help="Generate config only (no quantization)")
     parser.add_argument("--dry-run", action="store_true",
@@ -126,6 +128,8 @@ def main():
     elif args.generate_config:
         cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
                "--profile", args.profile, "--layers", str(args.layers)]
+        if args.dense_layers:
+            cmd.extend(["--dense-layers", str(args.dense_layers)])
         if args.output:
             cmd.extend(["-o", args.output])
         subprocess.run(cmd, check=True)
@@ -137,6 +141,8 @@ def main():
         cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
                "--profile", args.profile, "--layers", str(args.layers),
                "-o", config_file]
+        if args.dense_layers:
+            cmd.extend(["--dense-layers", str(args.dense_layers)])
         subprocess.run(cmd, check=True)
         print(f">>> Generated config for profile '{args.profile}' ({args.layers} layers)")
 
