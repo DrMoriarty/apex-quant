@@ -41,7 +41,17 @@ ALWAYS_F32 = [
     re.compile(r"blk\.\d+\.attn_norm\.weight$"),
     re.compile(r"blk\.\d+\.attn_q_norm\.weight$"),
     re.compile(r"blk\.\d+\.ffn_gate_inp\.weight$"),
+    re.compile(r"blk\.\d+\.ffn_gate_inp_shexp\.weight$"),
+    re.compile(r"blk\.\d+\.post_attention_norm\.weight$"),
+    re.compile(r"blk\.\d+\.ssm_a$"),
+    re.compile(r"blk\.\d+\.ssm_conv1d\.weight$"),
+    re.compile(r"blk\.\d+\.ssm_dt\.bias$"),
+    re.compile(r"blk\.\d+\.ssm_norm\.weight$"),
     re.compile(r"output_norm\.weight$"),
+    # lfm2moe
+    re.compile(r"token_embd_norm\.weight$"),
+    re.compile(r"blk\.\d+\.shortconv\.conv\.weight$"),
+    re.compile(r"blk\.\d+\.exp_probs_b\.bias"),
 ]
 
 

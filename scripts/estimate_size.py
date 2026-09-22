@@ -117,7 +117,17 @@ ALWAYS_F32 = [
     re.compile(r"blk\.\d+\.attn_norm\.weight$"),
     re.compile(r"blk\.\d+\.attn_q_norm\.weight$"),
     re.compile(r"blk\.\d+\.ffn_gate_inp\.weight$"),
+    re.compile(r"blk\.\d+\.ffn_gate_inp_shexp\.weight$"),
+    re.compile(r"blk\.\d+\.post_attention_norm\.weight$"),
+    re.compile(r"blk\.\d+\.ssm_a$"),
+    re.compile(r"blk\.\d+\.ssm_conv1d\.weight$"),
+    re.compile(r"blk\.\d+\.ssm_dt\.bias$"),
+    re.compile(r"blk\.\d+\.ssm_norm\.weight$"),
     re.compile(r"output_norm\.weight$"),
+    # lfm2moe
+    re.compile(r"token_embd_norm\.weight$"),
+    re.compile(r"blk\.\d+\.shortconv\.conv\.weight$"),
+    re.compile(r"blk\.\d+\.exp_probs_b\.bias"),
 ]
 
 GROUP_EXPERTS = re.compile(r"blk\.\d+\.ffn_")
@@ -254,11 +264,11 @@ def main():
         description="Estimate quantized GGUF size without quantizing",
     )
     parser.add_argument("--profile", "-p",
-                        help="Profile name (default: balanced)")
+                        help="Profile name (default: balanced)", default="tier1")
     parser.add_argument("--config", "-c",
                         help="Custom tensor-type file")
-    parser.add_argument("--base-type", "-b", default="Q6_K",
-                        help="Base quant type (default: Q6_K)")
+    parser.add_argument("--base-type", "-b", default="Q8_0",
+                        help="Base quant type (default: Q8_0)")
     parser.add_argument("--layers", "-l", type=int,
                         default=int(os.environ.get("NUM_LAYERS", 40)),
                         help="Number of transformer layers (default: 40)")
@@ -274,11 +284,21 @@ def main():
 
     profile = args.profile or "balanced"
 
+    # Base type per profile
     base_type_map = {
-        "quality": "Q6_K", "i-quality": "Q6_K",
-        "balanced": "Q6_K", "i-balanced": "Q6_K",
-        "compact": "Q4_K", "i-compact": "Q4_K_M",
-        "mini": "Q3_K",
+        "tier1": "Q8_0", 
+        "tier2": "Q8_0", 
+        "tier3": "Q8_0", 
+        "tier4": "Q8_0", 
+        "tier5": "Q8_0", 
+        "tier6": "Q8_0", 
+        "tier7": "Q6_K", 
+        "tier8": "Q6_K", 
+        "tier9": "Q6_K", 
+        "tier10": "Q5_K", 
+        "tier11": "Q5_K", 
+        "tier12": "Q5_K", 
+        "tier13": "Q4_K", 
     }
     base = base_type_map.get(profile, args.base_type).upper()
 
