@@ -176,6 +176,7 @@ def estimate(tensors, rules, base):
     by_type = defaultdict(int)
     group_params = defaultdict(int)
     group_bits = defaultdict(float)
+    cat_type_bits = defaultdict(lambda: defaultdict(float))
     uncovered = 0
     uncovered_names = []
 
@@ -188,6 +189,7 @@ def estimate(tensors, rules, base):
             total_bits += bits
             by_type["F32"] += numel
             group_bits[group] += bits
+            cat_type_bits[group]["F32"] += bits
             continue
 
         qtype = match_type(name, rules)
@@ -203,9 +205,10 @@ def estimate(tensors, rules, base):
         total_bits += bits
         by_type[qtype] += numel
         group_bits[group] += bits
+        cat_type_bits[group][qtype] += bits
 
     size_gb = total_bits / 8 / 1e9
-    return size_gb, by_type, uncovered, uncovered_names, group_params, group_bits
+    return size_gb, by_type, uncovered, uncovered_names, group_params, group_bits, cat_type_bits
 
 
 # ── Compare: show actual GGUF breakdown ──────────────────────────────────────
@@ -387,7 +390,7 @@ def main():
 
         # ── Estimate from config (with optional compare) ──
         rules = load_config(config_file)
-        size_gb, by_type, uncovered, uncovered_names, group_params, group_bits = estimate(tensors, rules, base)
+        size_gb, by_type, uncovered, uncovered_names, group_params, group_bits, cat_type_bits = estimate(tensors, rules, base)
 
         if args.quiet:
             print(f"{size_gb:.3f}")
@@ -401,6 +404,7 @@ def main():
         print(f"rules:     {len(rules)} (uncovered fall back to {base}: {uncovered})")
         print(f"\nestimated output size: {size_gb:.2f} GB\n")
         print(f"{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
+        print("-" * 45)
         for grp in ("Experts", "ShExperts", "Attention", "MTP", "Other"):
             gp = group_params.get(grp, 0)
             if gp == 0:
@@ -408,10 +412,27 @@ def main():
             gb = group_bits.get(grp, 0.0) / 8 / 1e9
             print(f"{grp:<14}{gp / 1e9:>10.3f} B{100 * gp / total_params:>8.1f}%{gb:>9.2f} GB")
         print(f"\n{'type':<14}{'params':>12}{'share':>9}{'size':>10}")
+        print("-" * 45)
         for qtype, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
             bpw = BPW.get(qtype, 32.0)
             gb = n * bpw / 8 / 1e9
             print(f"{qtype:<14}{n / 1e9:>10.3f} B{100 * n / total_params:>8.1f}%{gb:>9.2f} GB")
+
+        est_groups = [g for g in ("Experts", "ShExperts", "Attention", "MTP", "Other")
+                      if group_params.get(g, 0) > 0]
+        all_types = sorted({t for d in cat_type_bits.values() for t in d},
+                          key=lambda t: -sum(cat_type_bits[c].get(t, 0) for c in est_groups))
+        if len(all_types) > 1:
+            hdr = f"\n{'group':<14}" + "".join(f"{t:>10}" for t in all_types)
+            print(hdr)
+            print("-" * (14 + 10 * len(all_types)))
+            for grp in est_groups:
+                row = f"{grp:<14}"
+                for t in all_types:
+                    gb = cat_type_bits[grp].get(t, 0) / 8 / 1e9
+                    row += f"{gb:>9.2f} "
+                print(row)
+
         if args.verbose and uncovered_names:
             print(f"\nuncovered tensors ({len(uncovered_names)}):")
             for name in uncovered_names:
