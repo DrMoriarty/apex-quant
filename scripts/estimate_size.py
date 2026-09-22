@@ -133,9 +133,12 @@ ALWAYS_F32 = [
 GROUP_EXPERTS = re.compile(r"blk\.\d+\.ffn_(gate|up|down)_exps")
 GROUP_SHEXPERTS = re.compile(r"blk\.\d+\.ffn_(gate|up|down)_shexp")
 GROUP_ATTENTION = re.compile(r"blk\.\d+\.attn_")
+GROUP_MTP_NAME = re.compile(r"blk\.\d+\.(nextn|mtl|mtp|future)\.")
 
 
 def _classify_group(name):
+    if GROUP_MTP_NAME.search(name):
+        return "MTP"
     if GROUP_SHEXPERTS.search(name):
         return "ShExperts"
     if GROUP_EXPERTS.search(name):
@@ -240,19 +243,19 @@ def print_gguf_breakdown(tensors):
 
     print(f"\n{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
     print("-" * 48)
-    for grp in ("Experts", "ShExperts", "Attention", "Other"):
+    for grp in ("Experts", "ShExperts", "Attention", "MTP", "Other"):
         gp = group_params.get(grp, 0)
         gb = group_bits.get(grp, 0.0) / 8 / 1e9
         print(f"{grp:<14}{gp/1e9:>10.3f} B{100*gp/total_params:>8.1f}%{gb:>9.2f} GB")
 
     all_types = sorted({t for d in cat_type_bits.values() for t in d},
                        key=lambda t: -sum(cat_type_bits[c].get(t, 0) for c in
-                                          ("Experts", "ShExperts", "Attention", "Other")))
+                                          ("Experts", "ShExperts", "Attention", "MTP", "Other")))
     if len(all_types) > 1:
         hdr = f"\n{'group':<14}" + "".join(f"{t:>10}" for t in all_types)
         print(hdr)
         print("-" * (14 + 10 * len(all_types)))
-        for grp in ("Experts", "ShExperts", "Attention", "Other"):
+        for grp in ("Experts", "ShExperts", "Attention", "MTP", "Other"):
             row = f"{grp:<14}"
             for t in all_types:
                 gb = cat_type_bits[grp].get(t, 0) / 8 / 1e9
@@ -361,7 +364,7 @@ def main():
         print(f"rules:     {len(rules)} (uncovered fall back to {base}: {uncovered})")
         print(f"\nestimated output size: {size_gb:.2f} GB\n")
         print(f"{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
-        for grp in ("Experts", "ShExperts", "Attention", "Other"):
+        for grp in ("Experts", "ShExperts", "Attention", "MTP", "Other"):
             gp = group_params.get(grp, 0)
             gb = group_bits.get(grp, 0.0) / 8 / 1e9
             print(f"{grp:<14}{gp / 1e9:>10.3f} B{100 * gp / total_params:>8.1f}%{gb:>9.2f} GB")
