@@ -6,11 +6,29 @@ APEX quantizes MoE (and dense/hybrid) GGUF models via per-layer, per-tensor-type
 
 ## Key scripts and their roles
 
+Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based profiles). The Python scripts are the current primary interface shown in README.
+
+### Python scripts (primary — tier profiles: tier1–tier13, dense-*)
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/generate_config.py` | Emits tensor-type file; supports `--profile`, `--edge-exp`, `--layers`, `--dense-layers`, `--arch` |
+| `scripts/quantize.py` | Quantize GGUF; `--profile`, `--config`, `--imatrix`, `--dry-run`, `--generate-config` |
+| `scripts/estimate_size.py` | Predict GGUF size from a profile or config; `--compare` inspects tensor types × groups |
+| `scripts/detect_gguf_params.py` | Reads GGUF header to detect layers, arch, expert count (used by quantize.py) |
+
+### Shell scripts (legacy — named profiles: quality, balanced, compact, mini, nano, micro)
+
 | Script | Purpose |
 |--------|---------|
 | `scripts/generate_config.sh` | Emits a tensor-type file for `llama-quantize --tensor-type-file` |
 | `scripts/quantize.sh` | Wraps generate + llama-quantize; selects profile, finds binary |
-| `scripts/estimate_config_size.py` | Predicts GGUF size from a config + tensor inventory (prevents expensive re-quantizes) |
+
+### Shared scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/estimate_config_size.py` | Predicts GGUF size from a config + tensor inventory |
 | `scripts/eval.sh` | Runs PPL, KL, HellaSwag, Winogrande, MMLU, ARC, TruthfulQA, speed; outputs JSON |
 | `scripts/benchmark.sh` | Batch benchmarking with TSV output and optional plots |
 | `scripts/apex_pipeline.sh` | Full pipeline: download → convert → quantize → imatrix → eval → publish (YAML-driven) |
@@ -39,7 +57,12 @@ llama-quantize matches `--tensor-type-file` entries with `std::regex_search` —
 
 ## Config naming convention
 
-`configs/{prefix}_{profile}.txt` where prefix identifies the model (e.g., `qwen35a3b`, `laguna_xs21`) and profile is one of `quality`, `balanced`, `compact`, `mini`, plus I-variants and experimental tiers (`nano`, `micro`).
+`configs/{prefix}_{profile}.txt` where prefix identifies the model (e.g., `qwen35a3b`, `laguna_xs21`) and profile is one of:
+- **Legacy**: `quality`, `balanced`, `compact`, `mini`, plus I-variants and experimental tiers (`nano`, `micro`)
+- **Tier-based** (Python scripts): `tier1`–`tier13`
+- **Dense/hybrid**: `dense-flat`, `dense-grad`, `dense-hybrid`, `dense-hybrid-quality`
+
+Committed configs are the ground truth — `test_generate_config.sh` asserts the generator reproduces them byte-for-byte.
 
 ## Model definitions
 
@@ -47,7 +70,7 @@ llama-quantize matches `--tensor-type-file` entries with `std::regex_search` —
 
 ## Size estimation before quantizing
 
-Always use `scripts/estimate_config_size.py` to verify a config hits the target size band before running a 6-hour quantize. The dense experiment arms must be size-matched (≤0.20 GB spread) or the A/B is uninterpretable — the bash test enforces this.
+Always use `scripts/estimate_size.py` (or `scripts/estimate_config_size.py` for raw config files) to verify a config hits the target size band before running a 6-hour quantize. The dense experiment arms must be size-matched (≤0.20 GB spread) or the A/B is uninterpretable — the bash test enforces this.
 
 ## Environment variables
 
