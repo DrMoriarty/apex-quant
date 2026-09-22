@@ -243,19 +243,20 @@ def print_gguf_breakdown(tensors):
 
     print(f"\n{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
     print("-" * 48)
-    for grp in ("Experts", "ShExperts", "Attention", "MTP", "Other"):
+    groups = [g for g in ("Experts", "ShExperts", "Attention", "MTP", "Other")
+              if group_params.get(g, 0) > 0]
+    for grp in groups:
         gp = group_params.get(grp, 0)
         gb = group_bits.get(grp, 0.0) / 8 / 1e9
         print(f"{grp:<14}{gp/1e9:>10.3f} B{100*gp/total_params:>8.1f}%{gb:>9.2f} GB")
 
     all_types = sorted({t for d in cat_type_bits.values() for t in d},
-                       key=lambda t: -sum(cat_type_bits[c].get(t, 0) for c in
-                                          ("Experts", "ShExperts", "Attention", "MTP", "Other")))
+                       key=lambda t: -sum(cat_type_bits[c].get(t, 0) for c in groups))
     if len(all_types) > 1:
         hdr = f"\n{'group':<14}" + "".join(f"{t:>10}" for t in all_types)
         print(hdr)
         print("-" * (14 + 10 * len(all_types)))
-        for grp in ("Experts", "ShExperts", "Attention", "MTP", "Other"):
+        for grp in groups:
             row = f"{grp:<14}"
             for t in all_types:
                 gb = cat_type_bits[grp].get(t, 0) / 8 / 1e9
@@ -398,6 +399,8 @@ def main():
         print(f"{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
         for grp in ("Experts", "ShExperts", "Attention", "MTP", "Other"):
             gp = group_params.get(grp, 0)
+            if gp == 0:
+                continue
             gb = group_bits.get(grp, 0.0) / 8 / 1e9
             print(f"{grp:<14}{gp / 1e9:>10.3f} B{100 * gp / total_params:>8.1f}%{gb:>9.2f} GB")
         print(f"\n{'type':<14}{'params':>12}{'share':>9}{'size':>10}")
