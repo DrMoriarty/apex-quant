@@ -26,6 +26,7 @@ Environment:
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -68,6 +69,17 @@ def find_quantize():
     return None
 
 
+def detect_gguf_params(gguf_path):
+    """Detect architecture parameters from a GGUF file."""
+    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "detect_gguf_params.py"), gguf_path]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return json.loads(result.stdout)
+    except (subprocess.CalledProcessError, json.JSONDecodeError) as e:
+        print(f"Warning: failed to detect GGUF params: {e}", file=sys.stderr)
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="APEX quantization for llama.cpp",
@@ -86,6 +98,8 @@ def main():
                         help="Number of transformer layers (default: 40)")
     parser.add_argument("--dense-layers", type=int, default=0,
                         help="Leading dense (non-MoE) FFN layers (default: 0)")
+    parser.add_argument("--arch", choices=["moe", "dense"], default=None,
+                        help="Architecture: moe or dense (default: auto-detect)")
     parser.add_argument("--generate-config", action="store_true",
                         help="Generate config only (no quantization)")
     parser.add_argument("--dry-run", action="store_true",
@@ -115,6 +129,18 @@ def main():
     }
     args.base_type = base_type_map.get(args.profile, args.base_type)
 
+    # Auto-detect parameters if not provided
+    if args.input and os.path.isfile(args.input):
+        detected = detect_gguf_params(args.input)
+        if detected:
+            if args.layers == int(os.environ.get("NUM_LAYERS", 40)):
+                args.layers = detected["layers"]
+            if args.dense_layers == 0:
+                args.dense_layers = detected["dense_layers"]
+            if not hasattr(args, 'arch') or not args.arch:
+                args.arch = detected["arch"]
+            print(f">>> Detected from GGUF: arch={detected['arch']}, layers={detected['layers']}, dense_layers={detected['dense_layers']}")
+
     # Generate config
     config_file = None
     tmpfile = None
@@ -130,6 +156,8 @@ def main():
                "--profile", args.profile, "--layers", str(args.layers)]
         if args.dense_layers:
             cmd.extend(["--dense-layers", str(args.dense_layers)])
+        if args.arch:
+            cmd.extend(["--arch", args.arch])
         if args.output:
             cmd.extend(["-o", args.output])
         subprocess.run(cmd, check=True)
@@ -143,6 +171,8 @@ def main():
                "-o", config_file]
         if args.dense_layers:
             cmd.extend(["--dense-layers", str(args.dense_layers)])
+        if args.arch:
+            cmd.extend(["--arch", args.arch])
         subprocess.run(cmd, check=True)
         print(f">>> Generated config for profile '{args.profile}' ({args.layers} layers)")
 
