@@ -5,6 +5,10 @@ Downloads a source GGUF model (bf16/f16/f32) and an importance matrix from
 HuggingFace, quantizes through APEX tiers 1-13 using quantize.py, and
 uploads every resulting GGUF to HuggingFace.
 
+Manages a README.md in the output repo: downloads an existing README or
+creates one with source info, APEX attribution, and a quantization table.
+After all tiers are uploaded the README is pushed to the same repo.
+
 Supports **resumable** execution: state is persisted to a JSON file so that
 re-running with identical arguments only performs remaining work.
 
@@ -19,7 +23,7 @@ Usage:
       --imatrix user/imatrix-repo \\
       --output user/model-APEX
 
-Output repos: {output}-tier1 .. {output}-tier13
+Output repo: {output}  (all tier GGUFs in one repo)
 
 Environment / .env:
   HF_TOKEN   HuggingFace access token
@@ -163,6 +167,23 @@ class BatchState:
     def imatrix_info(self) -> Optional[dict]:
         return self.data.get("imatrix") if self.data.get("imatrix", {}).get("status") == "downloaded" else None
 
+    # -- README helpers --
+    def readme_initialized(self) -> bool:
+        return self.data.get("readme_initialized", False)
+
+    def mark_readme_initialized(self):
+        self.data["readme_initialized"] = True
+        self.save()
+
+    def readme_tiers(self) -> set:
+        return set(self.data.get("readme_tiers", []))
+
+    def mark_readme_tier(self, tier: int):
+        tiers = set(self.data.get("readme_tiers", []))
+        tiers.add(tier)
+        self.data["readme_tiers"] = sorted(tiers)
+        self.save()
+
 
 # ---------------------------------------------------------------------------
 # Rich display  (optional — falls back to plain text)
@@ -200,8 +221,11 @@ _STATUS_ICON = {
 }
 
 
-def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool):
+def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
+                   tiers: list = None):
     """Render the current status to the terminal."""
+    if tiers is None:
+        tiers = TIERS
     if _HAS_RICH:
         from rich.text import Text
         table = Table(show_lines=False, expand=False, padding=(0, 1))
@@ -209,7 +233,7 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool):
         table.add_column("Base", width=7)
         table.add_column("Status", min_width=26)
         table.add_column("Info", min_width=16, style="dim")
-        for tier in TIERS:
+        for tier in tiers:
             base = TIER_BASE_TYPE[tier]
             st = state.tier_status(tier)
             icon = _STATUS_ICON.get(st, "?")
@@ -236,7 +260,7 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool):
     else:
         print(f"\n  {'Tier':<6} {'Base':<8} {'Status'}")
         print(f"  {'─'*6} {'─'*8} {'─'*20}")
-        for tier in TIERS:
+        for tier in tiers:
             base = TIER_BASE_TYPE[tier]
             st = state.tier_status(tier)
             icon = _STATUS_ICON.get(st, "?")
@@ -302,6 +326,129 @@ def _pick_imatrix_file(files: list) -> str:
         dat_files.sort(reverse=True)
         return dat_files[0]
     return ""
+
+
+# ---------------------------------------------------------------------------
+# README management
+# ---------------------------------------------------------------------------
+
+README_HEADER = """\
+# APEX Quantized Models
+
+## Source Data
+
+The source data for quantization was taken from [{source_model}](https://huggingface.co/{source_model}).
+
+Original source file: `{source_file}`
+
+## Quantization Method
+
+All quants were produced using the **modified APEX** quantization scheme.
+
+APEX (Automated Precision EXpert allocation) assigns per-layer, per-tensor precision
+for MoE models using `llama.cpp`'s `--tensor-type-file`.
+
+For more information, see: <https://github.com/DrMoriarty/apex-quant/>
+
+## Quantized Models
+
+| Name | Size (GB) | Comments |
+|------|-----------|----------|
+"""
+
+
+def _readme_in_repo(repo_id: str, token: Optional[str]) -> bool:
+    """Check if README.md exists in a HF repo."""
+    from huggingface_hub import HfApi
+    try:
+        api = HfApi(token=token)
+        files = api.list_repo_files(repo_id=repo_id, repo_type="model")
+        return "README.md" in files
+    except Exception:
+        return False
+
+
+def _download_readme(repo_id: str, token: Optional[str], dest: Path) -> bool:
+    """Download README.md from a HF repo. Returns True on success."""
+    from huggingface_hub import hf_hub_download
+    try:
+        local = hf_hub_download(
+            repo_id=repo_id,
+            filename="README.md",
+            repo_type="model",
+            local_dir=str(dest.parent),
+            token=token,
+        )
+        src = Path(local)
+        if src.exists() and src != dest:
+            dest.write_text(src.read_text())
+        return dest.exists()
+    except Exception:
+        return False
+
+
+def _create_readme(readme_path: Path, source_model: str, source_file: str):
+    """Create a fresh README.md with header and empty table."""
+    readme_path.write_text(README_HEADER.format(
+        source_model=source_model,
+        source_file=source_file,
+    ))
+
+
+def _readme_has_tier(readme_path: Path, tier_name: str) -> bool:
+    """Check whether a tier row already exists in the README."""
+    if not readme_path.exists():
+        return False
+    return f"| {tier_name} " in readme_path.read_text()
+
+
+def _append_readme_row(readme_path: Path, tier_name: str, size_gb: float):
+    """Append a row for a completed tier to the README table."""
+    row = f"| {tier_name} | {size_gb:.2f} | |\n"
+    with readme_path.open("a") as f:
+        f.write(row)
+
+
+def _rebuild_readme_rows(readme_path: Path, state: "BatchState"):
+    """Populate README with rows for all tiers already marked uploaded in state."""
+    for tier in TIERS:
+        if state.tier_status(tier) != "uploaded":
+            continue
+        tier_name = f"tier{tier}"
+        if _readme_has_tier(readme_path, tier_name):
+            continue
+        info = state._t(tier)
+        sz_mb = info.get("size_mb")
+        if sz_mb:
+            _append_readme_row(readme_path, tier_name, sz_mb / 1024)
+
+
+def _upload_readme(
+    readme_path: Path,
+    repo_id: str,
+    token: Optional[str],
+):
+    """Upload README.md to the output repo."""
+    from huggingface_hub import create_repo, upload_folder
+    if not readme_path.exists():
+        log_err(f"README not found at {readme_path}, skipping upload.")
+        return
+
+    try:
+        create_repo(repo_id=repo_id, repo_type="model",
+                    exist_ok=True, token=token)
+        with tempfile.TemporaryDirectory(prefix="apex_readme_") as tmp:
+            (Path(tmp) / "README.md").write_text(readme_path.read_text())
+            upload_folder(
+                folder_path=tmp,
+                repo_id=repo_id,
+                repo_type="model",
+                token=token,
+                commit_message="Update README — APEX quantization info",
+            )
+        log(f"  ✓ README → {repo_id}")
+    except Exception as exc:
+        log_err(f"  ✗ README upload failed ({repo_id}): {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -448,22 +595,24 @@ def run_pipeline(args):
         log_err("--output must be in the form org/name  (e.g. MyOrg/Model-APEX)")
         sys.exit(1)
 
-    tiers = list(range(args.tiers[0], args.tiers[1] + 1))
+    tiers = args.tiers
     output_dir = workspace / "quantized"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # ── header ──
     log("=" * 60)
+    if args.dry_run:
+        log("  *** DRY RUN MODE ***")
     log("  APEX Batch Quantization Pipeline")
     log("=" * 60)
     log(f"  Model:    {args.model}")
     log(f"  Imatrix:  {args.imatrix}")
-    log(f"  Output:   {output_base}-tierN")
-    log(f"  Tiers:    {tiers[0]}..{tiers[-1]}")
+    log(f"  Output:   {output_base}")
+    log(f"  Tiers:    {tiers}")
     log(f"  Workspace: {workspace}")
     log("=" * 60)
 
-    display_status(state, source_ok=state.source_info() is not None, imatrix_ok=state.imatrix_info() is not None)
+    display_status(state, source_ok=state.source_info() is not None, imatrix_ok=state.imatrix_info() is not None, tiers=tiers)
 
     # ── 1. Discover & download source model + imatrix ──
     source_info = state.source_info()
@@ -525,33 +674,64 @@ def run_pipeline(args):
             log(f"Selected imatrix file: {imatrix_file}")
 
         # download both in parallel
-        dl_futures = {}
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="download") as dl_pool:
+        if args.dry_run:
             if not source_info:
-                dl_futures["source"] = dl_pool.submit(
-                    download_source_model, args.model, workspace, token, source_file)
+                log(f"DRY RUN: would download source model {args.model} ({source_file})")
+                source_gguf = Path(f"/dry-run/{source_file}")
+                state.mark_source(str(source_gguf), source_file)
             if not imatrix_info:
-                dl_futures["imatrix"] = dl_pool.submit(
-                    download_imatrix, args.imatrix, workspace, token, imatrix_file)
+                log(f"DRY RUN: would download imatrix {args.imatrix} ({imatrix_file})")
+                imatrix_path = Path(f"/dry-run/{imatrix_file}")
+                state.mark_imatrix(str(imatrix_path))
+        else:
+            dl_futures = {}
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="download") as dl_pool:
+                if not source_info:
+                    dl_futures["source"] = dl_pool.submit(
+                        download_source_model, args.model, workspace, token, source_file)
+                if not imatrix_info:
+                    dl_futures["imatrix"] = dl_pool.submit(
+                        download_imatrix, args.imatrix, workspace, token, imatrix_file)
 
-            # wait for both
-            for key, fut in dl_futures.items():
-                try:
-                    result = fut.result()
-                except Exception as exc:
-                    log_err(f"Download failed ({key}): {exc}")
-                    sys.exit(1)
-                if key == "source":
-                    source_gguf = result
-                    state.mark_source(str(result), source_file)
-                else:
-                    imatrix_path = result
-                    state.mark_imatrix(str(result))
+                # wait for both
+                for key, fut in dl_futures.items():
+                    try:
+                        result = fut.result()
+                    except Exception as exc:
+                        log_err(f"Download failed ({key}): {exc}")
+                        sys.exit(1)
+                    if key == "source":
+                        source_gguf = result
+                        state.mark_source(str(result), source_file)
+                    else:
+                        imatrix_path = result
+                        state.mark_imatrix(str(result))
 
         log("✓ Both downloads complete.")
 
+    # ── 2. Initialize README.md ──
+    readme_path = workspace / "README.md"
+    if not state.readme_initialized() or not readme_path.exists():
+        if _readme_in_repo(output_base, token):
+            log(f"Found README.md in {output_base}, downloading …")
+            downloaded = _download_readme(output_base, token, readme_path)
+            if downloaded:
+                log(f"✓ README.md downloaded from {output_base}")
+            else:
+                _create_readme(readme_path, args.model,
+                               state.source_info()["format"])
+                log("✓ Created new README.md (download failed, created fresh)")
+        else:
+            _create_readme(readme_path, args.model,
+                           state.source_info()["format"])
+            log("✓ Created new README.md")
+        _rebuild_readme_rows(readme_path, state)
+        state.mark_readme_initialized()
+    else:
+        log("✓ README.md already initialized")
+
     # ── Determine which tiers need work ──
-    display_status(state, source_ok=True, imatrix_ok=True)
+    display_status(state, source_ok=True, imatrix_ok=True, tiers=tiers)
 
     needs_work = []
     for tier in tiers:
@@ -564,6 +744,10 @@ def run_pipeline(args):
     if not needs_work:
         log("\n✅ All tiers completed. Nothing to do.")
         _print_summary(state, tiers, output_base)
+        if not args.dry_run:
+            _upload_readme(readme_path, output_base, token)
+        else:
+            log(f"DRY RUN: would upload README.md → {output_base}")
         return
 
     log(f"\nTiers to process: {needs_work}")
@@ -580,11 +764,16 @@ def run_pipeline(args):
         tier_p, fut = pending_upload
         try:
             fut.result()
-            state.set_tier(tier_p, "uploaded",
-                           size_mb=round(
-                               (output_dir / f"tier{tier_p}.gguf").stat().st_size
-                               / (1024**2), 1
-                           ) if (output_dir / f"tier{tier_p}.gguf").exists() else None)
+            gguf_p = output_dir / f"tier{tier_p}.gguf"
+            sz_mb_val = round(gguf_p.stat().st_size / (1024**2), 1) if gguf_p.exists() else None
+            state.set_tier(tier_p, "uploaded", size_mb=sz_mb_val)
+            # append row to README
+            if gguf_p.exists() and readme_path.exists():
+                tier_name = f"tier{tier_p}"
+                if not _readme_has_tier(readme_path, tier_name):
+                    _append_readme_row(readme_path, tier_name,
+                                       gguf_p.stat().st_size / (1024**3))
+                state.mark_readme_tier(tier_p)
         except Exception as exc:
             err = str(exc)[:120]
             log_err(f"tier{tier_p} upload failed: {err}")
@@ -601,6 +790,10 @@ def run_pipeline(args):
                 log("⚠ Pipeline interrupted by user.")
                 break
 
+            if args.dry_run:
+                log(f"DRY RUN: would quantize and upload tier{tier}")
+                continue
+
             output_gguf = output_dir / f"tier{tier}.gguf"
             st = state.tier_status(tier)
 
@@ -611,7 +804,7 @@ def run_pipeline(args):
                     log(f"✓ tier{tier}: quantized file exists, skipping quantize")
                 else:
                     state.set_tier(tier, "quantizing")
-                    display_status(state, True, True)
+                    display_status(state, True, True, tiers=tiers)
                     t0 = time.time()
                     try:
                         run_quantize(tier, source_gguf, imatrix_path, output_gguf)
@@ -637,7 +830,7 @@ def run_pipeline(args):
             else:
                 log(f"tier{tier}: status={st}, will proceed to upload")
 
-            display_status(state, True, True)
+            display_status(state, True, True, tiers=tiers)
 
             # ── wait for previous upload to finish ──
             _wait_pending_upload()
@@ -647,9 +840,9 @@ def run_pipeline(args):
                 break
 
             # ── start upload in background ──
-            repo_id = f"{output_base}-tier{tier}"
+            repo_id = output_base
             state.set_tier(tier, "uploading")
-            display_status(state, True, True)
+            display_status(state, True, True, tiers=tiers)
 
             def _do_upload(t=tier, rid=repo_id, p=output_gguf):
                 upload_tier(t, p, rid, token)
@@ -671,16 +864,27 @@ def run_pipeline(args):
         upload_executor.shutdown(wait=False, cancel_futures=True)
 
     # ── 4. Cleanup incomplete outputs ──
-    _cleanup_incomplete(state, output_dir)
+    if not args.dry_run:
+        _cleanup_incomplete(state, output_dir, tiers=tiers)
 
     # ── 5. Final report ──
     _print_summary(state, tiers, output_base)
 
+    # ── 6. Upload README to output repo ──
+    if readme_path.exists():
+        if args.dry_run:
+            log(f"\nDRY RUN: would upload README.md → {output_base}")
+        else:
+            log(f"\nUploading README.md → {output_base} …")
+            _upload_readme(readme_path, output_base, token)
 
-def _cleanup_incomplete(state: BatchState, output_dir: Path):
+
+def _cleanup_incomplete(state: BatchState, output_dir: Path, tiers: list = None):
     """Delete quantized GGUFs for tiers that are not fully uploaded."""
+    if tiers is None:
+        tiers = TIERS
     count = 0
-    for tier in TIERS:
+    for tier in tiers:
         st = state.tier_status(tier)
         if st in ("uploaded", "done"):
             continue
@@ -707,10 +911,9 @@ def _print_summary(state: BatchState, tiers: list, output_base: str):
     for tier in tiers:
         st = state.tier_status(tier)
         info = state._t(tier)
-        repo = f"{output_base}-tier{tier}"
         sz = info.get("size_mb", "?")
         if st == "uploaded":
-            uploaded.append((tier, repo, sz))
+            uploaded.append((tier, sz))
         elif st in ("quantized", "quantizing", "uploading"):
             quantized_pending.append((tier, st))
         elif st == "error":
@@ -719,10 +922,12 @@ def _print_summary(state: BatchState, tiers: list, output_base: str):
 
     pending_count = len(tiers) - len(uploaded) - len(quantized_pending) - len(errors)
 
+    log(f"\n  Repo: https://huggingface.co/{output_base}")
+
     if uploaded:
         log(f"\n  ✅ Uploaded ({len(uploaded)}):")
-        for tier, repo, sz in uploaded:
-            log(f"     tier{tier:<3}  {sz} MB  →  https://huggingface.co/{repo}")
+        for tier, sz in uploaded:
+            log(f"     tier{tier:<3}  {sz} MB")
 
     if quantized_pending:
         log(f"\n  📦 Quantized but not uploaded ({len(quantized_pending)}):")
@@ -750,17 +955,28 @@ def _print_summary(state: BatchState, tiers: list, output_base: str):
 # CLI
 # ---------------------------------------------------------------------------
 
-def _parse_tiers(s: str) -> tuple:
-    """Parse '1-13', '1,5,7', '3-8' into (start, end)."""
-    s = s.strip()
-    if "-" in s:
-        a, b = s.split("-", 1)
-        return int(a), int(b)
-    if "," in s:
-        nums = [int(x) for x in s.split(",")]
-        return min(nums), max(nums)
-    n = int(s)
-    return n, n
+def _parse_tiers(s: str) -> list:
+    """Parse tier spec into a sorted list of ints.
+
+    Supports comma-separated ranges and individual values:
+      '1-10,13'   → [1,2,3,4,5,6,7,8,9,10,13]
+      '1-13'      → [1,2,3,4,5,6,7,8,9,10,11,12,13]
+      '3-8'       → [3,4,5,6,7,8]
+      '1,5,7'     → [1,5,7]
+      '2'         → [2]
+    """
+    tiers = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            a, b = int(a), int(b)
+            tiers.update(range(a, b + 1))
+        else:
+            tiers.add(int(part))
+    return sorted(tiers)
 
 
 def main():
@@ -780,10 +996,10 @@ def main():
     parser.add_argument("--imatrix", "-i", required=True,
                         help="HF repo with imatrix file (e.g. user/imatrix-GGUF)")
     parser.add_argument("--output", "-o", required=True,
-                        help="Base repo id for output (org/name). Tier repos will be "
-                             "{output}-tier1 .. {output}-tier13")
+                        help="HF repo id for all output tiers (org/name), "
+                             "e.g. user/model-APEX")
     parser.add_argument("--tiers", default="1-13",
-                        help="Tier range, e.g. '1-13' or '3-8' (default: 1-13)")
+                        help="Tier spec: '1-13', '1-10,13', '3-8', '1,5,7' (default: 1-13)")
     parser.add_argument("--workspace", "-w",
                         default=str(Path.home() / "apex_batch"),
                         help="Workspace directory for state & intermediate files "
@@ -794,11 +1010,14 @@ def main():
                         help="Explicit source GGUF filename (skip auto-detection)")
     parser.add_argument("--imatrix-file",
                         help="Explicit imatrix filename (skip auto-detection)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Simulate the pipeline without downloading, quantizing, "
+                             "or uploading. Still creates/updates README.md locally.")
 
     args = parser.parse_args()
     args.tiers = _parse_tiers(args.tiers)
 
-    if not (1 <= args.tiers[0] <= args.tiers[1] <= 13):
+    if not args.tiers or not all(1 <= t <= 13 for t in args.tiers):
         log_err("--tiers must be in range 1-13")
         sys.exit(1)
 
