@@ -30,6 +30,12 @@ e.g. Qwen3.8-27B: 64 layers, 48 linear-attention + 16 full-attention):
   dense-hybrid-quality  dense-hybrid rebuilt in the Q5/Q6 band, to check the
                         winning allocation still wins away from the Q4 band.
 
+Quant mode (default: mixed):
+  By default, experts use QUANTS_RANKED_SIZE (IQ4_NL/IQ3_S/IQ2_S) while
+  attention, shared experts and embeddings use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K).
+  --speed  Use QUANTS_RANKED_SPEED for all tensors unconditionally.
+  --size   Use QUANTS_RANKED_SIZE for all tensors unconditionally.
+
 Profile modifiers (used with profiles, positive = lower quality, negative = higher):
   --edge-exp N      Shift edge-expert quality by N steps
   --near-exp N      Shift near-expert quality by N steps
@@ -73,12 +79,25 @@ QUANTS_RANKED_SPEED = [
 ]
 
 
-_use_speed = False
+_quant_mode = "default"  # "default" | "speed" | "size"
 
 
-def ranked_quant(index):
-    """Return quant string for a quality-rank index, clamping to valid range."""
-    quants = QUANTS_RANKED_SPEED if _use_speed else QUANTS_RANKED_SIZE
+def ranked_quant(index, role="expert"):
+    """Return quant string for a quality-rank index, clamping to valid range.
+
+    *role* selects the quant table when mode is "default":
+      "expert"  → QUANTS_RANKED_SIZE
+      "shared"  → QUANTS_RANKED_SPEED
+      "attn"    → QUANTS_RANKED_SPEED
+      "embd"    → QUANTS_RANKED_SPEED
+    When mode is "speed" or "size" the corresponding table is used regardless.
+    """
+    if _quant_mode == "speed":
+        quants = QUANTS_RANKED_SPEED
+    elif _quant_mode == "size":
+        quants = QUANTS_RANKED_SIZE
+    else:
+        quants = QUANTS_RANKED_SIZE if role == "expert" else QUANTS_RANKED_SPEED
     if index < 0:
         return quants[0]
     if index >= len(quants):
@@ -124,8 +143,11 @@ def parse_args(argv=None):
                    help="Architecture: moe or dense (default: moe)")
     p.add_argument("--output", "-o",
                    help="Write config to file instead of stdout")
-    p.add_argument("--speed", action="store_true",
-                   help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) instead of QUANTS_RANKED_SIZE")
+    quant_mode = p.add_mutually_exclusive_group()
+    quant_mode.add_argument("--speed", action="store_const", dest="quant_mode", const="speed",
+                            help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) for all tensors")
+    quant_mode.add_argument("--size", action="store_const", dest="quant_mode", const="size",
+                            help="Use QUANTS_RANKED_SIZE (IQ4_NL/IQ3_S/IQ2_S) for all tensors")
 
     # Profile modifiers (integers)
     p.add_argument("--edge-exp", type=int, default=None,
@@ -306,9 +328,9 @@ def generate_moe(cfg):
     dense_layers = cfg["dense_layers"]
     ei, ni, mi, esi, msi, eai, mai, emi = cfg["indices"]
 
-    lines.append(f"token_embd.weight={ranked_quant(emi)}")
-    lines.append(f"output.weight={ranked_quant(emi)}")
-    
+    lines.append(f"token_embd.weight={ranked_quant(emi, 'embd')}")
+    lines.append(f"output.weight={ranked_quant(emi, 'embd')}")
+
     for i in range(layers):
         zone = get_zone(i, layers, dense_layers)
 
@@ -332,35 +354,35 @@ def generate_moe(cfg):
 
         # Expert or dense FFN tensors
         if i < dense_layers:
-            lines.append(f"blk.{i}.ffn_gate.weight={ranked_quant(sh)}")
-            lines.append(f"blk.{i}.ffn_up.weight={ranked_quant(sh)}")
-            lines.append(f"blk.{i}.ffn_down.weight={ranked_quant(sh - 1)}")  # -1
+            lines.append(f"blk.{i}.ffn_gate.weight={ranked_quant(sh, 'shared')}")
+            lines.append(f"blk.{i}.ffn_up.weight={ranked_quant(sh, 'shared')}")
+            lines.append(f"blk.{i}.ffn_down.weight={ranked_quant(sh - 1, 'shared')}")  # -1
         else:
-            lines.append(f"blk.{i}.ffn_gate_exps={ranked_quant(exp)}") 
-            lines.append(f"blk.{i}.ffn_up_exps={ranked_quant(exp)}")   
-            lines.append(f"blk.{i}.ffn_down_exps={ranked_quant(exp - 1)}")  # -1
+            lines.append(f"blk.{i}.ffn_gate_exps={ranked_quant(exp, 'expert')}")
+            lines.append(f"blk.{i}.ffn_up_exps={ranked_quant(exp, 'expert')}")
+            lines.append(f"blk.{i}.ffn_down_exps={ranked_quant(exp - 1, 'expert')}")  # -1
 
         # Shared expert tensors
-        lines.append(f"blk.{i}.ffn_gate_shexp={ranked_quant(sh)}")
-        lines.append(f"blk.{i}.ffn_up_shexp={ranked_quant(sh)}")
-        lines.append(f"blk.{i}.ffn_down_shexp={ranked_quant(sh - 1)}")  # -1
+        lines.append(f"blk.{i}.ffn_gate_shexp={ranked_quant(sh, 'shared')}")
+        lines.append(f"blk.{i}.ffn_up_shexp={ranked_quant(sh, 'shared')}")
+        lines.append(f"blk.{i}.ffn_down_shexp={ranked_quant(sh - 1, 'shared')}")  # -1
 
         # Attention tensors
-        lines.append(f"blk.{i}.attn_q={ranked_quant(ai)}")
-        lines.append(f"blk.{i}.attn_k={ranked_quant(ai)}")
-        lines.append(f"blk.{i}.attn_v={ranked_quant(ai - 2)}")
-        lines.append(f"blk.{i}.attn_output={ranked_quant(ai - 1)}")   # always equal to output.weight
-        lines.append(f"blk.{i}.attn_gate={ranked_quant(ai - 2)}")
-        lines.append(f"blk.{i}.attn_qkv={ranked_quant(ai - 2)}")
+        lines.append(f"blk.{i}.attn_q={ranked_quant(ai, 'attn')}")
+        lines.append(f"blk.{i}.attn_k={ranked_quant(ai, 'attn')}")
+        lines.append(f"blk.{i}.attn_v={ranked_quant(ai - 2, 'attn')}")
+        lines.append(f"blk.{i}.attn_output={ranked_quant(ai - 1, 'attn')}")
+        lines.append(f"blk.{i}.attn_gate={ranked_quant(ai - 2, 'attn')}")
+        lines.append(f"blk.{i}.attn_qkv={ranked_quant(ai - 2, 'attn')}")
 
         # Short-convolution mixing tensors (LFM2 conv layers)
-        lines.append(f"blk.{i}.shortconv.in_proj={ranked_quant(ai)}")
-        lines.append(f"blk.{i}.shortconv.out_proj={ranked_quant(ai - 1)}")
+        lines.append(f"blk.{i}.shortconv.in_proj={ranked_quant(ai, 'attn')}")
+        lines.append(f"blk.{i}.shortconv.out_proj={ranked_quant(ai - 1, 'attn')}")
 
         # SSM tensors (Mamba/hybrid archs)
-        lines.append(f"blk.{i}.ssm_alpha={ranked_quant(ai)}")
-        lines.append(f"blk.{i}.ssm_beta={ranked_quant(ai)}")
-        lines.append(f"blk.{i}.ssm_out={ranked_quant(ai)}")
+        lines.append(f"blk.{i}.ssm_alpha={ranked_quant(ai, 'attn')}")
+        lines.append(f"blk.{i}.ssm_beta={ranked_quant(ai, 'attn')}")
+        lines.append(f"blk.{i}.ssm_out={ranked_quant(ai, 'attn')}")
 
     return lines
 
@@ -408,9 +430,9 @@ def generate_dense(cfg):
 
 
 def main(argv=None):
-    global _use_speed
+    global _quant_mode
     args = parse_args(argv)
-    _use_speed = args.speed
+    _quant_mode = args.quant_mode or "default"
     cfg = resolve_profile(args)
 
     if cfg["arch"] == "dense":
