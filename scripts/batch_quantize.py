@@ -31,6 +31,7 @@ Environment / .env:
 """
 
 import argparse
+import io
 import json
 import os
 import signal
@@ -177,11 +178,19 @@ def _ts() -> str:
 
 
 def log(msg: str):
-    print(f"[{_ts()}] {msg}", flush=True)
+    line = f"[{_ts()}] {msg}"
+    if _HAS_RICH and _lc is not None and _lc.live is not None:
+        _lc.live.append_log(line)
+    else:
+        print(line, flush=True)
 
 
 def log_err(msg: str):
-    print(f"[{_ts()}] ❌ {msg}", file=sys.stderr, flush=True)
+    line = f"[{_ts()}] \u274c {msg}"
+    if _HAS_RICH and _lc is not None and _lc.live is not None:
+        _lc.live.append_log(line)
+    else:
+        print(line, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -266,14 +275,136 @@ class BatchState:
 
 _HAS_RICH = False
 try:
-    from rich.console import Console
+    from rich.console import Console, Group
     from rich.table import Table
     from rich.panel import Panel
+    from rich.text import Text
+    from rich.live import Live
     _HAS_RICH = True
 except ImportError:
     pass
 
-console = Console() if _HAS_RICH else None
+# One-shot console for non-live display_status() calls.
+if _HAS_RICH:
+    console = Console(force_terminal=True)
+else:
+    console = None
+
+
+# ---------------------------------------------------------------------------
+# Live display context
+# ---------------------------------------------------------------------------
+
+class _LiveContext:
+    """Mutable namespace shared between pipeline and display code."""
+
+    def __init__(self):
+        self.live: Optional["_RichLive"] = None
+        self.active_tiers: dict[int, dict] = {}
+        self.upload_progress: dict[int, dict] = {}
+        self.downloads: dict[str, dict] = {}
+        self.state: Optional["BatchState"] = None
+        self.source_ok: bool = False
+        self.imatrix_ok: bool = False
+        self.tiers: list = []
+
+
+_lc = _LiveContext() if _HAS_RICH else None
+
+
+# ---------------------------------------------------------------------------
+# Live display — thin wrapper around rich.live.Live
+# ---------------------------------------------------------------------------
+#
+# Previous attempts to manually manage ANSI cursor-up via sys.stdout failed
+# on macOS Terminal.app because Python's TTY buffering and Rich's internal
+# cursor bookkeeping fight over the terminal.  We now use Rich's native
+# ``Live`` widget, which handles all cursor positioning internally.
+#
+# The original duplicate-table bug was caused by calling ``console.print()``
+# while a Live context was active.  In the current code, *all* output during
+# live mode goes through ``live.update()`` and ``append_log()``, never
+# through ``console.print()``.
+# ---------------------------------------------------------------------------
+
+_LOG_RING_SIZE = 8
+
+
+class _RichLive:
+    """Thin wrapper around ``rich.live.Live``.
+
+    ``display_status(...)`` returns a Rich *Panel*; ``append_log()`` appends
+    a plain-text line to a ring buffer.  A composite renderable (Panel +
+    log Text) is pushed to ``Live`` on every update / log / refresh.
+    """
+
+    def __init__(self):
+        self._console = Console(force_terminal=True, stderr=False)
+        self._live = Live(
+            console=self._console,
+            refresh_per_second=4,
+            transient=False,
+        )
+        self._renderable = None
+        self._log_lines: list[str] = []
+        self._lock = threading.Lock()
+
+    # -- lifecycle --
+
+    def start(self):
+        self._live.start()
+
+    def stop(self):
+        # Push one final composite before shutting down.
+        self._live.update(self._composite())
+        self._live.stop()
+
+    def update(self, renderable):
+        with self._lock:
+            self._renderable = renderable
+        self._live.update(self._composite())
+
+    def append_log(self, msg: str):
+        with self._lock:
+            self._log_lines.append(msg)
+            if len(self._log_lines) > _LOG_RING_SIZE * 3:
+                self._log_lines = self._log_lines[-_LOG_RING_SIZE:]
+        self._live.update(self._composite())
+
+    # -- helpers --
+
+    def _composite(self):
+        with self._lock:
+            renderable = self._renderable
+            logs = list(self._log_lines[-_LOG_RING_SIZE:])
+        parts = []
+        if renderable is not None:
+            parts.append(renderable)
+        if logs:
+            parts.append(Text("\n".join(logs)))
+        return Group(*parts) if parts else Text("")
+
+
+def _init_live():
+    if not _HAS_RICH or _lc is None:
+        return
+    _lc.live = _RichLive()
+    _lc.live.start()
+
+
+def _stop_live():
+    if not _HAS_RICH or _lc is None or _lc.live is None:
+        return
+    _lc.live.update(_build_live_renderable())
+    _lc.live.stop()
+    _lc.live = None
+
+
+def _build_live_renderable():
+    """Build the Rich renderable for the live display."""
+    return display_status(_lc.state, _lc.source_ok, _lc.imatrix_ok,
+                          _lc.tiers, _live_ctx=_lc)
+
 
 _STATUS_STYLE = {
     "pending":    "dim",
@@ -297,12 +428,84 @@ _STATUS_ICON = {
 
 
 def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
-                   tiers: list = None):
-    """Render the current status to the terminal."""
+                   tiers: list = None, *, _live_ctx=None):
+    """Render the current status to the terminal.
+
+    When *_live_ctx* is provided (internal), returns a Rich renderable
+    for use inside a ``Live`` display.  Otherwise prints a one-shot table.
+    """
     if tiers is None:
         tiers = TIERS
+
+    # ── Live mode (called by _build_live_renderable) ──
+    if _HAS_RICH and _live_ctx is not None:
+        from rich.text import Text
+
+        table = Table(show_lines=False, expand=False, padding=(0, 1))
+        table.add_column("Tier", justify="right", style="bold", width=6)
+        table.add_column("Base", width=7)
+        table.add_column("Status", min_width=32)
+        table.add_column("Info", min_width=16, style="dim")
+
+        # Download rows (above tier table)
+        for key, dl in _live_ctx.downloads.items():
+            label = dl.get("label", key)
+            st = dl["status"]
+            if st == "downloading":
+                total = dl.get("total", 0)
+                dl_bytes = dl.get("bytes", 0)
+                start = dl.get("start", time.time())
+                elapsed = time.time() - start
+                m, s = divmod(int(elapsed), 60)
+                elapsed_str = f"{m:02d}:{s:02d}"
+                frame = _SPINNER_FRAMES[int(time.time() * 4) % len(_SPINNER_FRAMES)]
+                if total > 0:
+                    pct = dl_bytes / total * 100
+                    bar_len = 20
+                    filled = int(pct / 100 * bar_len)
+                    bar = "█" * filled + "░" * (bar_len - filled)
+                    status_col = Text(f" {frame} {bar} {pct:.1f}% {elapsed_str}",
+                                      style="cyan")
+                    info = f"{dl_bytes / (1024**2):.0f}/{total / (1024**2):.0f} MB"
+                else:
+                    status_col = Text(f" {frame} downloading… {elapsed_str}", style="cyan")
+                    info = ""
+                table.add_row("DL", label[:7], status_col, info)
+            elif st == "done":
+                table.add_row("DL", label[:7],
+                              Text(" ✓ downloaded", style="green"), "")
+
+        # Tier rows
+        for tier in tiers:
+            base = TIER_BASE_TYPE[tier]
+            active = _live_ctx.active_tiers.get(tier)
+            if active:
+                status_col = _render_active_tier(tier, active, _live_ctx)
+                info = _format_active_info(tier, active, state)
+            else:
+                st = state.tier_status(tier)
+                icon = _STATUS_ICON.get(st, "?")
+                style = _STATUS_STYLE.get(st, "")
+                status_col = Text(f" {icon} {st}", style=style)
+                info = ""
+                if st == "error":
+                    info = state._t(tier).get("error_short", "")
+                elif st == "uploaded":
+                    sz = state._t(tier).get("size_mb")
+                    if sz:
+                        info = f"{sz} MB"
+            table.add_row(f"tier{tier}", base, status_col, info)
+
+        src_label = "✓ downloaded" if source_ok else "… pending"
+        imx_label = "✓ downloaded" if imatrix_ok else "… pending"
+        header = Text(f"Source:  {src_label}\nImatrix: {imx_label}", style="bold")
+        return Panel(table, title="[bold]APEX Batch Quantization[/bold]",
+                     subtitle=header, border_style="blue")
+
+    # ── One-shot mode (original behavior) ──
     if _HAS_RICH:
         from rich.text import Text
+
         table = Table(show_lines=False, expand=False, padding=(0, 1))
         table.add_column("Tier", justify="right", style="bold", width=6)
         table.add_column("Base", width=7)
@@ -341,6 +544,113 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
             icon = _STATUS_ICON.get(st, "?")
             print(f"  {tier:<6} {base:<8} {icon} {st}")
         print()
+
+
+_SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _render_active_tier(tier: int, active: dict, lc) -> "Text":
+    """Build a Rich Text object for a currently active tier row."""
+    from rich.text import Text
+    st = active["status"]
+    start = active.get("start", time.time())
+    elapsed = time.time() - start
+    m, s = divmod(int(elapsed), 60)
+    h, m = divmod(m, 60)
+    elapsed_str = f"{m:02d}:{s:02d}" if not h else f"{h}:{m:02d}:{s:02d}"
+    frame = _SPINNER_FRAMES[int(time.time() * 4) % len(_SPINNER_FRAMES)]
+
+    if st == "quantizing":
+        last = active.get("last_line", "")
+        suffix = f"  {last[:22]}" if last else ""
+        return Text(f" {frame} quantizing… {elapsed_str}{suffix}", style="yellow")
+    elif st == "uploading":
+        prog = lc.upload_progress.get(tier)
+        if prog and prog.get("total", 0) > 0:
+            pct = prog["current"] / prog["total"] * 100
+            bar_len = 16
+            filled = int(pct / 100 * bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            return Text(f" ↑ {bar} {pct:.0f}% {elapsed_str}", style="magenta")
+        last = active.get("last_line", "")
+        suffix = f"  {last[:22]}" if last else ""
+        return Text(f" {frame} uploading… {elapsed_str}{suffix}", style="magenta")
+    else:
+        return Text(f" ? {st}", style="dim")
+
+
+def _format_active_info(tier: int, active: dict, state: BatchState) -> str:
+    """Return hint text for active tier's info column."""
+    last = active.get("last_line", "")
+    if not last:
+        return ""
+    return last[:38]
+
+
+class _Capture:
+    """Captures subprocess output, exposing the last non-empty line.
+
+    Used by ``run_quantize`` to feed tier status into the live display
+    while preventing raw output from corrupting Rich's rendering.
+    """
+
+    def __init__(self, tier: int, *, stream: Optional[io.TextIOBase] = None):
+        self.tier = tier
+        self._stream = stream          # original stderr (or None)
+        self._buf = ""
+        self._lines: list[str] = []
+        self.last_line: str = ""
+        self._lock = threading.Lock()
+        self._last_live_update: float = 0.0
+
+    def write(self, data: str) -> int:
+        self._buf += data
+        while True:
+            # Find the earliest line terminator (\n or \r)
+            idx_n = self._buf.find("\n")
+            idx_r = self._buf.find("\r")
+            if idx_n >= 0 and (idx_r < 0 or idx_n <= idx_r):
+                idx = idx_n
+            elif idx_r >= 0:
+                idx = idx_r
+            else:
+                break
+            line = self._buf[:idx].rstrip("\r\n\t ")
+            self._buf = self._buf[idx + 1:]
+            if line:
+                with self._lock:
+                    self._lines.append(line)
+                    self.last_line = line
+                if _lc and _lc.active_tiers.get(self.tier):
+                    _lc.active_tiers[self.tier]["last_line"] = self.last_line[:120]
+                    # Force Rich Live refresh (throttled to ~1/sec)
+                    now = time.time()
+                    if _lc.live and now - self._last_live_update >= 1.0:
+                        _lc.live.update(_build_live_renderable())
+                        self._last_live_update = now
+        if self._stream is not None and not (_lc and _lc.live):
+            try:
+                return self._stream.write(data)
+            except Exception:
+                pass
+        return len(data)
+
+    def flush(self):
+        if self._stream is not None:
+            try:
+                self._stream.flush()
+            except Exception:
+                pass
+
+    def fileno(self):
+        if self._stream is not None:
+            return self._stream.fileno()
+        raise io.UnsupportedOperation("fileno")
+
+    @property
+    def lines(self) -> list[str]:
+        with self._lock:
+            return list(self._lines)
 
 
 # ---------------------------------------------------------------------------
@@ -615,11 +925,20 @@ def _resumable_download(url: str, dest: Path, *, token: Optional[str] = None,
 
             total_mb = total / (1024**2)
             last_log = time.time()
+            last_live_update = time.time()
             for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                 f.write(chunk)
                 bytes_downloaded += len(chunk)
                 now = time.time()
-                if now - last_log >= 5:
+                # Update live context download progress
+                if _lc and _lc.downloads.get(label):
+                    _lc.downloads[label]["bytes"] = bytes_downloaded
+                    _lc.downloads[label]["total"] = total
+                    # Force Rich Live to re-render (throttled to 1/sec)
+                    if _lc.live and now - last_live_update >= 1.0:
+                        _lc.live.update(_build_live_renderable())
+                        last_live_update = now
+                elif now - last_log >= 5:
                     pct = bytes_downloaded / total * 100 if total else 0
                     log(f"  {label}: {bytes_downloaded / (1024**2):.0f}/{total_mb:.0f} MB  ({pct:.1f}%)")
                     last_log = now
@@ -654,13 +973,29 @@ def _download_single_file(
     """Download a single file from HF with resume support."""
     dest = workspace / filename
     if dest.exists() and dest.stat().st_size > 0:
+        if _lc:
+            _lc.downloads[label] = {"label": label, "status": "done",
+                                     "bytes": dest.stat().st_size,
+                                     "total": dest.stat().st_size, "start": time.time()}
         log(f"{label} already exists: {dest.name}  "
             f"({dest.stat().st_size / (1024**3):.2f} GB)")
+        if _lc and _lc.live:
+            _lc.live.update(_build_live_renderable())
         return dest
 
     workspace.mkdir(parents=True, exist_ok=True)
+    if _lc:
+        _lc.downloads[label] = {"label": label, "status": "downloading",
+                                 "bytes": 0, "total": 0, "start": time.time()}
+        if _lc.live:
+            _lc.live.update(_build_live_renderable())
     url = _get_hf_download_url(repo_id, filename, token)
-    return _resumable_download(url, dest, token=token, label=label)
+    result = _resumable_download(url, dest, token=token, label=label)
+    if _lc and label in _lc.downloads:
+        _lc.downloads[label]["status"] = "done"
+        if _lc.live:
+            _lc.live.update(_build_live_renderable())
+    return result
 
 
 @_retry_on_network_error
@@ -716,10 +1051,20 @@ def run_quantize(
         "--imatrix", str(imatrix_path),
         str(source_gguf), str(output_gguf),
     ]
-    log(f"Quantizing tier{tier} → {output_gguf.name}")
-    proc = subprocess.run(cmd, text=True)
-    if proc.returncode != 0:
-        raise RuntimeError(f"quantize.py exited with code {proc.returncode}")
+
+    if _HAS_RICH and _lc is not None and _lc.live is not None:
+        cap = _Capture(tier, stream=sys.stderr)
+        proc = subprocess.run(cmd, text=True, stdout=subprocess.DEVNULL, stderr=cap)
+        if proc.returncode != 0:
+            tail = "\n".join(cap.lines[-15:]) or f"(exit code {proc.returncode})"
+            raise RuntimeError(
+                f"quantize.py (tier{tier}) failed:\n{tail}"
+            )
+    else:
+        log(f"Quantizing tier{tier} → {output_gguf.name}")
+        proc = subprocess.run(cmd, text=True)
+        if proc.returncode != 0:
+            raise RuntimeError(f"quantize.py exited with code {proc.returncode}")
 
 
 # ---------------------------------------------------------------------------
@@ -740,22 +1085,45 @@ def upload_tier(
     if gguf_path.stat().st_size == 0:
         raise ValueError(f"GGUF file is empty: {gguf_path}")
 
-    log(f"Uploading tier{tier} ({gguf_path.name}, "
-        f"{gguf_path.stat().st_size / (1024**3):.2f} GB) → {repo_id}")
+    _live_active = _HAS_RICH and _lc is not None and _lc.live is not None
+    if not _live_active:
+        log(f"Uploading tier{tier} ({gguf_path.name}, "
+            f"{gguf_path.stat().st_size / (1024**3):.2f} GB) → {repo_id}")
 
     create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=token)
 
     with tempfile.TemporaryDirectory(prefix=f"apex_upload_t{tier}_") as tmpdir:
         link = Path(tmpdir) / gguf_path.name
         link.symlink_to(gguf_path.resolve())
-        upload_folder(
-            folder_path=tmpdir,
-            repo_id=repo_id,
-            repo_type="model",
-            token=token,
-            commit_message=f"APEX tier{tier} quantization",
-        )
-    log(f"✓ Uploaded tier{tier} → {repo_id}")
+        if _live_active:
+            import io as _io
+            _old_stderr = sys.stderr
+            sys.stderr = _io.StringIO()
+            try:
+                upload_folder(
+                    folder_path=tmpdir,
+                    repo_id=repo_id,
+                    repo_type="model",
+                    token=token,
+                    commit_message=f"APEX tier{tier} quantization",
+                )
+            finally:
+                captured = sys.stderr.getvalue()
+                sys.stderr = _old_stderr
+                if _lc and tier in _lc.active_tiers:
+                    lines = [l for l in captured.splitlines() if l.strip()]
+                    if lines:
+                        _lc.active_tiers[tier]["last_line"] = lines[-1][:120]
+        else:
+            upload_folder(
+                folder_path=tmpdir,
+                repo_id=repo_id,
+                repo_type="model",
+                token=token,
+                commit_message=f"APEX tier{tier} quantization",
+            )
+    if not _live_active:
+        log(f"✓ Uploaded tier{tier} → {repo_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -798,13 +1166,27 @@ def run_pipeline(args):
     log(f"  Workspace: {workspace}")
     log("=" * 60)
 
-    display_status(state, source_ok=state.source_info() is not None, imatrix_ok=state.imatrix_info() is not None, tiers=tiers)
+    if _lc:
+        _lc.state = state
+        _lc.source_ok = state.source_info() is not None
+        _lc.imatrix_ok = state.imatrix_info() is not None
+        _lc.tiers = tiers
+
+    _init_live()
 
     # ── 1. Discover & download source model + imatrix ──
     source_info = state.source_info()
     if source_info:
         source_gguf = Path(source_info["path"])
         if source_gguf.exists():
+            if _lc:
+                _lc.downloads["source model"] = {
+                    "label": "source model", "status": "done",
+                    "bytes": source_gguf.stat().st_size,
+                    "total": source_gguf.stat().st_size, "start": time.time()}
+                _lc.source_ok = True
+                if _lc.live:
+                    _lc.live.update(_build_live_renderable())
             log(f"✓ Source model already downloaded: {source_gguf.name}")
         else:
             source_info = None
@@ -815,6 +1197,14 @@ def run_pipeline(args):
     if imatrix_info:
         imatrix_path = Path(imatrix_info["path"])
         if imatrix_path.exists():
+            if _lc:
+                _lc.downloads["imatrix"] = {
+                    "label": "imatrix", "status": "done",
+                    "bytes": imatrix_path.stat().st_size,
+                    "total": imatrix_path.stat().st_size, "start": time.time()}
+                _lc.imatrix_ok = True
+                if _lc.live:
+                    _lc.live.update(_build_live_renderable())
             log(f"✓ Imatrix already downloaded: {imatrix_path.name}")
         else:
             imatrix_info = None
@@ -897,6 +1287,12 @@ def run_pipeline(args):
                         imatrix_path = result
                         state.mark_imatrix(str(result))
 
+        if _lc:
+            _lc.source_ok = True
+            _lc.imatrix_ok = True
+            if _lc.live:
+                _lc.live.update(_build_live_renderable())
+
         log("✓ Both downloads complete.")
 
     # ── 2. Initialize README.md ──
@@ -921,7 +1317,10 @@ def run_pipeline(args):
         log("✓ README.md already initialized")
 
     # ── Determine which tiers need work ──
-    display_status(state, source_ok=True, imatrix_ok=True, tiers=tiers)
+    if _lc and _lc.live:
+        _lc.live.update(_build_live_renderable())
+    else:
+        display_status(state, source_ok=True, imatrix_ok=True, tiers=tiers)
 
     needs_work = []
     for tier in tiers:
@@ -944,6 +1343,7 @@ def run_pipeline(args):
 
     # ── 3. Quantize + Upload pipeline ──
     # upload N-1 overlaps with quantize N
+    _init_live()
     upload_executor = ThreadPoolExecutor(max_workers=1)
     pending_upload: Optional[tuple] = None  # (tier, Future)
 
@@ -957,6 +1357,11 @@ def run_pipeline(args):
             gguf_p = output_dir / f"tier{tier_p}.gguf"
             sz_mb_val = round(gguf_p.stat().st_size / (1024**2), 1) if gguf_p.exists() else None
             state.set_tier(tier_p, "uploaded", size_mb=sz_mb_val)
+            if _lc:
+                _lc.active_tiers.pop(tier_p, None)
+                _lc.upload_progress.pop(tier_p, None)
+                if _lc.live:
+                    _lc.live.update(_build_live_renderable())
             # append row to README
             if gguf_p.exists() and readme_path.exists():
                 tier_name = f"tier{tier_p}"
@@ -969,6 +1374,11 @@ def run_pipeline(args):
             log_err(f"tier{tier_p} upload failed: {err}")
             state.set_tier(tier_p, "error", error=str(exc)[:300],
                            error_short=err[:40])
+            if _lc:
+                _lc.active_tiers.pop(tier_p, None)
+                _lc.upload_progress.pop(tier_p, None)
+                if _lc.live:
+                    _lc.live.update(_build_live_renderable())
         pending_upload = None
 
     processed = []
@@ -994,7 +1404,14 @@ def run_pipeline(args):
                     log(f"✓ tier{tier}: quantized file exists, skipping quantize")
                 else:
                     state.set_tier(tier, "quantizing")
-                    display_status(state, True, True, tiers=tiers)
+                    if _lc:
+                        _lc.active_tiers[tier] = {"status": "quantizing",
+                                                   "start": time.time(),
+                                                   "last_line": ""}
+                        if _lc.live:
+                            _lc.live.update(_build_live_renderable())
+                    else:
+                        display_status(state, True, True, tiers=tiers)
                     t0 = time.time()
                     try:
                         run_quantize(tier, source_gguf, imatrix_path, output_gguf)
@@ -1004,6 +1421,10 @@ def run_pipeline(args):
                         state.set_tier(tier, "error", error=str(exc)[:300],
                                        error_short=err[:40])
                         failed.append(tier)
+                        if _lc:
+                            _lc.active_tiers.pop(tier, None)
+                            if _lc.live:
+                                _lc.live.update(_build_live_renderable())
                         if output_gguf.exists() and output_gguf.stat().st_size == 0:
                             output_gguf.unlink(missing_ok=True)
                         continue
@@ -1014,13 +1435,17 @@ def run_pipeline(args):
                     log(f"✓ tier{tier}: quantized in {h:02d}:{m:02d}:{s:02d}  "
                         f"({sz_mb:.1f} MB)")
                     state.set_tier(tier, "quantized", size_mb=round(sz_mb, 1))
+                    if _lc:
+                        _lc.active_tiers.pop(tier, None)
+                        if _lc.live:
+                            _lc.live.update(_build_live_renderable())
             elif st == "uploading":
-                # interrupted during upload — re-upload below
                 log(f"tier{tier}: was uploading, will retry")
             else:
                 log(f"tier{tier}: status={st}, will proceed to upload")
 
-            display_status(state, True, True, tiers=tiers)
+            if not (_lc and _lc.live):
+                display_status(state, True, True, tiers=tiers)
 
             # ── wait for previous upload to finish ──
             _wait_pending_upload()
@@ -1032,7 +1457,15 @@ def run_pipeline(args):
             # ── start upload in background ──
             repo_id = output_base
             state.set_tier(tier, "uploading")
-            display_status(state, True, True, tiers=tiers)
+            if _lc:
+                _lc.active_tiers[tier] = {"status": "uploading",
+                                           "start": time.time(),
+                                           "last_line": ""}
+                _lc.upload_progress[tier] = {"current": 0, "total": 0}
+                if _lc.live:
+                    _lc.live.update(_build_live_renderable())
+            else:
+                display_status(state, True, True, tiers=tiers)
 
             def _do_upload(t=tier, rid=repo_id, p=output_gguf):
                 upload_tier(t, p, rid, token)
@@ -1052,6 +1485,8 @@ def run_pipeline(args):
         log_err(f"Unexpected error: {exc}")
         _wait_pending_upload()
         upload_executor.shutdown(wait=False, cancel_futures=True)
+    finally:
+        _stop_live()
 
     # ── 4. Cleanup incomplete outputs ──
     if not args.dry_run:

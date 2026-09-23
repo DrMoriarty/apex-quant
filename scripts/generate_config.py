@@ -79,7 +79,7 @@ QUANTS_RANKED_SPEED = [
 ]
 
 
-_quant_mode = "default"  # "default" | "speed" | "size"
+_quant_mode = "speed"  # "mixed" | "speed" | "size"
 
 
 def ranked_quant(index, role="expert"):
@@ -96,7 +96,7 @@ def ranked_quant(index, role="expert"):
         quants = QUANTS_RANKED_SPEED
     elif _quant_mode == "size":
         quants = QUANTS_RANKED_SIZE
-    else:
+    else: # mixed mode
         quants = QUANTS_RANKED_SIZE if role == "expert" else QUANTS_RANKED_SPEED
     if index < 0:
         return quants[0]
@@ -148,6 +148,8 @@ def parse_args(argv=None):
                             help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) for all tensors")
     quant_mode.add_argument("--size", action="store_const", dest="quant_mode", const="size",
                             help="Use QUANTS_RANKED_SIZE (IQ4_NL/IQ3_S/IQ2_S) for all tensors")
+    quant_mode.add_argument("--mixed", action="store_const", dest="quant_mode", const="mixed",
+                            help="Use mixed quants.")
 
     # Profile modifiers (integers)
     p.add_argument("--edge-exp", type=int, default=None,
@@ -432,7 +434,7 @@ def generate_dense(cfg):
 def main(argv=None):
     global _quant_mode
     args = parse_args(argv)
-    _quant_mode = args.quant_mode or "default"
+    _quant_mode = args.quant_mode or "speed"
     cfg = resolve_profile(args)
 
     if cfg["arch"] == "dense":
