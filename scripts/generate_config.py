@@ -50,7 +50,7 @@ import sys
 
 # Quantization types sorted by quality descending (index = quality rank).
 # Use ranked_quant(index) to convert an index to a quant string with clamping.
-QUANTS_RANKED = [
+QUANTS_RANKED_SIZE = [
     "Q8_0",       # 0
     "Q6_K",       # 1
     "Q5_K",       # 2
@@ -78,7 +78,7 @@ _use_speed = False
 
 def ranked_quant(index):
     """Return quant string for a quality-rank index, clamping to valid range."""
-    quants = QUANTS_RANKED_SPEED if _use_speed else QUANTS_RANKED
+    quants = QUANTS_RANKED_SPEED if _use_speed else QUANTS_RANKED_SIZE
     if index < 0:
         return quants[0]
     if index >= len(quants):
@@ -125,7 +125,7 @@ def parse_args(argv=None):
     p.add_argument("--output", "-o",
                    help="Write config to file instead of stdout")
     p.add_argument("--speed", action="store_true",
-                   help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) instead of QUANTS_RANKED")
+                   help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) instead of QUANTS_RANKED_SIZE")
 
     # Profile modifiers (integers)
     p.add_argument("--edge-exp", type=int, default=None,

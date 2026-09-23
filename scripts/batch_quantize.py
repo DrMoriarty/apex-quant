@@ -13,7 +13,8 @@ Supports **resumable** execution: state is persisted to a JSON file so that
 re-running with identical arguments only performs remaining work.
 
 Concurrency:
-  * model + imatrix downloads run in parallel
+  * model + imatrix downloads run sequentially in the main thread
+    (so Ctrl+C can interrupt them)
   * tiers are quantized sequentially, but tier N upload overlaps with
     tier N+1 quantization (upload runs in a background thread)
 
@@ -62,6 +63,34 @@ def _handle_sigint(sig, frame):
 signal.signal(signal.SIGINT, _handle_sigint)
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _allow_hard_interrupt():
+    """On Ctrl+C, kill the process immediately (no cleanup).
+
+    huggingface_hub catches KeyboardInterrupt in its retry/tqdm loops
+    and swallows it, so we must os._exit to actually stop.
+
+    No-op outside the main thread (signal.signal only works there).
+    """
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+    old = signal.getsignal(signal.SIGINT)
+
+    def _hard_exit(sig, frame):
+        sys.stderr.write("\n")
+        os._exit(130)
+
+    signal.signal(signal.SIGINT, _hard_exit)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, old)
+
+
 def _load_dotenv():
     path = PROJECT_ROOT / ".env"
     if not path.is_file():
@@ -77,6 +106,52 @@ def _load_dotenv():
 
 
 _load_dotenv()
+
+
+# ---------------------------------------------------------------------------
+# Network retry
+# ---------------------------------------------------------------------------
+
+try:
+    import httpx as _httpx
+    _HTTPX_ERRORS = (_httpx.HTTPError,)
+except ImportError:
+    _httpx = None
+    _HTTPX_ERRORS = ()
+
+_NETWORK_ERRORS = (
+    OSError,
+    ConnectionError,
+    TimeoutError,
+) + _HTTPX_ERRORS
+
+
+def _retry_on_network_error(fn=None, *, max_retries=5, delay=10):
+    """Decorator: retry a function on transient network errors.
+
+    Prints a user-visible warning before each retry so the operator knows
+    the script is waiting for connectivity to recover.
+    """
+    import functools
+
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except _NETWORK_ERRORS as exc:
+                    if attempt == max_retries:
+                        raise
+                    log_err(f"Network error in {func.__name__}: {exc}")
+                    log(f"  → Проблемы с интернетом, повтор через {delay} сек. "
+                        f"(попытка {attempt}/{max_retries})")
+                    time.sleep(delay)
+        return wrapper
+
+    if fn is not None:
+        return decorator(fn)
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +359,12 @@ def _check_hf_import():
         sys.exit(1)
 
 
+def _is_network_error(exc: Exception) -> bool:
+    """Return True if *exc* looks like a transient network failure."""
+    return isinstance(exc, _NETWORK_ERRORS)
+
+
+@_retry_on_network_error
 def _list_repo_gguf_files(repo_id: str, token: Optional[str]) -> list:
     """Return list of .gguf filenames in a HF repo."""
     from huggingface_hub import HfApi
@@ -357,6 +438,7 @@ For more information, see: <https://github.com/DrMoriarty/apex-quant/>
 """
 
 
+@_retry_on_network_error
 def _readme_in_repo(repo_id: str, token: Optional[str]) -> bool:
     """Check if README.md exists in a HF repo."""
     from huggingface_hub import HfApi
@@ -364,10 +446,13 @@ def _readme_in_repo(repo_id: str, token: Optional[str]) -> bool:
         api = HfApi(token=token)
         files = api.list_repo_files(repo_id=repo_id, repo_type="model")
         return "README.md" in files
-    except Exception:
+    except Exception as exc:
+        if _is_network_error(exc):
+            raise
         return False
 
 
+@_retry_on_network_error
 def _download_readme(repo_id: str, token: Optional[str], dest: Path) -> bool:
     """Download README.md from a HF repo. Returns True on success."""
     from huggingface_hub import hf_hub_download
@@ -383,7 +468,9 @@ def _download_readme(repo_id: str, token: Optional[str], dest: Path) -> bool:
         if src.exists() and src != dest:
             dest.write_text(src.read_text())
         return dest.exists()
-    except Exception:
+    except Exception as exc:
+        if _is_network_error(exc):
+            raise
         return False
 
 
@@ -423,6 +510,7 @@ def _rebuild_readme_rows(readme_path: Path, state: "BatchState"):
             _append_readme_row(readme_path, tier_name, sz_mb / 1024)
 
 
+@_retry_on_network_error
 def _upload_readme(
     readme_path: Path,
     repo_id: str,
@@ -448,13 +536,133 @@ def _upload_readme(
             )
         log(f"  ✓ README → {repo_id}")
     except Exception as exc:
+        if _is_network_error(exc):
+            raise
         log_err(f"  ✗ README upload failed ({repo_id}): {exc}")
 
 
 # ---------------------------------------------------------------------------
-# Download
+# Download — resume support
+# ---------------------------------------------------------------------------
+# Download — resumable
+# ---------------------------------------------------------------------------
+#
+# huggingface_hub does NOT support resuming downloads across process
+# restarts: it uses per-process UUID temp file names (PR #4228) and
+# deletes the blob before re-downloading.  Xet storage adds its own
+# non-resumable layer on top.
+#
+# We implement our own resumable downloader: get the URL + file size
+# from HuggingFace API, then download with httpx + Range headers,
+# writing to a deterministic `.part` file.
+#
+# On restart the script checks the existing `.part` file size and
+# resumes from that byte offset.  On success the file is renamed
+# to the final `.gguf` name.
 # ---------------------------------------------------------------------------
 
+import httpx
+
+
+def _resumable_download(url: str, dest: Path, *, token: Optional[str] = None,
+                        label: str = "file") -> Path:
+    """Download *url* to *dest* with resume support.
+
+    Incomplete data is stored alongside *dest* as ``{dest}.part``.
+    On resume the existing ``.part`` file is inspected and a ``Range``
+    header is sent to skip already-downloaded bytes.
+    """
+    part = dest.with_suffix(dest.suffix + ".part")
+    existing = part.stat().st_size if part.exists() else 0
+
+    headers: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    # Get total file size via HEAD
+    with httpx.Client(follow_redirects=True, timeout=30) as client:
+        head = client.head(url, headers=headers)
+        head.raise_for_status()
+        total = int(head.headers.get("content-length", 0))
+
+    if existing > 0 and existing < total:
+        log(f"Resuming {label} from {existing / (1024**2):.1f} MB  "
+            f"({existing / total * 100:.1f}%)")
+        headers["Range"] = f"bytes={existing}-"
+    elif existing >= total and total > 0:
+        # Already complete — rename and return
+        if dest.exists():
+            dest.unlink()
+        part.rename(dest)
+        return dest
+    else:
+        existing = 0
+
+    mode = "ab" if existing > 0 else "wb"
+    bytes_downloaded = existing
+
+    with open(part, mode) as f, \
+         httpx.Client(follow_redirects=True, timeout=httpx.Timeout(300, connect=30)) as client:
+        with client.stream("GET", url, headers=headers) as response:
+            if existing > 0 and response.status_code == 200:
+                # Server ignored Range — restart from scratch
+                f.seek(0)
+                f.truncate()
+                bytes_downloaded = 0
+
+            response.raise_for_status()
+
+            total_mb = total / (1024**2)
+            last_log = time.time()
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                f.write(chunk)
+                bytes_downloaded += len(chunk)
+                now = time.time()
+                if now - last_log >= 5:
+                    pct = bytes_downloaded / total * 100 if total else 0
+                    log(f"  {label}: {bytes_downloaded / (1024**2):.0f}/{total_mb:.0f} MB  ({pct:.1f}%)")
+                    last_log = now
+
+    # Verify size
+    actual = part.stat().st_size
+    if actual != total:
+        raise ValueError(
+            f"Download size mismatch: expected {total}, got {actual} ({label})")
+
+    if dest.exists():
+        dest.unlink()
+    part.rename(dest)
+    log(f"{label} complete: {dest.name}  ({actual / (1024**3):.2f} GB)")
+    return dest
+
+
+def _get_hf_download_url(repo_id: str, filename: str, token: Optional[str]) -> str:
+    """Resolve the download URL for a file in a HuggingFace repo."""
+    from huggingface_hub import hf_hub_url
+    return hf_hub_url(repo_id, filename=filename, repo_type="model")
+
+
+def _download_single_file(
+    repo_id: str,
+    filename: str,
+    workspace: Path,
+    token: Optional[str],
+    *,
+    label: str = "file",
+) -> Path:
+    """Download a single file from HF with resume support."""
+    dest = workspace / filename
+    if dest.exists() and dest.stat().st_size > 0:
+        log(f"{label} already exists: {dest.name}  "
+            f"({dest.stat().st_size / (1024**3):.2f} GB)")
+        return dest
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    url = _get_hf_download_url(repo_id, filename, token)
+    return _resumable_download(url, dest, token=token, label=label)
+
+
+@_retry_on_network_error
 def download_source_model(
     repo_id: str,
     workspace: Path,
@@ -462,29 +670,17 @@ def download_source_model(
     source_file: str,
 ) -> Path:
     """Download the source GGUF from HF, return local path."""
-    from huggingface_hub import snapshot_download
     target_dir = workspace / "source_model"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    log(f"Downloading source model {repo_id} → {target_dir}  (file: {source_file})")
-    local_dir = snapshot_download(
-        repo_id=repo_id,
-        repo_type="model",
-        local_dir=str(target_dir),
-        allow_patterns=[source_file],
-        token=token,
+    result = _download_single_file(
+        repo_id, source_file, target_dir, token, label="source model",
     )
-    result = Path(local_dir) / source_file
     if not result.exists():
-        # fallback: find any .gguf in the downloaded dir
-        ggufs = list(Path(local_dir).glob("*.gguf"))
-        if ggufs:
-            result = ggufs[0]
-        else:
-            raise FileNotFoundError(f"No .gguf found after downloading {repo_id}")
+        raise FileNotFoundError(f"Source file not found after download: {result}")
     log(f"Source model ready: {result.name}  ({result.stat().st_size / (1024**3):.2f} GB)")
     return result
 
 
+@_retry_on_network_error
 def download_imatrix(
     repo_id: str,
     workspace: Path,
@@ -492,24 +688,12 @@ def download_imatrix(
     imatrix_file: str,
 ) -> Path:
     """Download the imatrix file from HF, return local path."""
-    from huggingface_hub import snapshot_download
     target_dir = workspace / "imatrix"
-    target_dir.mkdir(parents=True, exist_ok=True)
-    log(f"Downloading imatrix {repo_id} → {target_dir}  (file: {imatrix_file})")
-    local_dir = snapshot_download(
-        repo_id=repo_id,
-        repo_type="model",
-        local_dir=str(target_dir),
-        allow_patterns=[imatrix_file],
-        token=token,
+    result = _download_single_file(
+        repo_id, imatrix_file, target_dir, token, label="imatrix",
     )
-    result = Path(local_dir) / imatrix_file
     if not result.exists():
-        cands = list(Path(local_dir).glob("*imatrix*")) + list(Path(local_dir).glob("*.dat"))
-        if cands:
-            result = cands[0]
-        else:
-            raise FileNotFoundError(f"No imatrix file found after downloading {repo_id}")
+        raise FileNotFoundError(f"Imatrix file not found after download: {result}")
     log(f"Imatrix ready: {result.name}  ({result.stat().st_size / (1024**2):.1f} MB)")
     return result
 
@@ -541,6 +725,7 @@ def run_quantize(
 # Upload
 # ---------------------------------------------------------------------------
 
+@_retry_on_network_error
 def upload_tier(
     tier: int,
     gguf_path: Path,
@@ -639,12 +824,17 @@ def run_pipeline(args):
     if not source_info or not imatrix_info:
         from huggingface_hub import HfApi
         api = HfApi(token=token)
+
+        @_retry_on_network_error
+        def _list_all(repo_id):
+            return api.list_repo_files(repo_id=repo_id, repo_type="model")
+
         if not source_info:
-            src_files = api.list_repo_files(repo_id=args.model, repo_type="model")
+            src_files = _list_all(args.model)
         else:
             src_files = []
         if not imatrix_info:
-            imx_files = api.list_repo_files(repo_id=args.imatrix, repo_type="model")
+            imx_files = _list_all(args.imatrix)
         else:
             imx_files = []
 
@@ -673,7 +863,7 @@ def run_pipeline(args):
                 sys.exit(1)
             log(f"Selected imatrix file: {imatrix_file}")
 
-        # download both in parallel
+        # download both in the main thread so Ctrl+C actually stops them
         if args.dry_run:
             if not source_info:
                 log(f"DRY RUN: would download source model {args.model} ({source_file})")
@@ -684,19 +874,18 @@ def run_pipeline(args):
                 imatrix_path = Path(f"/dry-run/{imatrix_file}")
                 state.mark_imatrix(str(imatrix_path))
         else:
-            dl_futures = {}
-            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="download") as dl_pool:
+            with _allow_hard_interrupt():
+                downloads = []
                 if not source_info:
-                    dl_futures["source"] = dl_pool.submit(
-                        download_source_model, args.model, workspace, token, source_file)
+                    downloads.append(("source", download_source_model, (args.model, workspace, token, source_file)))
                 if not imatrix_info:
-                    dl_futures["imatrix"] = dl_pool.submit(
-                        download_imatrix, args.imatrix, workspace, token, imatrix_file)
-
-                # wait for both
-                for key, fut in dl_futures.items():
+                    downloads.append(("imatrix", download_imatrix, (args.imatrix, workspace, token, imatrix_file)))
+                for key, fn, a in downloads:
                     try:
-                        result = fut.result()
+                        result = fn(*a)
+                    except KeyboardInterrupt:
+                        log("\nDownload interrupted by user.")
+                        sys.exit(130)
                     except Exception as exc:
                         log_err(f"Download failed ({key}): {exc}")
                         sys.exit(1)
