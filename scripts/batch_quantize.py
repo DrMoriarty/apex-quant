@@ -34,12 +34,15 @@ import argparse
 import io
 import json
 import os
+import pty
+import re
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import tty
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
@@ -82,7 +85,7 @@ def _allow_hard_interrupt():
     old = signal.getsignal(signal.SIGINT)
 
     def _hard_exit(sig, frame):
-        sys.stderr.write("\n")
+        os.write(2, b"\n\033[?25h")
         os._exit(130)
 
     signal.signal(signal.SIGINT, _hard_exit)
@@ -187,10 +190,11 @@ def log(msg: str):
 
 def log_err(msg: str):
     line = f"[{_ts()}] \u274c {msg}"
+    # Always print errors to stderr so they are visible even when
+    # Rich Live is overwriting the terminal.
+    print(line, file=sys.stderr, flush=True)
     if _HAS_RICH and _lc is not None and _lc.live is not None:
         _lc.live.append_log(line)
-    else:
-        print(line, file=sys.stderr, flush=True)
 
 
 # ---------------------------------------------------------------------------
@@ -331,65 +335,88 @@ _LOG_RING_SIZE = 8
 
 
 class _RichLive:
-    """Thin wrapper around ``rich.live.Live``.
+    """Thin wrapper around ``rich.live.Live`` — handles spinner animation,
+    log ring buffer, and Rich Live cursor management.
 
-    ``display_status(...)`` returns a Rich *Panel*; ``append_log()`` appends
-    a plain-text line to a ring buffer.  A composite renderable (Panel +
-    log Text) is pushed to ``Live`` on every update / log / refresh.
+    Rich's ``get_renderable`` callback is used: Rich's own daemon thread calls
+    ``_composite()`` on every refresh. No manual terminal I/O from our threads.
+    Only callers (pipeline, capture) mutate state dicts; Rich renders.
     """
 
     def __init__(self):
-        self._console = Console(force_terminal=True, stderr=False)
-        self._live = Live(
-            console=self._console,
-            refresh_per_second=4,
-            transient=False,
-        )
-        self._renderable = None
         self._log_lines: list[str] = []
         self._lock = threading.Lock()
+        self._last_refresh: float = 0.0
+        self._last_good: Optional[object] = None   # fallback renderable
 
-    # -- lifecycle --
+        # Pass file=sys.stdout explicitly so that Console stores a direct
+        # reference.  Without it, self._file is None and Console's ``file``
+        # property re-reads ``sys.stdout`` on every render — which breaks
+        # during upload when sys.stdout is temporarily redirected.
+        self._live = Live(
+            console=Console(file=sys.stdout, force_terminal=True),
+            auto_refresh=True,
+            refresh_per_second=5,
+            transient=True,
+            get_renderable=self._composite,
+        )
+
+    # -- lifecycle (thin passthrough) --
 
     def start(self):
         self._live.start()
 
     def stop(self):
-        # Push one final composite before shutting down.
-        self._live.update(self._composite())
         self._live.stop()
 
-    def update(self, renderable):
-        with self._lock:
-            self._renderable = renderable
-        self._live.update(self._composite())
+    def update(self, _renderable=None):
+        """Explicit refresh — throttled to avoid starving auto-refresh."""
+        now = time.time()
+        if now - self._last_refresh >= 0.2:       # ≤ 5/sec
+            self._last_refresh = now
+            self._live.refresh()
 
     def append_log(self, msg: str):
         with self._lock:
             self._log_lines.append(msg)
             if len(self._log_lines) > _LOG_RING_SIZE * 3:
                 self._log_lines = self._log_lines[-_LOG_RING_SIZE:]
-        self._live.update(self._composite())
 
-    # -- helpers --
+    # -- composite builder (called by Rich's daemon thread via
+    #    ``_get_renderable`` on every auto-refresh tick) --
 
     def _composite(self):
-        with self._lock:
-            renderable = self._renderable
-            logs = list(self._log_lines[-_LOG_RING_SIZE:])
-        parts = []
-        if renderable is not None:
-            parts.append(renderable)
-        if logs:
-            parts.append(Text("\n".join(logs)))
-        return Group(*parts) if parts else Text("")
+        try:
+            with self._lock:
+                logs = list(self._log_lines[-_LOG_RING_SIZE:])
+            if _lc is not None:
+                renderable = display_status(
+                    _lc.state, _lc.source_ok, _lc.imatrix_ok,
+                    _lc.tiers, _live_ctx=_lc)
+            else:
+                renderable = Text("")
+            parts = [renderable]
+            padded = logs + [""] * (_LOG_RING_SIZE - len(logs))
+            parts.append(Text("\n".join(padded)))
+            result = Group(*parts)
+            self._last_good = result
+            return result
+        except Exception:
+            # If the refresh thread's _composite raises, Rich's
+            # _RefreshThread.run() dies with no recovery.  Return
+            # the last known-good renderable to keep the display
+            # alive.
+            if self._last_good is not None:
+                return self._last_good
+            return Text("… refreshing …")
 
 
 def _init_live():
-    if not _HAS_RICH or _lc is None:
+    if _lc is None or not _HAS_RICH:
         return
-    _lc.live = _RichLive()
-    _lc.live.start()
+    if _lc.live is None:
+        _lc.live = _RichLive()
+        _lc.live.start()
 
 
 def _stop_live():
@@ -398,6 +425,8 @@ def _stop_live():
     _lc.live.update(_build_live_renderable())
     _lc.live.stop()
     _lc.live = None
+    sys.stdout.write("\033[?25h")
+    sys.stdout.flush()
 
 
 def _build_live_renderable():
@@ -406,11 +435,13 @@ def _build_live_renderable():
                           _lc.tiers, _live_ctx=_lc)
 
 
+
 _STATUS_STYLE = {
     "pending":    "dim",
     "quantizing": "yellow",
     "quantized":  "cyan",
     "uploading":  "magenta",
+    "queued":     "dim cyan",
     "uploaded":   "green",
     "error":      "bold red",
     "done":       "bold green",
@@ -421,6 +452,7 @@ _STATUS_ICON = {
     "quantizing": "◉",
     "quantized":  "◇",
     "uploading":  "↑",
+    "queued":     "↑",
     "uploaded":   "✓",
     "error":      "✗",
     "done":       "✓",
@@ -441,11 +473,11 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
     if _HAS_RICH and _live_ctx is not None:
         from rich.text import Text
 
-        table = Table(show_lines=False, expand=False, padding=(0, 1))
+        table = Table(show_lines=False, padding=(0, 1), expand=True)
         table.add_column("Tier", justify="right", style="bold", width=6)
         table.add_column("Base", width=7)
-        table.add_column("Status", min_width=32)
-        table.add_column("Info", min_width=16, style="dim")
+        table.add_column("Status", width=56)
+        table.add_column("Info", ratio=1, style="dim", overflow="fold")
 
         # Download rows (above tier table)
         for key, dl in _live_ctx.downloads.items():
@@ -459,12 +491,16 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                 m, s = divmod(int(elapsed), 60)
                 elapsed_str = f"{m:02d}:{s:02d}"
                 frame = _SPINNER_FRAMES[int(time.time() * 4) % len(_SPINNER_FRAMES)]
-                if total > 0:
+                if total > 0 and dl_bytes > 0:
                     pct = dl_bytes / total * 100
                     bar_len = 20
                     filled = int(pct / 100 * bar_len)
                     bar = "█" * filled + "░" * (bar_len - filled)
-                    status_col = Text(f" {frame} {bar} {pct:.1f}% {elapsed_str}",
+                    eta_sec = elapsed / dl_bytes * (total - dl_bytes)
+                    em, es = divmod(int(eta_sec), 60)
+                    eh, em = divmod(em, 60)
+                    eta_str = f"{em:02d}:{es:02d}" if not eh else f"{eh}:{em:02d}:{es:02d}"
+                    status_col = Text(f" {frame} {bar} {pct:.1f}% {elapsed_str} ETA {eta_str}",
                                       style="cyan")
                     info = f"{dl_bytes / (1024**2):.0f}/{total / (1024**2):.0f} MB"
                 else:
@@ -484,13 +520,16 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                 info = _format_active_info(tier, active, state)
             else:
                 st = state.tier_status(tier)
-                icon = _STATUS_ICON.get(st, "?")
-                style = _STATUS_STYLE.get(st, "")
-                status_col = Text(f" {icon} {st}", style=style)
+                # State says "uploading" but the tier is NOT in active_tiers
+                # → the upload is sitting in the executor queue.
+                show_st = "queued" if st == "uploading" else st
+                icon = _STATUS_ICON.get(show_st, "?")
+                style = _STATUS_STYLE.get(show_st, "")
+                status_col = Text(f" {icon} {show_st}", style=style)
                 info = ""
-                if st == "error":
-                    info = state._t(tier).get("error_short", "")
-                elif st == "uploaded":
+                if show_st == "error":
+                    info = Text(state._t(tier).get("error_short", ""), style="red")
+                elif show_st == "uploaded":
                     sz = state._t(tier).get("size_mb")
                     if sz:
                         info = f"{sz} MB"
@@ -499,18 +538,18 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         src_label = "✓ downloaded" if source_ok else "… pending"
         imx_label = "✓ downloaded" if imatrix_ok else "… pending"
         header = Text(f"Source:  {src_label}\nImatrix: {imx_label}", style="bold")
-        return Panel(table, title="[bold]APEX Batch Quantization[/bold]",
+        return Panel(table, title="[bold]mAPEX Batch Quantization[/bold]",
                      subtitle=header, border_style="blue")
 
     # ── One-shot mode (original behavior) ──
     if _HAS_RICH:
         from rich.text import Text
 
-        table = Table(show_lines=False, expand=False, padding=(0, 1))
+        table = Table(show_lines=False, padding=(0, 1), expand=True)
         table.add_column("Tier", justify="right", style="bold", width=6)
         table.add_column("Base", width=7)
-        table.add_column("Status", min_width=26)
-        table.add_column("Info", min_width=16, style="dim")
+        table.add_column("Status", width=56)
+        table.add_column("Info", ratio=1, style="dim", overflow="fold")
         for tier in tiers:
             base = TIER_BASE_TYPE[tier]
             st = state.tier_status(tier)
@@ -518,7 +557,7 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
             style = _STATUS_STYLE.get(st, "")
             info = ""
             if st == "error":
-                info = state._t(tier).get("error_short", "")
+                info = Text(state._t(tier).get("error_short", ""), style="red")
             elif st == "uploaded":
                 sz = state._t(tier).get("size_mb")
                 if sz:
@@ -532,7 +571,7 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         src_label = "✓ downloaded" if source_ok else "… pending"
         imx_label = "✓ downloaded" if imatrix_ok else "… pending"
         header = Text(f"Source:  {src_label}\nImatrix: {imx_label}", style="bold")
-        panel = Panel(table, title="[bold]APEX Batch Quantization[/bold]",
+        panel = Panel(table, title="[bold]mAPEX Batch Quantization[/bold]",
                        subtitle=header, border_style="blue")
         console.print(panel)
     else:
@@ -561,20 +600,46 @@ def _render_active_tier(tier: int, active: dict, lc) -> "Text":
     frame = _SPINNER_FRAMES[int(time.time() * 4) % len(_SPINNER_FRAMES)]
 
     if st == "quantizing":
-        last = active.get("last_line", "")
-        suffix = f"  {last[:22]}" if last else ""
-        return Text(f" {frame} quantizing… {elapsed_str}{suffix}", style="yellow")
-    elif st == "uploading":
-        prog = lc.upload_progress.get(tier)
-        if prog and prog.get("total", 0) > 0:
-            pct = prog["current"] / prog["total"] * 100
+        cur = active.get("tensor_current")
+        total = active.get("tensor_total")
+        if cur is not None and total and total > 0 and cur > 0:
+            pct = cur / total * 100
             bar_len = 16
             filled = int(pct / 100 * bar_len)
             bar = "█" * filled + "░" * (bar_len - filled)
-            return Text(f" ↑ {bar} {pct:.0f}% {elapsed_str}", style="magenta")
-        last = active.get("last_line", "")
-        suffix = f"  {last[:22]}" if last else ""
-        return Text(f" {frame} uploading… {elapsed_str}{suffix}", style="magenta")
+            eta_sec = elapsed / cur * (total - cur)
+            em, es = divmod(int(eta_sec), 60)
+            eh, em = divmod(em, 60)
+            eta_str = f"{em:02d}:{es:02d}" if not eh else f"{eh}:{em:02d}:{es:02d}"
+            return Text(f" ◉ {bar} {cur}/{total} {elapsed_str} ETA {eta_str}", style="yellow")
+        return Text(f" {frame} quantizing… {elapsed_str}", style="yellow")
+    elif st == "uploading":
+        prog = lc.upload_progress.get(tier)
+        if prog and prog.get("total", 0) > 0:
+            cur = prog["current"]
+            total = prog["total"]
+            pct = cur / total * 100
+            stage_start = prog.get("stage_start", active.get("start", time.time()))
+            stage_elapsed = time.time() - stage_start
+            bar_len = 16
+            filled = min(int(pct / 100 * bar_len), bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            cur_mb = cur / (1024**2)
+            total_mb = total / (1024**2)
+            if cur > 0 and stage_elapsed > 1:
+                eta_sec = stage_elapsed / cur * (total - cur)
+                em, es = divmod(int(eta_sec), 60)
+                eh, em = divmod(em, 60)
+                eta_str = f"{em:02d}:{es:02d}" if not eh else f"{eh}:{em:02d}:{es:02d}"
+                return Text(
+                    f" ↑ {bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str} ETA {eta_str}",
+                    style="magenta",
+                )
+            return Text(
+                f" ↑ {bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str}",
+                style="magenta",
+            )
+        return Text(f" {frame} uploading… {elapsed_str}", style="magenta")
     else:
         return Text(f" ? {st}", style="dim")
 
@@ -584,7 +649,7 @@ def _format_active_info(tier: int, active: dict, state: BatchState) -> str:
     last = active.get("last_line", "")
     if not last:
         return ""
-    return last[:38]
+    return last
 
 
 class _Capture:
@@ -593,6 +658,9 @@ class _Capture:
     Used by ``run_quantize`` to feed tier status into the live display
     while preventing raw output from corrupting Rich's rendering.
     """
+
+    _PROGRESS_RE = re.compile(r"\[\s*(\d+)/\s*(\d+)\]")
+    _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
     def __init__(self, tier: int, *, stream: Optional[io.TextIOBase] = None):
         self.tier = tier
@@ -606,7 +674,6 @@ class _Capture:
     def write(self, data: str) -> int:
         self._buf += data
         while True:
-            # Find the earliest line terminator (\n or \r)
             idx_n = self._buf.find("\n")
             idx_r = self._buf.find("\r")
             if idx_n >= 0 and (idx_r < 0 or idx_n <= idx_r):
@@ -615,7 +682,7 @@ class _Capture:
                 idx = idx_r
             else:
                 break
-            line = self._buf[:idx].rstrip("\r\n\t ")
+            line = self._ANSI_RE.sub("", self._buf[:idx]).rstrip("\r\n\t ")
             self._buf = self._buf[idx + 1:]
             if line:
                 with self._lock:
@@ -623,11 +690,12 @@ class _Capture:
                     self.last_line = line
                 if _lc and _lc.active_tiers.get(self.tier):
                     _lc.active_tiers[self.tier]["last_line"] = self.last_line[:120]
-                    # Force Rich Live refresh (throttled to ~1/sec)
-                    now = time.time()
-                    if _lc.live and now - self._last_live_update >= 1.0:
-                        _lc.live.update(_build_live_renderable())
-                        self._last_live_update = now
+                    m = self._PROGRESS_RE.search(line)
+                    if m:
+                        _lc.active_tiers[self.tier]["tensor_current"] = int(m.group(1))
+                        _lc.active_tiers[self.tier]["tensor_total"] = int(m.group(2))
+                    if _lc.live is not None:
+                        _lc.live.update()
         if self._stream is not None and not (_lc and _lc.live):
             try:
                 return self._stream.write(data)
@@ -723,8 +791,8 @@ def _pick_imatrix_file(files: list) -> str:
 # README management
 # ---------------------------------------------------------------------------
 
-README_HEADER = """\
-# APEX Quantized Models
+README_PREAMBLE = """\
+# mAPEX Quantized Models
 
 ## Source Data
 
@@ -736,11 +804,14 @@ Original source file: `{source_file}`
 
 All quants were produced using the **modified APEX** quantization scheme.
 
-APEX (Automated Precision EXpert allocation) assigns per-layer, per-tensor precision
+mAPEX (modified Automated Precision EXpert allocation) assigns per-layer, per-tensor precision
 for MoE models using `llama.cpp`'s `--tensor-type-file`.
 
 For more information, see: <https://github.com/DrMoriarty/apex-quant/>
 
+"""
+
+README_TABLE_HEADER = """\
 ## Quantized Models
 
 | Name | Size (GB) | Comments |
@@ -785,11 +856,50 @@ def _download_readme(repo_id: str, token: Optional[str], dest: Path) -> bool:
 
 
 def _create_readme(readme_path: Path, source_model: str, source_file: str):
-    """Create a fresh README.md with header and empty table."""
-    readme_path.write_text(README_HEADER.format(
-        source_model=source_model,
-        source_file=source_file,
-    ))
+    """Create a fresh README.md with source info and empty table at EOF."""
+    digest = README_PREAMBLE.format(source_model=source_model, source_file=source_file)
+    readme_path.write_text(digest + README_TABLE_HEADER)
+
+
+def _extract_frontmatter_and_body(content: str) -> tuple[str, str]:
+    """Split HF YAML frontmatter from the rest of the file.
+
+    Returns ``(frontmatter, body)`` where *frontmatter* includes the
+    closing ``---`` line (with a trailing newline) or is empty if the
+    content has no frontmatter block.
+    """
+    if not content.startswith("---"):
+        return "", content
+    second = content.find("---", 3)
+    if second < 0:
+        return "", content
+    end = second + 3
+    # consume trailing newline after the closing ---
+    if end < len(content) and content[end] == "\n":
+        end += 1
+    return content[:end], content[end:]
+
+
+def _ensure_apex_header(readme_path: Path, source_model: str, source_file: str):
+    """Inject APEX header into an existing README downloaded from HF.
+
+    If the README already contains the APEX table marker (``## Quantized Models``),
+    it is left untouched.  Otherwise the file is restructured as:
+
+        <HF YAML frontmatter>        ← preserved verbatim at top
+        <APEX source/method info>    ← new
+        <original prose body>        ← preserved
+        <quantization table>         ← new; must be last so ``open("a")`` row appends land inside
+    """
+    if not readme_path.exists():
+        return
+    content = readme_path.read_text()
+    if "## Quantized Models" in content:
+        return
+    frontmatter, body = _extract_frontmatter_and_body(content)
+    preamble = README_PREAMBLE.format(source_model=source_model, source_file=source_file)
+    readme_path.write_text(frontmatter + preamble + body.strip("\n") + "\n\n" + README_TABLE_HEADER)
+    log("✓ Injected mAPEX header into existing README.md")
 
 
 def _readme_has_tier(readme_path: Path, tier_name: str) -> bool:
@@ -842,7 +952,7 @@ def _upload_readme(
                 repo_id=repo_id,
                 repo_type="model",
                 token=token,
-                commit_message="Update README — APEX quantization info",
+                commit_message="Update README — mAPEX quantization info",
             )
         log(f"  ✓ README → {repo_id}")
     except Exception as exc:
@@ -1053,10 +1163,70 @@ def run_quantize(
     ]
 
     if _HAS_RICH and _lc is not None and _lc.live is not None:
-        cap = _Capture(tier, stream=sys.stderr)
-        proc = subprocess.run(cmd, text=True, stdout=subprocess.DEVNULL, stderr=cap)
+        cap = _Capture(tier)
+
+        # Use a PTY for stderr so llama-quantize sees a real terminal and
+        # emits per-tensor progress lines (it suppresses them on pipes).
+        master_fd, slave_fd = pty.openpty()
+        tty.setraw(slave_fd)
+
+        proc = subprocess.Popen(cmd, text=True, stdout=subprocess.PIPE,
+                                stderr=slave_fd, close_fds=True)
+        os.close(slave_fd)
+
+        err_buf = ""
+        def _read_stderr():
+            nonlocal err_buf
+            try:
+                while True:
+                    try:
+                        chunk = os.read(master_fd, 8192)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    text = chunk.decode("utf-8", errors="replace")
+                    cap.write(text)
+                    err_buf += text
+            finally:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+
+        def _read_stdout():
+            try:
+                while True:
+                    chunk = proc.stdout.read(4096)
+                    if not chunk:
+                        break
+                    cap.write(chunk)
+            except Exception:
+                pass
+
+        reader_err = threading.Thread(target=_read_stderr, daemon=True)
+        reader_err.start()
+        reader_out = threading.Thread(target=_read_stdout, daemon=True)
+        reader_out.start()
+        # Poll instead of blocking wait so Ctrl-C / _interruption_requested
+        # is checked regularly (proc.wait() blocks the main thread entirely).
+        while proc.poll() is None:
+            if _interruption_requested:
+                proc.kill()
+                proc.wait()
+                reader_err.join(timeout=5)
+                reader_out.join(timeout=5)
+                raise KeyboardInterrupt("Quantization interrupted by user")
+            try:
+                proc.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                pass
+        reader_err.join(timeout=5)
+        reader_out.join(timeout=5)
         if proc.returncode != 0:
-            tail = "\n".join(cap.lines[-15:]) or f"(exit code {proc.returncode})"
+            clean_err = _Capture._ANSI_RE.sub("", err_buf)
+            tail_lines = [l for l in clean_err.splitlines() if l.strip()]
+            tail = "\n".join(tail_lines[-15:]) or f"(exit code {proc.returncode})"
             raise RuntimeError(
                 f"quantize.py (tier{tier}) failed:\n{tail}"
             )
@@ -1071,6 +1241,80 @@ def run_quantize(
 # Upload
 # ---------------------------------------------------------------------------
 
+
+class _UploadProgressWrapper(io.BufferedIOBase):
+    """Wraps a binary file object to track upload progress via _lc.upload_progress.
+
+    huggingface_hub reads the file twice:
+      1.  Preparing  — reads to compute SHA/hash
+      2.  seek(0)    — rewinds
+      3.  Uploading  — reads again to send bytes over the wire
+      4.  Committing — API commit after upload
+
+    Stage transitions fire when a full pass completes (bytes_read reaches total).
+    """
+
+    def __init__(self, path: Path, tier: int):
+        super().__init__()
+        self._file = open(path, "rb")
+        self._tier = tier
+        self._total = path.stat().st_size
+        self._bytes_read = 0
+        self._pass = 0
+        self.name = str(path)
+        self.mode = "rb"
+        self._set_stage("preparing")
+
+    # -- stage helpers --
+
+    def _on_pass_complete(self):
+        self._pass += 1
+        if self._pass == 1:
+            self._set_stage("uploading")
+        elif self._pass >= 2:
+            self._set_stage("committing")
+
+    def _set_stage(self, stage: str):
+        if _lc and self._tier in _lc.upload_progress:
+            _lc.upload_progress[self._tier]["stage"] = stage
+            _lc.upload_progress[self._tier]["stage_start"] = time.time()
+        if _lc and self._tier in _lc.active_tiers:
+            _lc.active_tiers[self._tier]["last_line"] = stage
+            if _lc.live is not None:
+                _lc.live.update()
+
+    # -- io interface --
+
+    def readable(self) -> bool:
+        return True
+
+    def read(self, size: int = -1) -> bytes:
+        chunk = self._file.read(size)
+        n = len(chunk)
+        if n:
+            self._bytes_read += n
+            if self._bytes_read >= self._total:
+                self._on_pass_complete()
+            if _lc and self._tier in _lc.upload_progress:
+                _lc.upload_progress[self._tier]["current"] = self._bytes_read
+        return chunk
+
+    def __len__(self) -> int:
+        return self._total
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        pos = self._file.seek(offset, whence)
+        self._bytes_read = pos
+        return pos
+
+    def tell(self) -> int:
+        return self._file.tell()
+
+    def close(self):
+        self._file.close()
+        super().close()
+
+
 @_retry_on_network_error
 def upload_tier(
     tier: int,
@@ -1079,7 +1323,7 @@ def upload_tier(
     token: Optional[str],
 ) -> None:
     """Upload a quantized GGUF to HuggingFace."""
-    from huggingface_hub import create_repo, upload_folder
+    from huggingface_hub import create_repo, HfApi
     if not gguf_path.exists():
         raise FileNotFoundError(f"GGUF file not found for upload: {gguf_path}")
     if gguf_path.stat().st_size == 0:
@@ -1092,36 +1336,45 @@ def upload_tier(
 
     create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=token)
 
-    with tempfile.TemporaryDirectory(prefix=f"apex_upload_t{tier}_") as tmpdir:
-        link = Path(tmpdir) / gguf_path.name
-        link.symlink_to(gguf_path.resolve())
-        if _live_active:
-            import io as _io
-            _old_stderr = sys.stderr
-            sys.stderr = _io.StringIO()
+    if _live_active:
+        import io as _io
+
+        wrapper = _UploadProgressWrapper(gguf_path, tier)
+        _old_stdout = sys.stdout
+        _old_stderr = sys.stderr
+        sys.stdout = _io.StringIO()
+        sys.stderr = _io.StringIO()
+        try:
             try:
-                upload_folder(
-                    folder_path=tmpdir,
+                HfApi(token=token).upload_file(
+                    path_or_fileobj=wrapper,
+                    path_in_repo=gguf_path.name,
                     repo_id=repo_id,
                     repo_type="model",
-                    token=token,
                     commit_message=f"APEX tier{tier} quantization",
                 )
-            finally:
-                captured = sys.stderr.getvalue()
-                sys.stderr = _old_stderr
-                if _lc and tier in _lc.active_tiers:
-                    lines = [l for l in captured.splitlines() if l.strip()]
-                    if lines:
-                        _lc.active_tiers[tier]["last_line"] = lines[-1][:120]
-        else:
-            upload_folder(
-                folder_path=tmpdir,
-                repo_id=repo_id,
-                repo_type="model",
-                token=token,
-                commit_message=f"APEX tier{tier} quantization",
-            )
+            except TypeError:
+                wrapper.close()
+                HfApi(token=token).upload_file(
+                    path_or_fileobj=str(gguf_path),
+                    path_in_repo=gguf_path.name,
+                    repo_id=repo_id,
+                    repo_type="model",
+                    commit_message=f"APEX tier{tier} quantization",
+                )
+        finally:
+            wrapper.close()
+            sys.stdout = _old_stdout
+            sys.stderr = _old_stderr
+    else:
+        HfApi(token=token).upload_file(
+            path_or_fileobj=str(gguf_path),
+            path_in_repo=gguf_path.name,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=f"APEX tier{tier} quantization",
+        )
+
     if not _live_active:
         log(f"✓ Uploaded tier{tier} → {repo_id}")
 
@@ -1157,7 +1410,7 @@ def run_pipeline(args):
     log("=" * 60)
     if args.dry_run:
         log("  *** DRY RUN MODE ***")
-    log("  APEX Batch Quantization Pipeline")
+    log("  mAPEX Batch Quantization Pipeline")
     log("=" * 60)
     log(f"  Model:    {args.model}")
     log(f"  Imatrix:  {args.imatrix}")
@@ -1303,6 +1556,8 @@ def run_pipeline(args):
             downloaded = _download_readme(output_base, token, readme_path)
             if downloaded:
                 log(f"✓ README.md downloaded from {output_base}")
+                _ensure_apex_header(readme_path, args.model,
+                                   state.source_info()["format"])
             else:
                 _create_readme(readme_path, args.model,
                                state.source_info()["format"])
@@ -1342,151 +1597,192 @@ def run_pipeline(args):
     log(f"\nTiers to process: {needs_work}")
 
     # ── 3. Quantize + Upload pipeline ──
-    # upload N-1 overlaps with quantize N
+    # At any moment: 1 upload running (executor queue), 1 quantize running.
+    # Uploads go to a single-threaded executor queue immediately; the live
+    # display shows only the tier whose upload is *currently executing*
+    # (set via callback inside _do_upload), not every queued tier.
     _init_live()
     upload_executor = ThreadPoolExecutor(max_workers=1)
-    pending_upload: Optional[tuple] = None  # (tier, Future)
+    pending_uploads: list[tuple[int, "Future"]] = []   # (tier, Future)
+    _upload_queue_lock = threading.Lock()
 
-    def _wait_pending_upload():
-        nonlocal pending_upload
-        if pending_upload is None:
-            return
-        tier_p, fut = pending_upload
-        try:
-            fut.result()
-            gguf_p = output_dir / f"tier{tier_p}.gguf"
-            sz_mb_val = round(gguf_p.stat().st_size / (1024**2), 1) if gguf_p.exists() else None
-            state.set_tier(tier_p, "uploaded", size_mb=sz_mb_val)
-            if _lc:
-                _lc.active_tiers.pop(tier_p, None)
-                _lc.upload_progress.pop(tier_p, None)
-                if _lc.live:
-                    _lc.live.update(_build_live_renderable())
-            # append row to README
-            if gguf_p.exists() and readme_path.exists():
-                tier_name = f"tier{tier_p}"
-                if not _readme_has_tier(readme_path, tier_name):
-                    _append_readme_row(readme_path, tier_name,
-                                       gguf_p.stat().st_size / (1024**3))
-                state.mark_readme_tier(tier_p)
-        except Exception as exc:
-            err = str(exc)[:120]
-            log_err(f"tier{tier_p} upload failed: {err}")
-            state.set_tier(tier_p, "error", error=str(exc)[:300],
-                           error_short=err[:40])
-            if _lc:
-                _lc.active_tiers.pop(tier_p, None)
-                _lc.upload_progress.pop(tier_p, None)
-                if _lc.live:
-                    _lc.live.update(_build_live_renderable())
-        pending_upload = None
+    def _do_upload_and_record(t: int, p: Path):
+        """Run in the executor thread: upload GGUF + mark uploaded + append README row immediately."""
+        fsize = p.stat().st_size if p.exists() else 0
+        if _lc and _lc.live is not None:
+            with _upload_queue_lock:
+                _lc.active_tiers[t] = {
+                    "status": "uploading",
+                    "start": time.time(),
+                    "last_line": "",
+                }
+                _lc.upload_progress[t] = {"current": 0, "total": fsize, "stage": "preparing"}
+        upload_tier(t, p, output_base, token)
+        sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
+        state.set_tier(t, "uploaded", size_mb=round(sz_gb * 1024, 1))
+        tier_name = f"tier{t}"
+        if readme_path.exists() and not _readme_has_tier(readme_path, tier_name):
+            _append_readme_row(readme_path, tier_name, sz_gb)
+
+    def _check_completed_uploads():
+        """Process all completed upload futures (non-blocking)."""
+        nonlocal pending_uploads
+        still_pending = []
+        for tier_p, fut in pending_uploads:
+            if not fut.done():
+                still_pending.append((tier_p, fut))
+                continue
+            try:
+                fut.result()
+                if _lc:
+                    _lc.active_tiers.pop(tier_p, None)
+                    _lc.upload_progress.pop(tier_p, None)
+                    if _lc.live:
+                        _lc.live.update(_build_live_renderable())
+            except Exception as exc:
+                err = str(exc)[:300]
+                log_err(f"tier{tier_p} upload failed: {err}")
+                state.set_tier(tier_p, "error", error=str(exc)[:300],
+                               error_short=err[:200])
+                if _lc:
+                    _lc.active_tiers.pop(tier_p, None)
+                    _lc.upload_progress.pop(tier_p, None)
+                    if _lc.live:
+                        _lc.live.update(_build_live_renderable())
+        pending_uploads = still_pending
+
+    def _wait_all_uploads():
+        """Wait for every remaining upload future to finish."""
+        while pending_uploads:
+            _check_completed_uploads()
+            if pending_uploads:
+                time.sleep(0.5)
 
     processed = []
     failed = []
 
-    try:
-        for tier in needs_work:
-            if _interruption_requested:
-                log("⚠ Pipeline interrupted by user.")
-                break
+    # huggingface_hub catches KeyboardInterrupt in its retry/tqdm loops
+    # and swallows it, so _wait_all_uploads / fut.result() will block
+    # forever on a normal SIGINT.  Use _allow_hard_interrupt so Ctrl+C
+    # during quantize or upload kills the process immediately.
+    with _allow_hard_interrupt():
+        try:
+            for tier in needs_work:
+                if _interruption_requested:
+                    log("⚠ Pipeline interrupted by user.")
+                    break
 
-            if args.dry_run:
-                log(f"DRY RUN: would quantize and upload tier{tier}")
-                continue
+                if args.dry_run:
+                    log(f"DRY RUN: would quantize and upload tier{tier}")
+                    continue
 
-            output_gguf = output_dir / f"tier{tier}.gguf"
-            st = state.tier_status(tier)
+                output_gguf = output_dir / f"tier{tier}.gguf"
+                st = state.tier_status(tier)
 
-            # ── quantize ──
-            if st in ("pending", "error", "quantized"):
-                # If quantized but file missing, re-quantize
-                if st == "quantized" and output_gguf.exists() and output_gguf.stat().st_size > 0:
-                    log(f"✓ tier{tier}: quantized file exists, skipping quantize")
-                else:
-                    state.set_tier(tier, "quantizing")
-                    if _lc:
-                        _lc.active_tiers[tier] = {"status": "quantizing",
-                                                   "start": time.time(),
-                                                   "last_line": ""}
-                        if _lc.live:
-                            _lc.live.update(_build_live_renderable())
+                # ── skip already uploaded ──
+                if st == "uploaded" and output_gguf.exists() and output_gguf.stat().st_size > 0:
+                    log(f"✓ tier{tier}: already uploaded, skipping")
+                    continue
+                elif st == "quantizing":
+                    log(f"tier{tier}: was quantizing (interrupted) → will re-quantize")
+                    if output_gguf.exists():
+                        output_gguf.unlink(missing_ok=True)
+                    state.set_tier(tier, "pending")
+                    st = "pending"
+                elif st == "uploading":
+                    if output_gguf.exists() and output_gguf.stat().st_size > 0:
+                        log(f"tier{tier}: was uploading, output exists → will re-upload")
+                        state.set_tier(tier, "quantized")
+                        st = "quantized"
                     else:
-                        display_status(state, True, True, tiers=tiers)
-                    t0 = time.time()
-                    try:
-                        run_quantize(tier, source_gguf, imatrix_path, output_gguf)
-                    except Exception as exc:
-                        err = str(exc)[:120]
-                        log_err(f"tier{tier} quantize failed: {err}")
-                        state.set_tier(tier, "error", error=str(exc)[:300],
-                                       error_short=err[:40])
-                        failed.append(tier)
+                        log(f"tier{tier}: was uploading, output missing → will re-quantize")
+                        state.set_tier(tier, "pending")
+                        st = "pending"
+
+                # ── collect completed uploads (non-blocking) ──
+                _check_completed_uploads()
+
+                # ── quantize (runs while executor processes upload queue) ──
+                if st in ("pending", "error", "quantized"):
+                    if st in ("quantized", "error") and output_gguf.exists() and output_gguf.stat().st_size > 0:
+                        # Verify file size matches what was recorded at
+                        # quantize time; truncated files (Ctrl-C) must be
+                        # re-quantized.
+                        expected_mb = state._t(tier).get("file_size_mb")
+                        actual_mb = round(output_gguf.stat().st_size / (1024**2), 1)
+                        if expected_mb is None or abs(expected_mb - actual_mb) < 0.5:
+                            log(f"✓ tier{tier}: quantized file exists, skipping quantize")
+                            state.set_tier(tier, "quantized", size_mb=actual_mb,
+                                           file_size_mb=actual_mb)
+                        else:
+                            log(f"tier{tier}: size mismatch ({actual_mb} MB vs expected "
+                                f"{expected_mb} MB) → will re-quantize")
+                            state.set_tier(tier, "pending")
+                            st = "pending"
+                    else:
+                        state.set_tier(tier, "quantizing")
+                        if _lc:
+                            _lc.active_tiers[tier] = {"status": "quantizing",
+                                                       "start": time.time(),
+                                                       "last_line": ""}
+                        t0 = time.time()
+                        try:
+                            run_quantize(tier, source_gguf, imatrix_path, output_gguf)
+                        except Exception as exc:
+                            err = str(exc)[:300]
+                            log_err(f"tier{tier} quantize failed: {err}")
+                            state.set_tier(tier, "error", error=str(exc)[:300],
+                                           error_short=err[:200])
+                            failed.append(tier)
+                            if _lc:
+                                _lc.active_tiers.pop(tier, None)
+                            if output_gguf.exists() and output_gguf.stat().st_size == 0:
+                                output_gguf.unlink(missing_ok=True)
+                            continue
+                        elapsed = time.time() - t0
+                        m, s = divmod(int(elapsed), 60)
+                        h, m = divmod(m, 60)
+                        sz_mb = output_gguf.stat().st_size / (1024**2)
+                        log(f"✓ tier{tier}: quantized in {h:02d}:{m:02d}:{s:02d}  "
+                            f"({sz_mb:.1f} MB)")
+                        state.set_tier(tier, "quantized", size_mb=round(sz_mb, 1),
+                                       file_size_mb=round(sz_mb, 1))
                         if _lc:
                             _lc.active_tiers.pop(tier, None)
-                            if _lc.live:
-                                _lc.live.update(_build_live_renderable())
-                        if output_gguf.exists() and output_gguf.stat().st_size == 0:
-                            output_gguf.unlink(missing_ok=True)
-                        continue
-                    elapsed = time.time() - t0
-                    m, s = divmod(int(elapsed), 60)
-                    h, m = divmod(m, 60)
-                    sz_mb = output_gguf.stat().st_size / (1024**2)
-                    log(f"✓ tier{tier}: quantized in {h:02d}:{m:02d}:{s:02d}  "
-                        f"({sz_mb:.1f} MB)")
-                    state.set_tier(tier, "quantized", size_mb=round(sz_mb, 1))
-                    if _lc:
-                        _lc.active_tiers.pop(tier, None)
-                        if _lc.live:
-                            _lc.live.update(_build_live_renderable())
-            elif st == "uploading":
-                log(f"tier{tier}: was uploading, will retry")
-            else:
-                log(f"tier{tier}: status={st}, will proceed to upload")
 
-            if not (_lc and _lc.live):
-                display_status(state, True, True, tiers=tiers)
+                if not (_lc and _lc.live):
+                    display_status(state, True, True, tiers=tiers)
 
-            # ── wait for previous upload to finish ──
-            _wait_pending_upload()
+                # ── skip upload if interrupted ──
+                if _interruption_requested:
+                    break
 
-            # ── skip upload if interrupted ──
-            if _interruption_requested:
-                break
+                # ── submit upload to executor queue ──
+                # Doesn't block.  The task sits in the queue until the
+                # executor's single worker finishes the previous upload.
+                # A callback inside _do_upload_and_record sets _lc.active_tiers
+                # right when the executor picks this task up, so the
+                # display only shows the *actually running* upload.
+                state.set_tier(tier, "uploading")
 
-            # ── start upload in background ──
-            repo_id = output_base
-            state.set_tier(tier, "uploading")
-            if _lc:
-                _lc.active_tiers[tier] = {"status": "uploading",
-                                           "start": time.time(),
-                                           "last_line": ""}
-                _lc.upload_progress[tier] = {"current": 0, "total": 0}
-                if _lc.live:
-                    _lc.live.update(_build_live_renderable())
-            else:
-                display_status(state, True, True, tiers=tiers)
+                fut = upload_executor.submit(_do_upload_and_record, tier, output_gguf)
+                pending_uploads.append((tier, fut))
+                processed.append(tier)
 
-            def _do_upload(t=tier, rid=repo_id, p=output_gguf):
-                upload_tier(t, p, rid, token)
+            # ── collect any remaining completions ──
+            _wait_all_uploads()
+            upload_executor.shutdown(wait=True)
 
-            pending_upload = (tier, upload_executor.submit(_do_upload))
-            processed.append(tier)
-
-        # ── wait for the very last upload ──
-        _wait_pending_upload()
-        upload_executor.shutdown(wait=True)
-
-    except KeyboardInterrupt:
-        log_err("Forced interrupt — saving state and cleaning up.")
-        _wait_pending_upload()
-        upload_executor.shutdown(wait=False, cancel_futures=True)
-    except Exception as exc:
-        log_err(f"Unexpected error: {exc}")
-        _wait_pending_upload()
-        upload_executor.shutdown(wait=False, cancel_futures=True)
-    finally:
-        _stop_live()
+        except KeyboardInterrupt:
+            log_err("Forced interrupt — saving state and cleaning up.")
+            _check_completed_uploads()
+            upload_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception as exc:
+            log_err(f"Unexpected error: {exc}")
+            _check_completed_uploads()
+            upload_executor.shutdown(wait=False, cancel_futures=True)
+        finally:
+            _stop_live()
 
     # ── 4. Cleanup incomplete outputs ──
     if not args.dry_run:
@@ -1505,13 +1801,17 @@ def run_pipeline(args):
 
 
 def _cleanup_incomplete(state: BatchState, output_dir: Path, tiers: list = None):
-    """Delete quantized GGUFs for tiers that are not fully uploaded."""
+    """Delete quantized GGUFs that were interrupted mid-quantize.
+
+    Preserves files whose quantization completed (status 'quantized',
+    'uploading', 'error') so that a re-run only retries the upload.
+    """
     if tiers is None:
         tiers = TIERS
     count = 0
     for tier in tiers:
         st = state.tier_status(tier)
-        if st in ("uploaded", "done"):
+        if st != "quantizing":
             continue
         gguf = output_dir / f"tier{tier}.gguf"
         if gguf.exists():
@@ -1606,7 +1906,7 @@ def _parse_tiers(s: str) -> list:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="APEX Batch Quantization Pipeline",
+        description="mAPEX Batch Quantization Pipeline",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
@@ -1646,7 +1946,11 @@ def main():
         log_err("--tiers must be in range 1-13")
         sys.exit(1)
 
-    run_pipeline(args)
+    try:
+        run_pipeline(args)
+    finally:
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
 
 if __name__ == "__main__":
