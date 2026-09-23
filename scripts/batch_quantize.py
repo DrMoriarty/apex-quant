@@ -578,6 +578,7 @@ def _resumable_download(url: str, dest: Path, *, token: Optional[str] = None,
     headers: dict[str, str] = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    headers["Accept-Encoding"] = "identity"
 
     # Get total file size via HEAD
     with httpx.Client(follow_redirects=True, timeout=30) as client:
