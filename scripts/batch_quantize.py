@@ -24,6 +24,10 @@ Concurrency:
   * when S3 upload is enabled (--s3-endpoint/--s3-token), each tier is
     uploaded to HF and to S3 in parallel: at most one quant is being
     uploaded to HF and at most one to S3 at any given moment
+  * with --s3-upload-source the source model (the merged GGUF when the
+    source was split into shards) is uploaded to S3 as a separate "SRC"
+    task shown in the live table.  While it runs, tier uploads are
+    blocked; quantization itself is not blocked.
 
 Usage:
   python3 scripts/batch_quantize.py \\
@@ -333,6 +337,18 @@ class BatchState:
         self._t(key)[f"{target}_done"] = True
         self.save()
 
+    # -- source model S3 upload --
+    def source_upload_done(self) -> bool:
+        return bool(self.data.get("source_upload", {}).get("done", False))
+
+    def mark_source_upload(self, status: str, **extra):
+        rec = {"status": status, "updated": datetime.now().isoformat()}
+        if status == "done":
+            rec["done"] = True
+        rec.update(extra)
+        self.data["source_upload"] = rec
+        self.save()
+
 
 # ---------------------------------------------------------------------------
 # Rich display  (optional — falls back to plain text)
@@ -368,6 +384,7 @@ class _LiveContext:
         self.active_tiers: dict[str, dict] = {}
         self.upload_progress: dict[str, dict] = {}
         self.s3_upload_progress: dict[str, dict] = {}
+        self.source_upload: Optional[dict] = None
         self.downloads: dict[str, dict] = {}
         self.merge: Optional[dict] = None
         self.state: Optional["BatchState"] = None
@@ -573,6 +590,12 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                 table.add_row("MERGE", "—",
                               Text(f" ✓ merged in {elapsed_str}{note}", style="green"), "")
 
+        # Source-model S3 upload row
+        if _live_ctx.source_upload:
+            row = _render_source_upload(_live_ctx.source_upload, _live_ctx)
+            if row:
+                table.add_row("SRC", "—", row[0], row[1])
+
         # Download rows (above tier table)
         for key, dl in _live_ctx.downloads.items():
             label = dl.get("label", key)
@@ -676,6 +699,14 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
             style = "green" if mst in ("done", "cached") else "bold red"
             table.add_row("MERGE", "—",
                           Text(f" ✓ merged in {mel}{note}", style=style), "")
+        su_rec = state.data.get("source_upload")
+        if su_rec:
+            if su_rec.get("done"):
+                table.add_row("SRC", "—",
+                              Text(" ✓ source uploaded to S3", style="green"), "")
+            elif su_rec.get("status") == "error":
+                table.add_row("SRC", "—",
+                              Text(" ✗ source S3 upload failed", style="bold red"), "")
         for tier, speed in tiers:
             key = variant_key(tier, speed)
             base = TIER_BASE_TYPE[tier]
@@ -714,6 +745,43 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
 
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
+def _render_source_upload(su: dict, lc):
+    """Build (status_col, info) for the SRC row, or None if nothing to show."""
+    from rich.text import Text
+    st = su.get("status")
+    if st == "uploading":
+        start = su.get("start", time.time())
+        elapsed_str = _format_elapsed(time.time() - start)
+        frame = _SPINNER_FRAMES[int(time.time() * 4) % len(_SPINNER_FRAMES)]
+        prog = lc.s3_upload_progress.get("src") if lc else None
+        if prog and prog.get("total", 0) > 0:
+            cur, total = prog["current"], prog["total"]
+            pct = cur / total * 100
+            bar_len = 16
+            filled = min(int(pct / 100 * bar_len), bar_len)
+            bar = "█" * filled + "░" * (bar_len - filled)
+            cur_mb, total_mb = cur / (1024**2), total / (1024**2)
+            speed_str = ""
+            start_ts = prog.get("start_ts")
+            if start_ts and cur > 0 and time.time() > start_ts:
+                speed_mb = cur / (1024**2) / (time.time() - start_ts)
+                speed_str = f" {speed_mb:.1f} MB/s"
+            status_col = Text(
+                f" ↑ s3 {bar} {cur_mb:.0f}/{total_mb:.0f} MB "
+                f"{pct:.0f}%{speed_str} {elapsed_str}",
+                style="magenta")
+        else:
+            status_col = Text(
+                f" {frame} uploading source to S3… {elapsed_str}",
+                style="magenta")
+        return status_col, ""
+    if st == "done":
+        return Text(" ✓ source uploaded to S3", style="green"), ""
+    if st == "error":
+        return Text(" ✗ source S3 upload failed", style="bold red"), ""
+    return None
 
 
 def _render_active_tier(key: str, active: dict, lc) -> "Text":
@@ -1003,6 +1071,10 @@ For more information, see: <https://github.com/DrMoriarty/apex-quant/>
 
 README_TABLE_HEADER = """\
 ## Quantized Models
+
+> **Note:** TierN-s quants are typically slightly larger than their regular
+> counterparts, but provide roughly 10–20% faster inference (highly dependent
+> on the model and GPU).
 
 | Name | Size (GB) | Comments |
 |------|-----------|----------|
@@ -1899,6 +1971,8 @@ def upload_tier_s3(
     key: str,
     gguf_path: Path,
     s3: dict,
+    *,
+    label: Optional[str] = None,
 ) -> None:
     """Upload a quantized GGUF to an S3-compatible storage.
 
@@ -1906,6 +1980,7 @@ def upload_tier_s3(
     (simple PUT is rejected by the storage frontend for large bodies
     with HTTP 413).  Authentication: static keys (SigV4) or IAM token.
     """
+    label = label or f"tier{key}"
     if not gguf_path.exists():
         raise FileNotFoundError(f"GGUF file not found for upload: {gguf_path}")
     if gguf_path.stat().st_size == 0:
@@ -1913,7 +1988,6 @@ def upload_tier_s3(
 
     size = gguf_path.stat().st_size
     url = f"{s3['base_url']}/{s3['bucket']}/{gguf_path.name}"
-    label = f"tier{key}"
 
     _live_active = _HAS_RICH and _lc is not None and _lc.live is not None
     if not _live_active:
@@ -2054,6 +2128,21 @@ def run_pipeline(args):
 
     s3 = _get_s3_settings(args)
 
+    # Optional S3 upload of the source (merged) model.  While the upload
+    # task runs, tier uploads are blocked (they wait on *source_upload_done*);
+    # quantization itself is not blocked.
+    upload_source = bool(getattr(args, "s3_upload_source", False))
+    if upload_source and s3 is None:
+        log_err("--s3-upload-source ignored: S3 endpoint/credentials are "
+                "not configured (set S3_ENDPOINT + keys in .env).")
+        upload_source = False
+    source_upload_done = threading.Event()
+    _upload_queue_lock = threading.Lock()
+    if not upload_source:
+        source_upload_done.set()
+    source_executor: Optional[ThreadPoolExecutor] = None
+    source_upload_future: Optional[Future] = None
+
     workspace = Path(args.workspace).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
     state_path = workspace / ".batch_quant_state.json"
@@ -2084,6 +2173,8 @@ def run_pipeline(args):
     if s3:
         auth_desc = ("static key" if s3["auth"]["mode"] == "sigv4" else "IAM token")
         log(f"  S3:       {s3['base_url']}  (bucket: {s3['bucket']}, auth: {auth_desc})")
+    if upload_source:
+        log("  S3 source upload: enabled (merged source model → S3)")
     log("=" * 60)
 
     # Migrate state: variants uploaded before S3 support only went to HF.
@@ -2242,6 +2333,62 @@ def run_pipeline(args):
 
         log("✓ Both downloads complete.")
 
+    # ── 1b. Optional S3 upload of the source (merged) model ──
+    # Runs in its own single-worker executor as a separate "SRC" task.
+    # Tier upload workers wait on *source_upload_done*, so the source
+    # upload blocks all tier uploads (HF and S3) but not quantization.
+    if upload_source and not args.dry_run:
+        if state.source_upload_done():
+            log("✓ Source model already uploaded to S3")
+            source_upload_done.set()
+        else:
+            def _do_upload_source_s3():
+                fsize = (source_gguf.stat().st_size
+                         if source_gguf.exists() else 0)
+                if _lc:
+                    with _upload_queue_lock:
+                        _lc.source_upload = {"status": "uploading",
+                                             "start": time.time()}
+                        _lc.s3_upload_progress["src"] = {
+                            "current": 0, "total": fsize,
+                            "start_ts": time.time()}
+                    if _lc.live:
+                        _lc.live.update(_build_live_renderable())
+                log(f"Uploading source model ({source_gguf.name}, "
+                    f"{fsize / (1024**3):.2f} GB) → S3 {s3['bucket']}")
+                try:
+                    upload_tier_s3("src", source_gguf, s3, label="source")
+                    elapsed = (time.time()
+                               - _lc.source_upload.get("start", time.time())
+                               ) if _lc and _lc.source_upload else 0.0
+                    state.mark_source_upload("done", elapsed=round(elapsed, 1))
+                    if _lc:
+                        with _upload_queue_lock:
+                            _lc.s3_upload_progress.pop("src", None)
+                            _lc.source_upload = {"status": "done",
+                                                 "elapsed": elapsed}
+                    log(f"✓ Source model uploaded to S3 {s3['bucket']} "
+                        f"in {_format_elapsed(elapsed)}")
+                except Exception as exc:
+                    err = str(exc)[:300]
+                    log_err(f"Source model S3 upload failed: {err}")
+                    state.mark_source_upload("error", error=err)
+                    if _lc:
+                        with _upload_queue_lock:
+                            _lc.s3_upload_progress.pop("src", None)
+                            _lc.source_upload = {"status": "error"}
+                finally:
+                    source_upload_done.set()
+                    if _lc and _lc.live:
+                        _lc.live.update(_build_live_renderable())
+
+            source_executor = ThreadPoolExecutor(max_workers=1)
+            source_upload_future = source_executor.submit(_do_upload_source_s3)
+    elif upload_source and args.dry_run:
+        log(f"DRY RUN: would upload source model {source_gguf.name} "
+            f"→ S3 {s3['bucket']}")
+        source_upload_done.set()
+
     # ── 2. Initialize README.md ──
     readme_path = workspace / "README.md"
     if not state.readme_initialized() or not readme_path.exists():
@@ -2286,6 +2433,10 @@ def run_pipeline(args):
 
     if not needs_work:
         log("\n✅ All variants completed. Nothing to do.")
+        if source_upload_future is not None:
+            log("Waiting for source model S3 upload to finish …")
+            source_upload_future.result()
+            source_executor.shutdown(wait=True)
         _print_summary(state, variants, output_base)
         if not args.dry_run:
             _upload_readme(readme_path, output_base, token)
@@ -2307,7 +2458,6 @@ def run_pipeline(args):
     s3_executor = ThreadPoolExecutor(max_workers=1) if s3 else None
     # pending_uploads: ((tier, speed), target, Future)
     pending_uploads: list = []
-    _upload_queue_lock = threading.Lock()
 
     def _active_start(key: str):
         """Mark variant active in the display when its first upload starts."""
@@ -2343,6 +2493,9 @@ def run_pipeline(args):
         """Run in the HF executor thread: upload GGUF to HuggingFace."""
         tier, speed = vk
         key = variant_key(tier, speed)
+        # While the source-model S3 upload (SRC task) is running, tier
+        # uploads are blocked; quantization is not affected.
+        source_upload_done.wait()
         _active_start(key)
         fsize = p.stat().st_size if p.exists() else 0
         if _lc and _lc.live is not None:
@@ -2365,6 +2518,7 @@ def run_pipeline(args):
         """Run in the S3 executor thread: upload GGUF to S3 storage."""
         tier, speed = vk
         key = variant_key(tier, speed)
+        source_upload_done.wait()
         _active_start(key)
         fsize = p.stat().st_size if p.exists() else 0
         if _lc and _lc.live is not None:
@@ -2587,6 +2741,9 @@ def run_pipeline(args):
             upload_executor.shutdown(wait=True)
             if s3_executor is not None:
                 s3_executor.shutdown(wait=True)
+            if source_upload_future is not None:
+                source_upload_future.result()
+                source_executor.shutdown(wait=True)
 
         except KeyboardInterrupt:
             log_err("Forced interrupt — saving state and cleaning up.")
@@ -2594,12 +2751,16 @@ def run_pipeline(args):
             upload_executor.shutdown(wait=False, cancel_futures=True)
             if s3_executor is not None:
                 s3_executor.shutdown(wait=False, cancel_futures=True)
+            if source_executor is not None:
+                source_executor.shutdown(wait=False, cancel_futures=True)
         except Exception as exc:
             log_err(f"Unexpected error: {exc}")
             _check_completed_uploads()
             upload_executor.shutdown(wait=False, cancel_futures=True)
             if s3_executor is not None:
                 s3_executor.shutdown(wait=False, cancel_futures=True)
+            if source_executor is not None:
+                source_executor.shutdown(wait=False, cancel_futures=True)
         finally:
             _stop_live()
 
@@ -2780,6 +2941,13 @@ def main():
     parser.add_argument("--s3-secret",
                         help="S3 static access secret key, used with "
                              "--s3-key-id (default: $S3_SECRET from env / .env)")
+    parser.add_argument("--s3-upload-source", action="store_true",
+                        help="Upload the source model to S3 (the merged GGUF "
+                             "when the source is split into shards, otherwise "
+                             "the single source file). Requires S3 credentials. "
+                             "Runs as a separate SRC task in the live table and "
+                             "blocks tier uploads until it finishes "
+                             "(quantization is not blocked).")
     parser.add_argument("--source-file",
                         help="Explicit source GGUF filename (skip auto-detection)")
     parser.add_argument("--imatrix-file",
