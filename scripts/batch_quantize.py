@@ -5,9 +5,9 @@ Downloads a source GGUF model (bf16/f16/f32) and an importance matrix from
 HuggingFace, quantizes through APEX tiers using quantize.py, and
 uploads every resulting GGUF to HuggingFace.
 
-Each tier in the speed range (7-15) is produced in two variants:
-  * normal   — default quantize.py parameters          (Tier7)
-  * speed    — with the ``--speed`` flag passed on     (Tier7-s)
+Each tier in the speed range (9-15) is produced in two variants:
+  * normal   — default quantize.py parameters          (Tier9)
+  * speed    — with the ``--speed`` flag passed on     (Tier9-s)
 
 Manages a README.md in the output repo: downloads an existing README or
 creates one with source info, APEX attribution, and a quantization table.
@@ -189,8 +189,8 @@ def _retry_on_network_error(fn=None, *, max_retries=5, delay=10):
 
 TIERS = list(range(1, 16))
 
-# Tiers that get an extra "--speed" variant (Tier7-s alongside Tier7).
-SPEED_TIERS = set(range(7, 16))
+# Tiers that get an extra "--speed" variant (Tier9-s alongside Tier9).
+SPEED_TIERS = set(range(9, 16))
 
 TIER_BASE_TYPE = {
     1: "Q8_0", 2: "Q8_0", 3: "Q8_0", 4: "Q8_0", 5: "Q8_0", 6: "Q8_0",
@@ -2756,7 +2756,7 @@ def main():
                              "e.g. user/model-APEX")
     parser.add_argument("--tiers", default="1-15",
                         help="Tier spec: '1-13', '1-10,13', '3-8', '1,5,7' "
-                             "(default: 1-13; tiers 7-15 are each produced in "
+                             "(default: 1-15; tiers 9-15 are each produced in "
                              "two variants: normal and -s with --speed)")
     parser.add_argument("--workspace", "-w",
                         default=str(Path.home() / "apex_batch"),
