@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""APEX Batch Quantization Pipeline.
+"""mAPEX Batch Quantization Pipeline.
 
 Downloads a source GGUF model (bf16/f16/f32) and an importance matrix from
-HuggingFace, quantizes through APEX tiers using quantize.py, and
+HuggingFace, quantizes through mAPEX tiers using quantize.py, and
 uploads every resulting GGUF to HuggingFace.
 
 Each tier in the speed range (9-15) is produced in two variants:
@@ -10,7 +10,7 @@ Each tier in the speed range (9-15) is produced in two variants:
   * speed    — with the ``--speed`` flag passed on     (Tier9-s)
 
 Manages a README.md in the output repo: downloads an existing README or
-creates one with source info, APEX attribution, and a quantization table.
+creates one with source info, mAPEX attribution, and a quantization table.
 After all tiers are uploaded the README is pushed to the same repo.
 
 Supports **resumable** execution: state is persisted to a JSON file so that
@@ -33,7 +33,7 @@ Usage:
   python3 scripts/batch_quantize.py \\
       --model user/source-model-GGUF \\
       --imatrix user/imatrix-repo \\
-      --output user/model-APEX
+      --output user/model-mAPEX
 
 Output repo: {output}  (all tier GGUFs in one repo)
 
@@ -1143,13 +1143,13 @@ def _extract_frontmatter_and_body(content: str) -> tuple[str, str]:
 
 
 def _ensure_apex_header(readme_path: Path, source_model: str, source_file: str):
-    """Inject APEX header into an existing README downloaded from HF.
+    """Inject mAPEX header into an existing README downloaded from HF.
 
-    If the README already contains the APEX table marker (``## Quantized Models``),
+    If the README already contains the mAPEX table marker (``## Quantized Models``),
     it is left untouched.  Otherwise the file is restructured as:
 
         <HF YAML frontmatter>        ← preserved verbatim at top
-        <APEX source/method info>    ← new
+        <mAPEX source/method info>    ← new
         <original prose body>        ← preserved
         <quantization table>         ← new; must be last so ``open("a")`` row appends land inside
     """
@@ -1742,7 +1742,7 @@ def upload_tier(
                     path_in_repo=gguf_path.name,
                     repo_id=repo_id,
                     repo_type="model",
-                    commit_message=f"APEX {label} quantization",
+                    commit_message=f"mAPEX {label} quantization",
                 )
             except TypeError:
                 wrapper.close()
@@ -1751,7 +1751,7 @@ def upload_tier(
                     path_in_repo=gguf_path.name,
                     repo_id=repo_id,
                     repo_type="model",
-                    commit_message=f"APEX {label} quantization",
+                    commit_message=f"mAPEX {label} quantization",
                 )
         finally:
             wrapper.close()
@@ -1763,7 +1763,7 @@ def upload_tier(
             path_in_repo=gguf_path.name,
             repo_id=repo_id,
             repo_type="model",
-            commit_message=f"APEX {label} quantization",
+            commit_message=f"mAPEX {label} quantization",
         )
 
     if not _live_active:
@@ -2151,7 +2151,7 @@ def run_pipeline(args):
     # Parse output base repo id (org/name)
     output_base = args.output.rstrip("/")
     if not output_base or "/" not in output_base:
-        log_err("--output must be in the form org/name  (e.g. MyOrg/Model-APEX)")
+        log_err("--output must be in the form org/name  (e.g. MyOrg/Model-mAPEX)")
         sys.exit(1)
 
     tiers = args.tiers
@@ -2905,7 +2905,7 @@ def main():
             "  python3 scripts/batch_quantize.py \\\n"
             "    --model bullerwins/Qwen3.5-35B-A3B-GGUF \\\n"
             "    --imatrix bullerwins/Qwen3.5-35B-A3B-imatrix-GGUF \\\n"
-            "    --output user/Qwen3.5-35B-A3B-APEX\n"
+            "    --output user/Qwen3.5-35B-A3B-mAPEX\n"
         ),
     )
     parser.add_argument("--model", "-m", required=True,
@@ -2914,7 +2914,7 @@ def main():
                         help="HF repo with imatrix file (e.g. user/imatrix-GGUF)")
     parser.add_argument("--output", "-o", required=True,
                         help="HF repo id for all output tiers (org/name), "
-                             "e.g. user/model-APEX")
+                             "e.g. user/model-mAPEX")
     parser.add_argument("--tiers", default="1-15",
                         help="Tier spec: '1-13', '1-10,13', '3-8', '1,5,7' "
                              "(default: 1-15; tiers 9-15 are each produced in "
