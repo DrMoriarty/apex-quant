@@ -758,17 +758,22 @@ def _render_active_tier(key: str, active: dict, lc) -> "Text":
             bar = "█" * filled + "░" * (bar_len - filled)
             cur_mb = cur / (1024**2)
             total_mb = total / (1024**2)
+            speed_str = ""
+            start_ts = prog.get("start_ts")
+            if start_ts and cur > 0 and time.time() > start_ts:
+                speed_mb = cur / (1024**2) / (time.time() - start_ts)
+                speed_str = f" {speed_mb:.1f} MB/s"
             if cur > 0 and stage_elapsed > 1:
                 eta_sec = stage_elapsed / cur * (total - cur)
                 em, es = divmod(int(eta_sec), 60)
                 eh, em = divmod(em, 60)
                 eta_str = f"{em:02d}:{es:02d}" if not eh else f"{eh}:{em:02d}:{es:02d}"
                 return Text(
-                    f" ↑ {target_tag}{bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str} ETA {eta_str}",
+                    f" ↑ {target_tag}{bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}%{speed_str} {elapsed_str} ETA {eta_str}",
                     style="magenta",
                 )
             return Text(
-                f" ↑ {target_tag}{bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str}",
+                f" ↑ {target_tag}{bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}%{speed_str} {elapsed_str}",
                 style="magenta",
             )
         return Text(f" {frame} uploading{(' ' + target_tag.strip()) if target_tag else ''}… {elapsed_str}", style="magenta")
@@ -785,7 +790,12 @@ def _format_active_info(key: str, active: dict, state: BatchState) -> str:
     s3p = _lc.s3_upload_progress.get(key) if _lc else None
     if s3p and s3p.get("total", 0) > 0:
         pct = s3p["current"] / s3p["total"] * 100
-        parts.append(f"S3 {pct:.0f}% ({s3p['current'] / (1024**2):.0f} MB)")
+        info = f"S3 {pct:.0f}% ({s3p['current'] / (1024**2):.0f} MB)"
+        start_ts = s3p.get("start_ts")
+        if start_ts and s3p["current"] > 0 and time.time() > start_ts:
+            speed_mb = s3p["current"] / (1024**2) / (time.time() - start_ts)
+            info += f" · {speed_mb:.1f} MB/s"
+        parts.append(info)
     return " · ".join(parts)
 
 
@@ -2359,7 +2369,7 @@ def run_pipeline(args):
         fsize = p.stat().st_size if p.exists() else 0
         if _lc and _lc.live is not None:
             with _upload_queue_lock:
-                _lc.s3_upload_progress[key] = {"current": 0, "total": fsize}
+                _lc.s3_upload_progress[key] = {"current": 0, "total": fsize, "start_ts": time.time()}
         upload_tier_s3(key, p, s3)
         state.mark_upload_done(key, "s3")
         if _lc:
