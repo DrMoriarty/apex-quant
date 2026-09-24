@@ -16,6 +16,7 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 | `scripts/quantize.py` | Quantize GGUF; `--profile`, `--config`, `--imatrix`, `--dry-run`, `--generate-config` |
 | `scripts/estimate_size.py` | Predict GGUF size from a profile or config; `--compare` inspects tensor types × groups |
 | `scripts/detect_gguf_params.py` | Reads GGUF header to detect layers, arch, expert count (used by quantize.py) |
+| `scripts/batch_quantize.py` | End-to-end batch runner: HF download → imatrix → `quantize.py` tiers → HF/S3 upload; resumable state, `--speed` variant |
 
 ### Shell scripts (legacy — named profiles: quality, balanced, compact, mini, nano, micro)
 
@@ -36,6 +37,17 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 | `scripts/generate_sensitivity_configs.py` | Builds perturbation sweep configs for measuring tensor-group sensitivity |
 | `scripts/generate_opt_config.py` | Turns a measured sensitivity curve into an allocation config |
 | `scripts/push_to_hf.sh` | Uploads GGUFs to HuggingFace |
+
+## Canonical workflow (Python interface)
+
+Operational order — always size-check before the 6-hour quantize:
+
+1. `scripts/estimate_size.py --profile <p> --layers N <model>.gguf` → predict target size from a profile.
+2. `scripts/generate_config.py --profile <p> --layers N [--dense-layers N] [--arch moe|dense]` → emit the tensor-type file.
+3. Re-verify the config lands in the target band with `estimate_size.py` (or `estimate_config_size.py` for a raw config). This is the gate before quantizing.
+4. `scripts/quantize.py --profile <p> --config <cfg> <input>.gguf <out>.gguf` → run the quantize (`--dry-run` skips the write; `--generate-config` re-emits).
+
+Shell equivalents: `scripts/generate_config.sh` + `scripts/quantize.sh` (selects profile, finds the `llama-quantize` binary, wraps generate → quantize).
 
 ## Running tests
 
@@ -82,4 +94,8 @@ Always use `scripts/estimate_size.py` (or `scripts/estimate_config_size.py` for 
 
 ## No package manager / no CI
 
-This repo has no package.json, Makefile, pyproject.toml, CI workflows, or linter config. Scripts are standalone bash/python with `set -euo pipefail`. Python dependencies: `matplotlib`, `numpy` (for plot scripts). Testing is manual: run the two test scripts above.
+This repo has no package.json, Makefile, pyproject.toml, CI workflows, or linter config. Scripts are standalone bash/python with `set -euo pipefail`. Python dependencies: `matplotlib`, `numpy` (for plot scripts), `huggingface_hub`, `rich`, `transformers` (see `requirements.txt`). Testing is manual: run the two test scripts above.
+
+## Secrets / git hygiene
+
+`.env` (git-ignored) holds `HF_TOKEN` and S3 upload keys (`S3_KEY_ID`/`S3_SECRET`/`S3_TOKEN`/`S3_ENDPOINT`/`S3_REGION`) — **never commit these**. `.gitignore` excludes `.env`, `*.gguf`, `*.bin`, `*.log`, `.venv/`; keep raw models and GGUFs out of git.
