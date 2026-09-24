@@ -772,6 +772,26 @@ def _pick_source_gguf(gguf_files: list) -> str:
     return ""
 
 
+_SRC_FMT_RE = re.compile(r"(?i)(?:bf16|f16|f32)")
+
+
+def _tier_filename(source_file: str, tier: int) -> str:
+    """Derive tier output GGUF name from the source model filename.
+
+    Replaces the source format token (BF16/F16/F32, any case) with Tier<N>:
+      Model-BF16.gguf → Model-Tier3.gguf
+      model_f16.gguf  → model_Tier3.gguf
+    Falls back to appending a -Tier<N> suffix if no format token is found.
+    """
+    name = Path(source_file).name
+    result, n = _SRC_FMT_RE.subn(f"Tier{tier}", name)
+    if n == 0:
+        result = re.sub(r"(?i)\.gguf$", f"-Tier{tier}.gguf", name)
+        if result == name:
+            result = f"{name}-Tier{tier}.gguf"
+    return result
+
+
 def _pick_imatrix_file(files: list) -> str:
     """Pick an imatrix file from a HF repo file list."""
     import re
@@ -1676,7 +1696,7 @@ def run_pipeline(args):
                     log(f"DRY RUN: would quantize and upload tier{tier}")
                     continue
 
-                output_gguf = output_dir / f"tier{tier}.gguf"
+                output_gguf = output_dir / _tier_filename(source_gguf.name, tier)
                 st = state.tier_status(tier)
 
                 # ── skip already uploaded ──
@@ -1785,8 +1805,11 @@ def run_pipeline(args):
             _stop_live()
 
     # ── 4. Cleanup incomplete outputs ──
-    if not args.dry_run:
-        _cleanup_incomplete(state, output_dir, tiers=tiers)
+    if not args.dry_run and not args.keep_files:
+        _cleanup_incomplete(state, output_dir,
+                            source_name=source_gguf.name, tiers=tiers)
+    elif args.keep_files:
+        log("✓ --keep-files: quantized files are kept in " + str(output_dir))
 
     # ── 5. Final report ──
     _print_summary(state, tiers, output_base)
@@ -1800,7 +1823,8 @@ def run_pipeline(args):
             _upload_readme(readme_path, output_base, token)
 
 
-def _cleanup_incomplete(state: BatchState, output_dir: Path, tiers: list = None):
+def _cleanup_incomplete(state: BatchState, output_dir: Path,
+                        source_name: str = "", tiers: list = None):
     """Delete quantized GGUFs that were interrupted mid-quantize.
 
     Preserves files whose quantization completed (status 'quantized',
@@ -1813,7 +1837,7 @@ def _cleanup_incomplete(state: BatchState, output_dir: Path, tiers: list = None)
         st = state.tier_status(tier)
         if st != "quantizing":
             continue
-        gguf = output_dir / f"tier{tier}.gguf"
+        gguf = output_dir / _tier_filename(source_name, tier)
         if gguf.exists():
             sz = gguf.stat().st_size / (1024**3)
             gguf.unlink()
@@ -1938,6 +1962,10 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the pipeline without downloading, quantizing, "
                              "or uploading. Still creates/updates README.md locally.")
+    parser.add_argument("--keep-files", action="store_true",
+                        help="Do not delete quantized GGUF files interrupted mid-quantize; "
+                             "keep them in the workspace quantized/ directory. Files are "
+                             "kept after successful upload regardless.")
 
     args = parser.parse_args()
     args.tiers = _parse_tiers(args.tiers)
