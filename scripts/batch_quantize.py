@@ -56,6 +56,7 @@ import json
 import os
 import pty
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -1301,21 +1302,27 @@ def find_gguf_split():
     return None
 
 
-def merge_gguf_shards(shard_paths: list) -> Path:
+def merge_gguf_shards(shard_paths: list, *, keep_shards: bool = True) -> Path:
     """Merge split GGUF shards into a single GGUF.
 
     llama-quantize cannot read split GGUFs, so sharded source models must
     be merged before quantization. The merged file is written next to the
     first shard and reused on subsequent runs.
+
+    When *keep_shards* is False the source shards are deleted after a
+    successful merge to save disk space.
     """
     first = Path(shard_paths[0]).resolve()
     m = SHARD_RE.match(first.name)
     if not m:
         return first
     merged = first.with_name(f"{m.group(1)}.gguf")
+    shards_exist = all(Path(p).exists() for p in shard_paths)
     if merged.exists() and merged.stat().st_size > 0:
         log(f"✓ Merged GGUF already exists: {merged.name}  "
             f"({merged.stat().st_size / (1024**3):.2f} GB)")
+        if not keep_shards and shards_exist:
+            _delete_shards(shard_paths)
         return merged
 
     split_bin = find_gguf_split()
@@ -1328,8 +1335,25 @@ def merge_gguf_shards(shard_paths: list) -> Path:
     total_gb = sum(p.stat().st_size for p in shard_paths) / (1024**3)
     log(f"Merging {len(shard_paths)} shards ({total_gb:.1f} GB) → {merged.name} …")
     subprocess.run([split_bin, "--merge", str(first), str(merged)], check=True)
+    if merged.stat().st_size == 0:
+        raise RuntimeError(f"Merged GGUF is empty: {merged}")
     log(f"✓ Merged: {merged.name}  ({merged.stat().st_size / (1024**3):.2f} GB)")
+    if not keep_shards:
+        _delete_shards(shard_paths)
     return merged
+
+
+def _delete_shards(shard_paths: list):
+    """Delete source GGUF shards after a successful merge."""
+    freed = 0
+    for p in shard_paths:
+        p = Path(p)
+        if p.exists():
+            freed += p.stat().st_size
+            p.unlink()
+    if freed:
+        log(f"🗑  Removed {len(shard_paths)} source shard(s), "
+            f"freed {freed / (1024**3):.2f} GB")
 
 
 def run_quantize(
@@ -1899,6 +1923,17 @@ def _escape_xml(s: str) -> str:
              .replace(">", "&gt;"))
 
 
+def _estimate_tier_size(tier: int, speed: bool, source_gguf: Path) -> int:
+    """Estimate quantized output size in bytes via estimate_size.py --json."""
+    cmd = [sys.executable, str(SCRIPT_DIR / "estimate_size.py"),
+           "--profile", f"tier{tier}", "--json", str(source_gguf)]
+    if speed:
+        cmd.append("--speed")
+    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    data = json.loads(result.stdout)
+    return int(data["estimated_size_gb"] * 1e9)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
@@ -2082,7 +2117,8 @@ def run_pipeline(args):
                         if len(result) == 1:
                             source_gguf = result[0]
                         else:
-                            source_gguf = merge_gguf_shards(result)
+                            source_gguf = merge_gguf_shards(
+                                result, keep_shards=args.keep_files)
                         state.mark_source(str(source_gguf), source_files[0])
                     else:
                         imatrix_path = result
@@ -2182,6 +2218,11 @@ def run_pipeline(args):
             return
         sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
         state.set_tier(key, "uploaded", size_mb=round(sz_gb * 1024, 1))
+        # Free disk space: the file is fully uploaded to all targets.
+        if not args.keep_files and p.exists():
+            sz = p.stat().st_size / (1024**3)
+            p.unlink()
+            log(f"🗑  Removed uploaded file: {p.name}  ({sz:.2f} GB)")
         if _lc:
             with _upload_queue_lock:
                 _lc.active_tiers.pop(key, None)
@@ -2268,6 +2309,38 @@ def run_pipeline(args):
             if pending_uploads:
                 time.sleep(0.5)
 
+    # Disk-space gating: estimated output size + safety margin must fit
+    # in the free space of the workspace volume before a tier is quantized.
+    DISK_MARGIN = 1.25   # 25% headroom over the estimate
+
+    def _wait_for_disk_space(needed_bytes: int, label: str):
+        """Block until *needed_bytes* are free on the workspace volume.
+
+        While waiting, completed uploads are collected — their files are
+        deleted after a successful upload, freeing disk space.  Aborts the
+        pipeline if nothing is queued and space still cannot be freed.
+        """
+        while True:
+            free = shutil.disk_usage(workspace).free
+            if free >= needed_bytes:
+                return
+            if not pending_uploads or _interruption_requested:
+                log_err(
+                    f"Not enough disk space for {label}: need "
+                    f"{needed_bytes / (1024**3):.1f} GB, free "
+                    f"{free / (1024**3):.1f} GB, and no pending uploads "
+                    f"to wait for. Free up space and re-run.")
+                sys.exit(1)
+            log(f"⏳ {label}: need {needed_bytes / (1024**3):.1f} GB, "
+                f"free {free / (1024**3):.1f} GB — waiting for pending "
+                f"uploads to finish and free space …")
+            # Sleep until at least one pending upload future completes.
+            while not any(fut.done() for _, _, fut in pending_uploads):
+                time.sleep(0.5)
+                if _interruption_requested:
+                    return
+            _check_completed_uploads()
+
     processed = []
     failed = []
 
@@ -2293,9 +2366,18 @@ def run_pipeline(args):
                 st = state.tier_status(key)
 
                 # ── skip already uploaded ──
-                if st == "uploaded" and output_gguf.exists() and output_gguf.stat().st_size > 0:
-                    if s3 and not state.upload_done(key, "s3"):
-                        log(f"{label}: on HF, uploading to S3")
+                if st == "uploaded":
+                    if output_gguf.exists() and output_gguf.stat().st_size > 0:
+                        if s3 and not state.upload_done(key, "s3"):
+                            log(f"{label}: on HF, uploading to S3")
+                        else:
+                            log(f"✓ {label}: already uploaded, skipping")
+                            continue
+                    elif s3 and not state.upload_done(key, "s3"):
+                        log(f"{label}: on HF, file was cleaned up → "
+                            f"will re-quantize for S3 upload")
+                        state.set_tier(key, "pending")
+                        st = "pending"
                     else:
                         log(f"✓ {label}: already uploaded, skipping")
                         continue
@@ -2336,6 +2418,8 @@ def run_pipeline(args):
                             state.set_tier(key, "pending")
                             st = "pending"
                     else:
+                        est_size = _estimate_tier_size(tier, speed, source_gguf)
+                        _wait_for_disk_space(int(est_size * DISK_MARGIN), label)
                         state.set_tier(key, "quantizing")
                         if _lc:
                             _lc.active_tiers[key] = {"status": "quantizing",
@@ -2430,10 +2514,12 @@ def run_pipeline(args):
 
 def _cleanup_incomplete(state: BatchState, output_dir: Path,
                         source_name: str = "", variants: list = None):
-    """Delete quantized GGUFs that were interrupted mid-quantize.
+    """Delete quantized GGUFs that are no longer needed on disk.
 
-    Preserves files whose quantization completed (status 'quantized',
-    'uploading', 'error') so that a re-run only retries the upload.
+    Removes files interrupted mid-quantize (status 'quantizing') and
+    files already fully uploaded (status 'uploaded') to free disk space.
+    Preserves files whose upload did not finish ('quantized', 'uploading',
+    'error') so that a re-run only retries the upload.
     """
     if variants is None:
         variants = expand_variants(TIERS)
@@ -2441,16 +2527,19 @@ def _cleanup_incomplete(state: BatchState, output_dir: Path,
     for tier, speed in variants:
         key = variant_key(tier, speed)
         st = state.tier_status(key)
-        if st != "quantizing":
+        if st not in ("quantizing", "uploaded"):
             continue
         gguf = output_dir / _tier_filename(source_name, tier, speed)
         if gguf.exists():
             sz = gguf.stat().st_size / (1024**3)
             gguf.unlink()
-            log(f"🗑  Removed incomplete file: {gguf.name}  ({sz:.2f} GB)")
+            if st == "quantizing":
+                log(f"🗑  Removed incomplete file: {gguf.name}  ({sz:.2f} GB)")
+            else:
+                log(f"🗑  Removed uploaded file: {gguf.name}  ({sz:.2f} GB)")
             count += 1
     if count:
-        log(f"Cleaned up {count} incomplete file(s).")
+        log(f"Cleaned up {count} file(s).")
 
 
 def _print_summary(state: BatchState, variants: list, output_base: str):
@@ -2589,9 +2678,10 @@ def main():
                         help="Simulate the pipeline without downloading, quantizing, "
                              "or uploading. Still creates/updates README.md locally.")
     parser.add_argument("--keep-files", action="store_true",
-                        help="Do not delete quantized GGUF files interrupted mid-quantize; "
-                             "keep them in the workspace quantized/ directory. Files are "
-                             "kept after successful upload regardless.")
+                        help="Keep quantized GGUF files on disk even after "
+                             "successful upload. Without this flag, files that "
+                             "are fully uploaded (HF and S3 if enabled) are "
+                             "deleted from disk to save space.")
 
     args = parser.parse_args()
     args.tiers = _parse_tiers(args.tiers)

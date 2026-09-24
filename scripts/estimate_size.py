@@ -11,6 +11,7 @@ Usage:
     ./scripts/estimate_size.py --profile balanced --quiet model.gguf
     ./scripts/estimate_size.py --compare model.gguf         # inspect tensor types x groups
     ./scripts/estimate_size.py --compare model.gguf --config configs/my_config.txt
+    ./scripts/estimate_size.py --profile tier5 --json model.gguf   # machine-readable JSON
 
 Layer count is explicitly set via --layers or auto-detected from the GGUF file.
 """
@@ -211,12 +212,31 @@ def estimate(tensors, rules, base):
     return size_gb, by_type, uncovered, uncovered_names, group_params, group_bits, cat_type_bits
 
 
+def estimate_breakdown(by_type, group_params, group_bits, cat_type_bits, total_params):
+    """Build by-type/by-group dicts (params + size) from estimate() results."""
+    groups = [g for g in ("Experts", "ShExperts", "Attention", "MTP", "Other")
+              if group_params.get(g, 0) > 0]
+    return {
+        "by_type": {t: {"params": by_type[t],
+                        "share": by_type[t] / total_params,
+                        "size_gb": by_type[t] * BPW.get(t, 32.0) / 8 / 1e9}
+                    for t in sorted(by_type, key=lambda t: -by_type[t])},
+        "by_group": {g: {"params": group_params[g],
+                         "share": group_params[g] / total_params,
+                         "size_gb": group_bits[g] / 8 / 1e9}
+                     for g in groups},
+        "group_types": {g: {t: cat_type_bits[g][t] / 8 / 1e9
+                            for t in sorted(cat_type_bits[g], key=lambda t: -cat_type_bits[g][t])}
+                        for g in groups},
+    }
+
+
 # ── Compare: show actual GGUF breakdown ──────────────────────────────────────
 
-def print_gguf_breakdown(tensors):
+def gguf_breakdown(tensors):
+    """Compute actual GGUF breakdown by quant type x group."""
     total_params = 0
     by_type = defaultdict(int)
-    type_params = defaultdict(int)
     type_bits = defaultdict(float)
     group_params = defaultdict(int)
     group_bits = defaultdict(float)
@@ -229,40 +249,62 @@ def print_gguf_breakdown(tensors):
         bpw = BPW.get(qtype, 32.0)
         bits = numel * bpw
         by_type[qtype] += numel
-        type_params[qtype] += numel
         type_bits[qtype] += bits
         group_params[group] += numel
         group_bits[group] += bits
         cat_type_params[group][qtype] += numel
         cat_type_bits[group][qtype] += bits
 
+    groups = [g for g in ("Experts", "ShExperts", "Attention", "MTP", "Other")
+              if group_params.get(g, 0) > 0]
+    return {
+        "total_params": total_params,
+        "by_type": {t: {"params": by_type[t],
+                        "share": by_type[t] / total_params,
+                        "size_gb": type_bits[t] / 8 / 1e9}
+                    for t in sorted(by_type, key=lambda t: -by_type[t])},
+        "by_group": {g: {"params": group_params[g],
+                         "share": group_params[g] / total_params,
+                         "size_gb": group_bits[g] / 8 / 1e9}
+                     for g in groups},
+        "group_types": {g: {t: cat_type_bits[g].get(t, 0.0) / 8 / 1e9
+                            for t in sorted(cat_type_bits[g], key=lambda t: -cat_type_bits[g][t])}
+                        for g in groups},
+    }
+
+
+def print_gguf_breakdown(tensors):
+    bd = gguf_breakdown(tensors)
+    total_params = bd["total_params"]
+
     print(f"\n{'type':<14}{'params':>12}{'share':>9}{'size':>10}")
     print("-" * 48)
-    for qtype, n in sorted(by_type.items(), key=lambda kv: -kv[1]):
-        gb = type_bits[qtype] / 8 / 1e9
-        print(f"{qtype:<14}{n/1e9:>10.3f} B{100*n/total_params:>8.1f}%{gb:>9.2f} GB")
-    total_gb = sum(type_bits.values()) / 8 / 1e9
+    for qtype, info in bd["by_type"].items():
+        n = info["params"]
+        gb = info["size_gb"]
+        print(f"{qtype:<14}{n/1e9:>10.3f} B{100*info['share']:>8.1f}%{gb:>9.2f} GB")
+    total_gb = sum(info["size_gb"] for info in bd["by_type"].values())
     print(f"{'TOTAL':<14}{total_params/1e9:>10.3f} B{' ':>9}{total_gb:>9.2f} GB")
 
     print(f"\n{'group':<14}{'params':>12}{'share':>9}{'size':>10}")
     print("-" * 48)
-    groups = [g for g in ("Experts", "ShExperts", "Attention", "MTP", "Other")
-              if group_params.get(g, 0) > 0]
-    for grp in groups:
-        gp = group_params.get(grp, 0)
-        gb = group_bits.get(grp, 0.0) / 8 / 1e9
-        print(f"{grp:<14}{gp/1e9:>10.3f} B{100*gp/total_params:>8.1f}%{gb:>9.2f} GB")
+    for grp, info in bd["by_group"].items():
+        gp = info["params"]
+        gb = info["size_gb"]
+        print(f"{grp:<14}{gp/1e9:>10.3f} B{100*info['share']:>8.1f}%{gb:>9.2f} GB")
 
-    all_types = sorted({t for d in cat_type_bits.values() for t in d},
-                       key=lambda t: -sum(cat_type_bits[c].get(t, 0) for c in groups))
+    cat_type_bits_gb = {g: {t: gb for t, gb in d.items()}
+                        for g, d in bd["group_types"].items()}
+    all_types = sorted({t for d in cat_type_bits_gb.values() for t in d},
+                       key=lambda t: -sum(cat_type_bits_gb[c].get(t, 0) for c in bd["by_group"]))
     if len(all_types) > 1:
         hdr = f"\n{'group':<14}" + "".join(f"{t:>10}" for t in all_types)
         print(hdr)
         print("-" * (14 + 10 * len(all_types)))
-        for grp in groups:
+        for grp in bd["by_group"]:
             row = f"{grp:<14}"
             for t in all_types:
-                gb = cat_type_bits[grp].get(t, 0) / 8 / 1e9
+                gb = cat_type_bits_gb[grp].get(t, 0.0)
                 row += f"{gb:>9.2f} "
             print(row)
 
@@ -302,6 +344,8 @@ def main():
                         help="Print list of tensors not covered by rules")
     parser.add_argument("--compare", action="store_true",
                         help="Show actual GGUF tensor breakdown by quant type x group")
+    parser.add_argument("--json", action="store_true",
+                        help="Emit machine-readable JSON instead of human-readable output")
     quant_mode = parser.add_mutually_exclusive_group()
     quant_mode.add_argument("--speed", action="store_const", dest="quant_mode", const="speed",
                             help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) for all tensors")
@@ -323,7 +367,8 @@ def main():
                 args.dense_layers = detected["dense_layers"]
             if args.arch is None:
                 args.arch = detected["arch"]
-            print(f">>> Detected from GGUF: arch={detected['arch']}, layers={detected['layers']}, dense_layers={detected['dense_layers']}")
+            if not args.json:
+                print(f">>> Detected from GGUF: arch={detected['arch']}, layers={detected['layers']}, dense_layers={detected['dense_layers']}")
     if args.layers is None:
         args.layers = 40
 
@@ -390,14 +435,52 @@ def main():
 
         # ── Compare-only: no estimate, just inspect the file ──
         if args.compare and not config_file:
-            print(f"input:  {args.input}")
-            print(f"tensors: {len(tensors)}, {total_params/1e9:.2f} B params")
-            print_gguf_breakdown(tensors)
+            if args.json:
+                bd = gguf_breakdown(tensors)
+                print(json.dumps({
+                    "mode": "compare",
+                    "input": args.input,
+                    "tensors": len(tensors),
+                    "total_params": bd["total_params"],
+                    "by_type": bd["by_type"],
+                    "by_group": bd["by_group"],
+                    "group_types": bd["group_types"],
+                }, indent=2))
+            else:
+                print(f"input:  {args.input}")
+                print(f"tensors: {len(tensors)}, {total_params/1e9:.2f} B params")
+                print_gguf_breakdown(tensors)
             return
 
         # ── Estimate from config (with optional compare) ──
         rules = load_config(config_file)
         size_gb, by_type, uncovered, uncovered_names, group_params, group_bits, cat_type_bits = estimate(tensors, rules, base)
+
+        if args.json:
+            result = {
+                "mode": "estimate",
+                "input": args.input,
+                "input_size_gb": os.path.getsize(args.input) / 1e9,
+                "profile": profile,
+                "config": config_file,
+                "base_type": base,
+                "layers": args.layers,
+                "dense_layers": args.dense_layers,
+                "arch": args.arch,
+                "tensors": len(tensors),
+                "total_params": total_params,
+                "rules": len(rules),
+                "uncovered": uncovered,
+                "estimated_size_gb": size_gb,
+            }
+            result.update(estimate_breakdown(by_type, group_params, group_bits,
+                                             cat_type_bits, total_params))
+            if args.verbose:
+                result["uncovered_names"] = uncovered_names
+            if args.compare:
+                result["actual"] = gguf_breakdown(tensors)
+            print(json.dumps(result, indent=2))
+            return
 
         if args.quiet:
             print(f"{size_gb:.3f}")
