@@ -369,6 +369,7 @@ class _LiveContext:
         self.upload_progress: dict[str, dict] = {}
         self.s3_upload_progress: dict[str, dict] = {}
         self.downloads: dict[str, dict] = {}
+        self.merge: Optional[dict] = None
         self.state: Optional["BatchState"] = None
         self.source_ok: bool = False
         self.imatrix_ok: bool = False
@@ -521,6 +522,13 @@ _STATUS_ICON = {
 }
 
 
+def _format_elapsed(seconds: float) -> str:
+    """Format a duration as MM:SS or H:MM:SS."""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{m:02d}:{s:02d}" if not h else f"{h}:{m:02d}:{s:02d}"
+
+
 def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                    tiers: list = None, *, _live_ctx=None):
     """Render the current status to the terminal.
@@ -542,6 +550,29 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         table.add_column("Status", width=56)
         table.add_column("Info", ratio=1, style="dim", overflow="fold")
 
+        # Merge row (shard merge task)
+        if _live_ctx.merge:
+            mg = _live_ctx.merge
+            mst = mg["status"]
+            if mst == "merging":
+                start = mg.get("start", time.time())
+                elapsed_str = _format_elapsed(time.time() - start)
+                frame = _SPINNER_FRAMES[int(time.time() * 4) % len(_SPINNER_FRAMES)]
+                total_gb = mg.get("total_gb")
+                info = f"{total_gb:.1f} GB" if total_gb else ""
+                table.add_row("MERGE", "—",
+                              Text(f" {frame} merging… {elapsed_str}", style="yellow"),
+                              info)
+            elif mst == "error":
+                elapsed_str = _format_elapsed(mg.get("elapsed", 0))
+                table.add_row("MERGE", "—",
+                              Text(f" ✗ merge failed {elapsed_str}", style="bold red"), "")
+            else:
+                elapsed_str = _format_elapsed(mg.get("elapsed", 0))
+                note = " (cached)" if mst == "cached" else ""
+                table.add_row("MERGE", "—",
+                              Text(f" ✓ merged in {elapsed_str}{note}", style="green"), "")
+
         # Download rows (above tier table)
         for key, dl in _live_ctx.downloads.items():
             label = dl.get("label", key)
@@ -559,13 +590,36 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                     bar_len = 20
                     filled = int(pct / 100 * bar_len)
                     bar = "█" * filled + "░" * (bar_len - filled)
-                    eta_sec = elapsed / dl_bytes * (total - dl_bytes)
-                    em, es = divmod(int(eta_sec), 60)
-                    eh, em = divmod(em, 60)
-                    eta_str = f"{em:02d}:{es:02d}" if not eh else f"{eh}:{em:02d}:{es:02d}"
+                    # ETA must be based on bytes transferred in this session:
+                    # resumed bytes from a previous attempt arrived in 0s
+                    # and would otherwise skew the rate estimate.
+                    session_bytes = dl_bytes - dl.get("resumed_from", 0)
+                    if session_bytes > 0:
+                        eta_sec = elapsed / session_bytes * (total - dl_bytes)
+                        em, es = divmod(int(eta_sec), 60)
+                        eh, em = divmod(em, 60)
+                        eta_str = f"{em:02d}:{es:02d}" if not eh else f"{eh}:{em:02d}:{es:02d}"
+                    else:
+                        # No bytes transferred yet this session (fresh resume)
+                        eta_str = "--:--"
+                    # Instantaneous speed, EMA-smoothed across renders.
+                    # Session-based (resumed bytes excluded) so a resume
+                    # spike doesn't show a bogus multi-GB/s value.
+                    now = time.time()
+                    prev_b = dl.get("_spd_bytes")
+                    prev_t = dl.get("_spd_ts")
+                    if prev_t is not None and now > prev_t:
+                        inst = max(0.0, (dl_bytes - prev_b) / (now - prev_t) / (1024**2))
+                        speed = 0.7 * dl.get("_spd", inst) + 0.3 * inst
+                    else:
+                        speed = dl.get("_spd", 0.0)
+                    dl["_spd_bytes"] = dl_bytes
+                    dl["_spd_ts"] = now
+                    dl["_spd"] = speed
                     status_col = Text(f" {frame} {bar} {pct:.1f}% {elapsed_str} ETA {eta_str}",
                                       style="cyan")
-                    info = f"{dl_bytes / (1024**2):.0f}/{total / (1024**2):.0f} MB"
+                    info = (f"{dl_bytes / (1024**2):.0f}/{total / (1024**2):.0f} MB"
+                            f" · {speed:.1f} MB/s")
                 else:
                     status_col = Text(f" {frame} downloading… {elapsed_str}", style="cyan")
                     info = ""
@@ -614,6 +668,14 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         table.add_column("Base", width=7)
         table.add_column("Status", width=56)
         table.add_column("Info", ratio=1, style="dim", overflow="fold")
+        merge_rec = state.data.get("merge")
+        if merge_rec:
+            mel = _format_elapsed(merge_rec.get("elapsed", 0))
+            mst = merge_rec.get("status", "done")
+            note = " (cached)" if mst == "cached" else ""
+            style = "green" if mst in ("done", "cached") else "bold red"
+            table.add_row("MERGE", "—",
+                          Text(f" ✓ merged in {mel}{note}", style=style), "")
         for tier, speed in tiers:
             key = variant_key(tier, speed)
             base = TIER_BASE_TYPE[tier]
@@ -1140,6 +1202,8 @@ def _resumable_download(url: str, dest: Path, *, token: Optional[str] = None,
 
     mode = "ab" if existing > 0 else "wb"
     bytes_downloaded = existing
+    if _lc and _lc.downloads.get(label):
+        _lc.downloads[label]["resumed_from"] = existing
 
     with open(part, mode) as f, \
          httpx.Client(follow_redirects=True, timeout=httpx.Timeout(300, connect=30)) as client:
@@ -1149,6 +1213,8 @@ def _resumable_download(url: str, dest: Path, *, token: Optional[str] = None,
                 f.seek(0)
                 f.truncate()
                 bytes_downloaded = 0
+                if _lc and _lc.downloads.get(label):
+                    _lc.downloads[label]["resumed_from"] = 0
 
             response.raise_for_status()
 
@@ -1302,7 +1368,8 @@ def find_gguf_split():
     return None
 
 
-def merge_gguf_shards(shard_paths: list, *, keep_shards: bool = True) -> Path:
+def merge_gguf_shards(shard_paths: list, *, keep_shards: bool = True,
+                      state: Optional["BatchState"] = None) -> Path:
     """Merge split GGUF shards into a single GGUF.
 
     llama-quantize cannot read split GGUFs, so sharded source models must
@@ -1311,7 +1378,24 @@ def merge_gguf_shards(shard_paths: list, *, keep_shards: bool = True) -> Path:
 
     When *keep_shards* is False the source shards are deleted after a
     successful merge to save disk space.
+
+    The merge is shown as its own task row (with spinner and elapsed time)
+    in the live table; the total time spent is recorded into *state*.
     """
+    def _mark(status: str, elapsed: float):
+        if _lc is not None:
+            if status == "merging":
+                _lc.merge = {"status": "merging", "start": time.time()}
+            else:
+                if _lc.merge is None:
+                    _lc.merge = {}
+                _lc.merge["status"] = status
+                _lc.merge["elapsed"] = elapsed
+            if _lc.live:
+                _lc.live.update(_build_live_renderable())
+        if state is not None:
+            state.set("merge", {"status": status, "elapsed": round(elapsed, 1)})
+
     first = Path(shard_paths[0]).resolve()
     m = SHARD_RE.match(first.name)
     if not m:
@@ -1321,6 +1405,7 @@ def merge_gguf_shards(shard_paths: list, *, keep_shards: bool = True) -> Path:
     if merged.exists() and merged.stat().st_size > 0:
         log(f"✓ Merged GGUF already exists: {merged.name}  "
             f"({merged.stat().st_size / (1024**3):.2f} GB)")
+        _mark("cached", 0.0)
         if not keep_shards and shards_exist:
             _delete_shards(shard_paths)
         return merged
@@ -1334,10 +1419,21 @@ def merge_gguf_shards(shard_paths: list, *, keep_shards: bool = True) -> Path:
 
     total_gb = sum(p.stat().st_size for p in shard_paths) / (1024**3)
     log(f"Merging {len(shard_paths)} shards ({total_gb:.1f} GB) → {merged.name} …")
-    subprocess.run([split_bin, "--merge", str(first), str(merged)], check=True)
+    _mark("merging", 0.0)
+    if _lc is not None and _lc.merge is not None:
+        _lc.merge["total_gb"] = total_gb
+    t0 = time.time()
+    try:
+        subprocess.run([split_bin, "--merge", str(first), str(merged)], check=True)
+        elapsed = time.time() - t0
+    except BaseException:
+        _mark("error", time.time() - t0)
+        raise
     if merged.stat().st_size == 0:
         raise RuntimeError(f"Merged GGUF is empty: {merged}")
-    log(f"✓ Merged: {merged.name}  ({merged.stat().st_size / (1024**3):.2f} GB)")
+    _mark("done", elapsed)
+    log(f"✓ Merged: {merged.name}  ({merged.stat().st_size / (1024**3):.2f} GB)  "
+        f"in {_format_elapsed(elapsed)}")
     if not keep_shards:
         _delete_shards(shard_paths)
     return merged
@@ -1996,6 +2092,10 @@ def run_pipeline(args):
         _lc.source_ok = state.source_info() is not None
         _lc.imatrix_ok = state.imatrix_info() is not None
         _lc.tiers = variants
+        merge_rec = state.get("merge")
+        if merge_rec:
+            _lc.merge = {"status": merge_rec.get("status", "done"),
+                         "elapsed": merge_rec.get("elapsed", 0.0)}
 
     _init_live()
 
@@ -2118,7 +2218,7 @@ def run_pipeline(args):
                             source_gguf = result[0]
                         else:
                             source_gguf = merge_gguf_shards(
-                                result, keep_shards=args.keep_files)
+                                result, keep_shards=args.keep_files, state=state)
                         state.mark_source(str(source_gguf), source_files[0])
                     else:
                         imatrix_path = result
