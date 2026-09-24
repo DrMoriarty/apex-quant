@@ -2644,7 +2644,7 @@ def main():
     parser.add_argument("--output", "-o", required=True,
                         help="HF repo id for all output tiers (org/name), "
                              "e.g. user/model-APEX")
-    parser.add_argument("--tiers", default="1-13",
+    parser.add_argument("--tiers", default="1-15",
                         help="Tier spec: '1-13', '1-10,13', '3-8', '1,5,7' "
                              "(default: 1-13; tiers 7-15 are each produced in "
                              "two variants: normal and -s with --speed)")
