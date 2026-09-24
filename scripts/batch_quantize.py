@@ -1212,7 +1212,7 @@ def _download_single_file(
             _lc.live.update(_build_live_renderable())
         return dest
 
-    workspace.mkdir(parents=True, exist_ok=True)
+    dest.parent.mkdir(parents=True, exist_ok=True)
     if _lc:
         _lc.downloads[label] = {"label": label, "status": "downloading",
                                  "bytes": 0, "total": 0, "start": time.time()}
