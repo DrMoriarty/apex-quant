@@ -537,7 +537,7 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         from rich.text import Text
 
         table = Table(show_lines=False, padding=(0, 1), expand=True)
-        table.add_column("Tier", justify="right", style="bold", width=6)
+        table.add_column("Tier", justify="right", style="bold", width=8)
         table.add_column("Base", width=7)
         table.add_column("Status", width=56)
         table.add_column("Info", ratio=1, style="dim", overflow="fold")
@@ -610,7 +610,7 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         from rich.text import Text
 
         table = Table(show_lines=False, padding=(0, 1), expand=True)
-        table.add_column("Tier", justify="right", style="bold", width=6)
+        table.add_column("Tier", justify="right", style="bold", width=8)
         table.add_column("Base", width=7)
         table.add_column("Status", width=56)
         table.add_column("Info", ratio=1, style="dim", overflow="fold")
