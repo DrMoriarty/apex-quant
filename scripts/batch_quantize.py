@@ -76,6 +76,9 @@ from urllib.parse import urlsplit
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
+# Split GGUF shard filename: <prefix>-00001-of-00002.gguf
+SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$")
+
 _interruption_requested = False
 
 
@@ -846,6 +849,27 @@ def _pick_source_gguf(gguf_files: list) -> str:
 _SRC_FMT_RE = re.compile(r"(?i)(?:bf16|f16|f32)")
 
 
+def _expand_shard_files(filename: str, repo_files: list) -> list:
+    """Expand a split-GGUF filename into all its shard filenames.
+
+    Split GGUFs are distributed as Model-00001-of-00002.gguf,
+    Model-00002-of-00002.gguf, … For a shard name returns the full
+    ordered shard list (filtered against *repo_files*); for a regular
+    single-file GGUF returns [filename].
+    """
+    m = SHARD_RE.match(filename)
+    if not m:
+        return [filename]
+    prefix, count = m.group(1), int(m.group(3))
+    shards = []
+    for f in repo_files:
+        mm = SHARD_RE.match(f)
+        if mm and mm.group(1) == prefix and int(mm.group(3)) == count:
+            shards.append(f)
+    shards.sort()
+    return shards if shards else [filename]
+
+
 def _tier_filename(source_file: str, tier: int, speed: bool = False) -> str:
     """Derive tier output GGUF name from the source model filename.
 
@@ -1207,17 +1231,22 @@ def download_source_model(
     repo_id: str,
     workspace: Path,
     token: Optional[str],
-    source_file: str,
-) -> Path:
-    """Download the source GGUF from HF, return local path."""
+    source_files: list,
+) -> list:
+    """Download the source GGUF shard(s) from HF, return list of local paths."""
     target_dir = workspace / "source_model"
-    result = _download_single_file(
-        repo_id, source_file, target_dir, token, label="source model",
-    )
-    if not result.exists():
-        raise FileNotFoundError(f"Source file not found after download: {result}")
-    log(f"Source model ready: {result.name}  ({result.stat().st_size / (1024**3):.2f} GB)")
-    return result
+    paths = []
+    n = len(source_files)
+    for i, filename in enumerate(source_files):
+        label = "source model" if n == 1 else f"source model {i + 1}/{n}"
+        result = _download_single_file(
+            repo_id, filename, target_dir, token, label=label,
+        )
+        if not result.exists():
+            raise FileNotFoundError(f"Source file not found after download: {result}")
+        log(f"Source shard ready: {result.name}  ({result.stat().st_size / (1024**3):.2f} GB)")
+        paths.append(result)
+    return paths
 
 
 @_retry_on_network_error
@@ -1241,6 +1270,67 @@ def download_imatrix(
 # ---------------------------------------------------------------------------
 # Quantize
 # ---------------------------------------------------------------------------
+
+def find_gguf_split():
+    """Find llama-gguf-split binary."""
+    q = os.environ.get("LLAMA_GGUF_SPLIT", "")
+    if q and os.path.isfile(q):
+        return q
+
+    d = os.environ.get("LLAMA_CPP_DIR", "")
+    if d:
+        p = os.path.join(d, "llama-gguf-split")
+        if os.path.isfile(p):
+            return p
+
+    candidates = [
+        "./llama.cpp/build/bin",
+        str(SCRIPT_DIR.parent / "llama.cpp" / "build" / "bin"),
+    ]
+    for d in candidates:
+        p = os.path.join(d, "llama-gguf-split")
+        if os.path.isfile(p):
+            return p
+
+    try:
+        subprocess.check_output(["command", "-v", "llama-gguf-split"], shell=True)
+        return "llama-gguf-split"
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    return None
+
+
+def merge_gguf_shards(shard_paths: list) -> Path:
+    """Merge split GGUF shards into a single GGUF.
+
+    llama-quantize cannot read split GGUFs, so sharded source models must
+    be merged before quantization. The merged file is written next to the
+    first shard and reused on subsequent runs.
+    """
+    first = Path(shard_paths[0]).resolve()
+    m = SHARD_RE.match(first.name)
+    if not m:
+        return first
+    merged = first.with_name(f"{m.group(1)}.gguf")
+    if merged.exists() and merged.stat().st_size > 0:
+        log(f"✓ Merged GGUF already exists: {merged.name}  "
+            f"({merged.stat().st_size / (1024**3):.2f} GB)")
+        return merged
+
+    split_bin = find_gguf_split()
+    if not split_bin:
+        log_err("llama-gguf-split not found. Set LLAMA_GGUF_SPLIT or LLAMA_CPP_DIR, "
+                "or merge the shards manually:\n"
+                f"  llama-gguf-split --merge {first} {merged}")
+        sys.exit(1)
+
+    total_gb = sum(p.stat().st_size for p in shard_paths) / (1024**3)
+    log(f"Merging {len(shard_paths)} shards ({total_gb:.1f} GB) → {merged.name} …")
+    subprocess.run([split_bin, "--merge", str(first), str(merged)], check=True)
+    log(f"✓ Merged: {merged.name}  ({merged.stat().st_size / (1024**3):.2f} GB)")
+    return merged
+
 
 def run_quantize(
     tier: int,
@@ -1943,6 +2033,10 @@ def run_pipeline(args):
                 sys.exit(1)
             if len(gguf_files) > 1:
                 log(f"Found {len(gguf_files)} .gguf files, selected: {source_file}")
+            source_files = _expand_shard_files(source_file, gguf_files)
+            if len(source_files) > 1:
+                log(f"Source model is split into {len(source_files)} shards: "
+                    f"{source_files[0]} … {source_files[-1]}")
 
         # resolve imatrix file
         if not imatrix_info:
@@ -1957,9 +2051,13 @@ def run_pipeline(args):
         # download both in the main thread so Ctrl+C actually stops them
         if args.dry_run:
             if not source_info:
-                log(f"DRY RUN: would download source model {args.model} ({source_file})")
-                source_gguf = Path(f"/dry-run/{source_file}")
-                state.mark_source(str(source_gguf), source_file)
+                log(f"DRY RUN: would download source model {args.model} "
+                    f"({', '.join(source_files)})")
+                if len(source_files) > 1:
+                    log("DRY RUN: shards would be merged into a single GGUF "
+                        "before quantization")
+                source_gguf = Path(f"/dry-run/{source_files[0]}")
+                state.mark_source(str(source_gguf), source_files[0])
             if not imatrix_info:
                 log(f"DRY RUN: would download imatrix {args.imatrix} ({imatrix_file})")
                 imatrix_path = Path(f"/dry-run/{imatrix_file}")
@@ -1968,7 +2066,7 @@ def run_pipeline(args):
             with _allow_hard_interrupt():
                 downloads = []
                 if not source_info:
-                    downloads.append(("source", download_source_model, (args.model, workspace, token, source_file)))
+                    downloads.append(("source", download_source_model, (args.model, workspace, token, source_files)))
                 if not imatrix_info:
                     downloads.append(("imatrix", download_imatrix, (args.imatrix, workspace, token, imatrix_file)))
                 for key, fn, a in downloads:
@@ -1981,8 +2079,11 @@ def run_pipeline(args):
                         log_err(f"Download failed ({key}): {exc}")
                         sys.exit(1)
                     if key == "source":
-                        source_gguf = result
-                        state.mark_source(str(result), source_file)
+                        if len(result) == 1:
+                            source_gguf = result[0]
+                        else:
+                            source_gguf = merge_gguf_shards(result)
+                        state.mark_source(str(source_gguf), source_files[0])
                     else:
                         imatrix_path = result
                         state.mark_imatrix(str(result))
