@@ -31,6 +31,7 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 | `scripts/estimate_config_size.py` | Predicts GGUF size from a config + tensor inventory |
 | `scripts/eval.sh` | Runs PPL, KL, HellaSwag, Winogrande, MMLU, ARC, TruthfulQA, speed; outputs JSON |
 | `scripts/benchmark.sh` | Batch benchmarking with TSV output and optional plots |
+| `scripts/batch_perplexity.py` | Batch perplexity/KLD eval of quants from S3 or HF; saves `<model>-perplexity-report.txt` and uploads it back |
 | `scripts/apex_pipeline.sh` | Full pipeline: download → convert → quantize → imatrix → eval → publish (YAML-driven) |
 | `scripts/generate_sensitivity_configs.py` | Builds perturbation sweep configs for measuring tensor-group sensitivity |
 | `scripts/generate_opt_config.py` | Turns a measured sensitivity curve into an allocation config |
