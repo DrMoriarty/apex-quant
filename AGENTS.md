@@ -8,7 +8,7 @@ APEX quantizes MoE (and dense/hybrid) GGUF models via per-layer, per-tensor-type
 
 Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based profiles). The Python scripts are the current primary interface shown in README.
 
-### Python scripts (primary — tier profiles: tier1–tier13, dense-*)
+### Python scripts (primary — tier profiles: tier1–tier15, dense-*)
 
 | Script | Purpose |
 |--------|---------|
@@ -59,7 +59,7 @@ llama-quantize matches `--tensor-type-file` entries with `std::regex_search` —
 
 `configs/{prefix}_{profile}.txt` where prefix identifies the model (e.g., `qwen35a3b`, `laguna_xs21`) and profile is one of:
 - **Legacy**: `quality`, `balanced`, `compact`, `mini`, plus I-variants and experimental tiers (`nano`, `micro`)
-- **Tier-based** (Python scripts): `tier1`–`tier13`
+- **Tier-based** (Python scripts): `tier1`–`tier15`
 - **Dense/hybrid**: `dense-flat`, `dense-grad`, `dense-hybrid`, `dense-hybrid-quality`
 
 Committed configs are the ground truth — `test_generate_config.sh` asserts the generator reproduces them byte-for-byte.

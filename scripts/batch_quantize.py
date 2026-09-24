@@ -2,8 +2,12 @@
 """APEX Batch Quantization Pipeline.
 
 Downloads a source GGUF model (bf16/f16/f32) and an importance matrix from
-HuggingFace, quantizes through APEX tiers 1-13 using quantize.py, and
+HuggingFace, quantizes through APEX tiers using quantize.py, and
 uploads every resulting GGUF to HuggingFace.
+
+Each tier in the speed range (7-15) is produced in two variants:
+  * normal   — default quantize.py parameters          (Tier7)
+  * speed    — with the ``--speed`` flag passed on     (Tier7-s)
 
 Manages a README.md in the output repo: downloads an existing README or
 creates one with source info, APEX attribution, and a quantization table.
@@ -179,14 +183,42 @@ def _retry_on_network_error(fn=None, *, max_retries=5, delay=10):
 # Constants
 # ---------------------------------------------------------------------------
 
-TIERS = list(range(1, 14))
+TIERS = list(range(1, 16))
+
+# Tiers that get an extra "--speed" variant (Tier7-s alongside Tier7).
+SPEED_TIERS = set(range(7, 16))
 
 TIER_BASE_TYPE = {
     1: "Q8_0", 2: "Q8_0", 3: "Q8_0", 4: "Q8_0", 5: "Q8_0", 6: "Q8_0",
     7: "Q6_K", 8: "Q6_K", 9: "Q6_K",
     10: "Q5_K_M", 11: "Q5_K_M", 12: "Q5_K_M",
     13: "Q4_K_M",
+    14: "Q4_K_M", 15: "Q4_K_M",
 }
+
+
+def variant_key(tier: int, speed: bool) -> str:
+    """State key for a tier variant: '7' (normal) or '7-s' (speed)."""
+    return f"{tier}-s" if speed else str(tier)
+
+
+def variant_label(tier: int, speed: bool) -> str:
+    """Display/README name for a tier variant: 'tier7' or 'tier7-s'."""
+    return f"tier{tier}-s" if speed else f"tier{tier}"
+
+
+def expand_variants(tiers: list) -> list:
+    """Expand a sorted tier list into (tier, speed) variants.
+
+    Tiers in SPEED_TIERS get both (tier, False) and (tier, True);
+    other tiers only (tier, False).  Ordering: tier7, tier7-s, tier8, …
+    """
+    out = []
+    for t in tiers:
+        out.append((t, False))
+        if t in SPEED_TIERS:
+            out.append((t, True))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -243,15 +275,15 @@ class BatchState:
         self.data[key] = value
         self.save()
 
-    # -- per-tier helpers --
-    def _t(self, tier: int) -> dict:
-        return self.data.setdefault("tiers", {}).setdefault(str(tier), {})
+    # -- per-variant helpers (key: '7' or '7-s') --
+    def _t(self, key: str) -> dict:
+        return self.data.setdefault("tiers", {}).setdefault(str(key), {})
 
-    def tier_status(self, tier: int) -> str:
-        return self._t(tier).get("status", "pending")
+    def tier_status(self, key: str) -> str:
+        return self._t(key).get("status", "pending")
 
-    def set_tier(self, tier: int, status: str, **extra):
-        t = self._t(tier)
+    def set_tier(self, key: str, status: str, **extra):
+        t = self._t(key)
         t["status"] = status
         t["updated"] = datetime.now().isoformat()
         t.update(extra)
@@ -289,12 +321,12 @@ class BatchState:
         self.data["readme_tiers"] = sorted(tiers)
         self.save()
 
-    # -- per-target upload helpers (hf / s3) --
-    def upload_done(self, tier: int, target: str) -> bool:
-        return bool(self._t(tier).get(f"{target}_done"))
+    # -- per-variant upload helpers (hf / s3) --
+    def upload_done(self, key: str, target: str) -> bool:
+        return bool(self._t(key).get(f"{target}_done"))
 
-    def mark_upload_done(self, tier: int, target: str):
-        self._t(tier)[f"{target}_done"] = True
+    def mark_upload_done(self, key: str, target: str):
+        self._t(key)[f"{target}_done"] = True
         self.save()
 
 
@@ -329,9 +361,9 @@ class _LiveContext:
 
     def __init__(self):
         self.live: Optional["_RichLive"] = None
-        self.active_tiers: dict[int, dict] = {}
-        self.upload_progress: dict[int, dict] = {}
-        self.s3_upload_progress: dict[int, dict] = {}
+        self.active_tiers: dict[str, dict] = {}
+        self.upload_progress: dict[str, dict] = {}
+        self.s3_upload_progress: dict[str, dict] = {}
         self.downloads: dict[str, dict] = {}
         self.state: Optional["BatchState"] = None
         self.source_ok: bool = False
@@ -489,11 +521,12 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                    tiers: list = None, *, _live_ctx=None):
     """Render the current status to the terminal.
 
-    When *_live_ctx* is provided (internal), returns a Rich renderable
-    for use inside a ``Live`` display.  Otherwise prints a one-shot table.
+    *tiers* is a list of (tier, speed) variants.  When *_live_ctx* is
+    provided (internal), returns a Rich renderable for use inside a
+    ``Live`` display.  Otherwise prints a one-shot table.
     """
     if tiers is None:
-        tiers = TIERS
+        tiers = expand_variants(TIERS)
 
     # ── Live mode (called by _build_live_renderable) ──
     if _HAS_RICH and _live_ctx is not None:
@@ -538,14 +571,15 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                               Text(" ✓ downloaded", style="green"), "")
 
         # Tier rows
-        for tier in tiers:
+        for tier, speed in tiers:
+            key = variant_key(tier, speed)
             base = TIER_BASE_TYPE[tier]
-            active = _live_ctx.active_tiers.get(tier)
+            active = _live_ctx.active_tiers.get(key)
             if active:
-                status_col = _render_active_tier(tier, active, _live_ctx)
-                info = _format_active_info(tier, active, state)
+                status_col = _render_active_tier(key, active, _live_ctx)
+                info = _format_active_info(key, active, state)
             else:
-                st = state.tier_status(tier)
+                st = state.tier_status(key)
                 # State says "uploading" but the tier is NOT in active_tiers
                 # → the upload is sitting in the executor queue.
                 show_st = "queued" if st == "uploading" else st
@@ -554,12 +588,12 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                 status_col = Text(f" {icon} {show_st}", style=style)
                 info = ""
                 if show_st == "error":
-                    info = Text(state._t(tier).get("error_short", ""), style="red")
+                    info = Text(state._t(key).get("error_short", ""), style="red")
                 elif show_st == "uploaded":
-                    sz = state._t(tier).get("size_mb")
+                    sz = state._t(key).get("size_mb")
                     if sz:
                         info = f"{sz} MB"
-            table.add_row(f"tier{tier}", base, status_col, info)
+            table.add_row(variant_label(tier, speed), base, status_col, info)
 
         src_label = "✓ downloaded" if source_ok else "… pending"
         imx_label = "✓ downloaded" if imatrix_ok else "… pending"
@@ -576,20 +610,21 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         table.add_column("Base", width=7)
         table.add_column("Status", width=56)
         table.add_column("Info", ratio=1, style="dim", overflow="fold")
-        for tier in tiers:
+        for tier, speed in tiers:
+            key = variant_key(tier, speed)
             base = TIER_BASE_TYPE[tier]
-            st = state.tier_status(tier)
+            st = state.tier_status(key)
             icon = _STATUS_ICON.get(st, "?")
             style = _STATUS_STYLE.get(st, "")
             info = ""
             if st == "error":
-                info = Text(state._t(tier).get("error_short", ""), style="red")
+                info = Text(state._t(key).get("error_short", ""), style="red")
             elif st == "uploaded":
-                sz = state._t(tier).get("size_mb")
+                sz = state._t(key).get("size_mb")
                 if sz:
                     info = f"{sz} MB"
             table.add_row(
-                f"tier{tier}",
+                variant_label(tier, speed),
                 base,
                 Text(f" {icon} {st}", style=style),
                 info,
@@ -601,20 +636,21 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
                        subtitle=header, border_style="blue")
         console.print(panel)
     else:
-        print(f"\n  {'Tier':<6} {'Base':<8} {'Status'}")
-        print(f"  {'─'*6} {'─'*8} {'─'*20}")
-        for tier in tiers:
+        print(f"\n  {'Tier':<9} {'Base':<8} {'Status'}")
+        print(f"  {'─'*9} {'─'*8} {'─'*20}")
+        for tier, speed in tiers:
+            key = variant_key(tier, speed)
             base = TIER_BASE_TYPE[tier]
-            st = state.tier_status(tier)
+            st = state.tier_status(key)
             icon = _STATUS_ICON.get(st, "?")
-            print(f"  {tier:<6} {base:<8} {icon} {st}")
+            print(f"  {variant_label(tier, speed):<9} {base:<8} {icon} {st}")
         print()
 
 
 _SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 
 
-def _render_active_tier(tier: int, active: dict, lc) -> "Text":
+def _render_active_tier(key: str, active: dict, lc) -> "Text":
     """Build a Rich Text object for a currently active tier row."""
     from rich.text import Text
     st = active["status"]
@@ -640,10 +676,10 @@ def _render_active_tier(tier: int, active: dict, lc) -> "Text":
             return Text(f" ◉ {bar} {cur}/{total} {elapsed_str} ETA {eta_str}", style="yellow")
         return Text(f" {frame} quantizing… {elapsed_str}", style="yellow")
     elif st == "uploading":
-        prog = lc.upload_progress.get(tier)
+        prog = lc.upload_progress.get(key)
         target_tag = ""
         if not prog or prog.get("total", 0) <= 0:
-            prog = lc.s3_upload_progress.get(tier)
+            prog = lc.s3_upload_progress.get(key)
             target_tag = "s3 "
         if prog and prog.get("total", 0) > 0:
             cur = prog["current"]
@@ -674,13 +710,13 @@ def _render_active_tier(tier: int, active: dict, lc) -> "Text":
         return Text(f" ? {st}", style="dim")
 
 
-def _format_active_info(tier: int, active: dict, state: BatchState) -> str:
+def _format_active_info(key: str, active: dict, state: BatchState) -> str:
     """Return hint text for active tier's info column."""
     last = active.get("last_line", "")
     parts = []
     if last:
         parts.append(last)
-    s3p = _lc.s3_upload_progress.get(tier) if _lc else None
+    s3p = _lc.s3_upload_progress.get(key) if _lc else None
     if s3p and s3p.get("total", 0) > 0:
         pct = s3p["current"] / s3p["total"] * 100
         parts.append(f"S3 {pct:.0f}% ({s3p['current'] / (1024**2):.0f} MB)")
@@ -697,8 +733,8 @@ class _Capture:
     _PROGRESS_RE = re.compile(r"\[\s*(\d+)/\s*(\d+)\]")
     _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 
-    def __init__(self, tier: int, *, stream: Optional[io.TextIOBase] = None):
-        self.tier = tier
+    def __init__(self, key: str, *, stream: Optional[io.TextIOBase] = None):
+        self.key = key                 # variant key ('7' or '7-s')
         self._stream = stream          # original stderr (or None)
         self._buf = ""
         self._lines: list[str] = []
@@ -723,12 +759,12 @@ class _Capture:
                 with self._lock:
                     self._lines.append(line)
                     self.last_line = line
-                if _lc and _lc.active_tiers.get(self.tier):
-                    _lc.active_tiers[self.tier]["last_line"] = self.last_line[:120]
+                if _lc and _lc.active_tiers.get(self.key):
+                    _lc.active_tiers[self.key]["last_line"] = self.last_line[:120]
                     m = self._PROGRESS_RE.search(line)
                     if m:
-                        _lc.active_tiers[self.tier]["tensor_current"] = int(m.group(1))
-                        _lc.active_tiers[self.tier]["tensor_total"] = int(m.group(2))
+                        _lc.active_tiers[self.key]["tensor_current"] = int(m.group(1))
+                        _lc.active_tiers[self.key]["tensor_total"] = int(m.group(2))
                     if _lc.live is not None:
                         _lc.live.update()
         if self._stream is not None and not (_lc and _lc.live):
@@ -810,20 +846,22 @@ def _pick_source_gguf(gguf_files: list) -> str:
 _SRC_FMT_RE = re.compile(r"(?i)(?:bf16|f16|f32)")
 
 
-def _tier_filename(source_file: str, tier: int) -> str:
+def _tier_filename(source_file: str, tier: int, speed: bool = False) -> str:
     """Derive tier output GGUF name from the source model filename.
 
-    Replaces the source format token (BF16/F16/F32, any case) with Tier<N>:
+    Replaces the source format token (BF16/F16/F32, any case) with Tier<N>
+    (or Tier<N>-s for the speed variant):
       Model-BF16.gguf → Model-Tier3.gguf
-      model_f16.gguf  → model_Tier3.gguf
+      model_f16.gguf  → model_Tier7-s.gguf  (speed variant)
     Falls back to appending a -Tier<N> suffix if no format token is found.
     """
     name = Path(source_file).name
-    result, n = _SRC_FMT_RE.subn(f"Tier{tier}", name)
+    tier_token = f"Tier{tier}-s" if speed else f"Tier{tier}"
+    result, n = _SRC_FMT_RE.subn(tier_token, name)
     if n == 0:
-        result = re.sub(r"(?i)\.gguf$", f"-Tier{tier}.gguf", name)
+        result = re.sub(r"(?i)\.gguf$", f"-{tier_token}.gguf", name)
         if result == name:
-            result = f"{name}-Tier{tier}.gguf"
+            result = f"{name}-{tier_token}.gguf"
     return result
 
 
@@ -972,14 +1010,15 @@ def _append_readme_row(readme_path: Path, tier_name: str, size_gb: float):
 
 
 def _rebuild_readme_rows(readme_path: Path, state: "BatchState"):
-    """Populate README with rows for all tiers already marked uploaded in state."""
-    for tier in TIERS:
-        if state.tier_status(tier) != "uploaded":
+    """Populate README with rows for all variants already marked uploaded in state."""
+    for tier, speed in expand_variants(TIERS):
+        key = variant_key(tier, speed)
+        if state.tier_status(key) != "uploaded":
             continue
-        tier_name = f"tier{tier}"
+        tier_name = variant_label(tier, speed)
         if _readme_has_tier(readme_path, tier_name):
             continue
-        info = state._t(tier)
+        info = state._t(key)
         sz_mb = info.get("size_mb")
         if sz_mb:
             _append_readme_row(readme_path, tier_name, sz_mb / 1024)
@@ -1205,20 +1244,24 @@ def download_imatrix(
 
 def run_quantize(
     tier: int,
+    speed: bool,
     source_gguf: Path,
     imatrix_path: Path,
     output_gguf: Path,
 ) -> None:
-    """Run quantize.py for a single tier. Raises on failure."""
+    """Run quantize.py for a single tier variant. Raises on failure."""
+    key = variant_key(tier, speed)
+    label = variant_label(tier, speed)
     cmd = [
         sys.executable, str(SCRIPT_DIR / "quantize.py"),
         "--profile", f"tier{tier}",
-        "--imatrix", str(imatrix_path),
-        str(source_gguf), str(output_gguf),
     ]
+    if speed:
+        cmd.append("--speed")
+    cmd += ["--imatrix", str(imatrix_path), str(source_gguf), str(output_gguf)]
 
     if _HAS_RICH and _lc is not None and _lc.live is not None:
-        cap = _Capture(tier)
+        cap = _Capture(key)
 
         # Use a PTY for stderr so llama-quantize sees a real terminal and
         # emits per-tensor progress lines (it suppresses them on pipes).
@@ -1283,10 +1326,10 @@ def run_quantize(
             tail_lines = [l for l in clean_err.splitlines() if l.strip()]
             tail = "\n".join(tail_lines[-15:]) or f"(exit code {proc.returncode})"
             raise RuntimeError(
-                f"quantize.py (tier{tier}) failed:\n{tail}"
+                f"quantize.py ({label}) failed:\n{tail}"
             )
     else:
-        log(f"Quantizing tier{tier} → {output_gguf.name}")
+        log(f"Quantizing {label} → {output_gguf.name}")
         proc = subprocess.run(cmd, text=True)
         if proc.returncode != 0:
             raise RuntimeError(f"quantize.py exited with code {proc.returncode}")
@@ -1309,10 +1352,10 @@ class _UploadProgressWrapper(io.BufferedIOBase):
     Stage transitions fire when a full pass completes (bytes_read reaches total).
     """
 
-    def __init__(self, path: Path, tier: int):
+    def __init__(self, path: Path, key: str):
         super().__init__()
         self._file = open(path, "rb")
-        self._tier = tier
+        self._key = key
         self._total = path.stat().st_size
         self._bytes_read = 0
         self._pass = 0
@@ -1330,11 +1373,11 @@ class _UploadProgressWrapper(io.BufferedIOBase):
             self._set_stage("committing")
 
     def _set_stage(self, stage: str):
-        if _lc and self._tier in _lc.upload_progress:
-            _lc.upload_progress[self._tier]["stage"] = stage
-            _lc.upload_progress[self._tier]["stage_start"] = time.time()
-        if _lc and self._tier in _lc.active_tiers:
-            _lc.active_tiers[self._tier]["last_line"] = stage
+        if _lc and self._key in _lc.upload_progress:
+            _lc.upload_progress[self._key]["stage"] = stage
+            _lc.upload_progress[self._key]["stage_start"] = time.time()
+        if _lc and self._key in _lc.active_tiers:
+            _lc.active_tiers[self._key]["last_line"] = stage
             if _lc.live is not None:
                 _lc.live.update()
 
@@ -1350,8 +1393,8 @@ class _UploadProgressWrapper(io.BufferedIOBase):
             self._bytes_read += n
             if self._bytes_read >= self._total:
                 self._on_pass_complete()
-            if _lc and self._tier in _lc.upload_progress:
-                _lc.upload_progress[self._tier]["current"] = self._bytes_read
+            if _lc and self._key in _lc.upload_progress:
+                _lc.upload_progress[self._key]["current"] = self._bytes_read
         return chunk
 
     def __len__(self) -> int:
@@ -1372,21 +1415,22 @@ class _UploadProgressWrapper(io.BufferedIOBase):
 
 @_retry_on_network_error
 def upload_tier(
-    tier: int,
+    key: str,
     gguf_path: Path,
     repo_id: str,
     token: Optional[str],
 ) -> None:
-    """Upload a quantized GGUF to HuggingFace."""
+    """Upload a quantized GGUF to HuggingFace. *key* is a variant key."""
     from huggingface_hub import create_repo, HfApi
     if not gguf_path.exists():
         raise FileNotFoundError(f"GGUF file not found for upload: {gguf_path}")
     if gguf_path.stat().st_size == 0:
         raise ValueError(f"GGUF file is empty: {gguf_path}")
 
+    label = f"tier{key}"
     _live_active = _HAS_RICH and _lc is not None and _lc.live is not None
     if not _live_active:
-        log(f"Uploading tier{tier} ({gguf_path.name}, "
+        log(f"Uploading {label} ({gguf_path.name}, "
             f"{gguf_path.stat().st_size / (1024**3):.2f} GB) → {repo_id}")
 
     create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=token)
@@ -1394,7 +1438,7 @@ def upload_tier(
     if _live_active:
         import io as _io
 
-        wrapper = _UploadProgressWrapper(gguf_path, tier)
+        wrapper = _UploadProgressWrapper(gguf_path, key)
         _old_stdout = sys.stdout
         _old_stderr = sys.stderr
         sys.stdout = _io.StringIO()
@@ -1406,7 +1450,7 @@ def upload_tier(
                     path_in_repo=gguf_path.name,
                     repo_id=repo_id,
                     repo_type="model",
-                    commit_message=f"APEX tier{tier} quantization",
+                    commit_message=f"APEX {label} quantization",
                 )
             except TypeError:
                 wrapper.close()
@@ -1415,7 +1459,7 @@ def upload_tier(
                     path_in_repo=gguf_path.name,
                     repo_id=repo_id,
                     repo_type="model",
-                    commit_message=f"APEX tier{tier} quantization",
+                    commit_message=f"APEX {label} quantization",
                 )
         finally:
             wrapper.close()
@@ -1427,11 +1471,11 @@ def upload_tier(
             path_in_repo=gguf_path.name,
             repo_id=repo_id,
             repo_type="model",
-            commit_message=f"APEX tier{tier} quantization",
+            commit_message=f"APEX {label} quantization",
         )
 
     if not _live_active:
-        log(f"✓ Uploaded tier{tier} → {repo_id}")
+        log(f"✓ Uploaded {label} → {repo_id}")
 
 
 # ---------------------------------------------------------------------------
@@ -1598,10 +1642,10 @@ def _s3_auth_headers(s3: dict, method: str, url: str,
 _S3_PART_SIZE = 64 * 1024 * 1024   # 64 MB per multipart part
 
 
-def _s3_progress(tier: int, sent: int):
+def _s3_progress(key: str, sent: int):
     """Update S3 upload progress in the live display."""
-    if _lc is not None and tier in _lc.s3_upload_progress:
-        _lc.s3_upload_progress[tier]["current"] = sent
+    if _lc is not None and key in _lc.s3_upload_progress:
+        _lc.s3_upload_progress[key]["current"] = sent
         if _lc.live is not None:
             _lc.live.update()
 
@@ -1632,7 +1676,7 @@ def _s3_put_part(url: str, s3: dict, data: bytes) -> str:
 
 @_retry_on_network_error
 def upload_tier_s3(
-    tier: int,
+    key: str,
     gguf_path: Path,
     s3: dict,
 ) -> None:
@@ -1649,10 +1693,11 @@ def upload_tier_s3(
 
     size = gguf_path.stat().st_size
     url = f"{s3['base_url']}/{s3['bucket']}/{gguf_path.name}"
+    label = f"tier{key}"
 
     _live_active = _HAS_RICH and _lc is not None and _lc.live is not None
     if not _live_active:
-        log(f"Uploading tier{tier} ({gguf_path.name}, {size / (1024**3):.2f} GB) "
+        log(f"Uploading {label} ({gguf_path.name}, {size / (1024**3):.2f} GB) "
             f"→ S3 {s3['bucket']}")
 
     if size <= _S3_PART_SIZE:
@@ -1665,7 +1710,7 @@ def upload_tier_s3(
                     if not chunk:
                         break
                     sent += len(chunk)
-                    _s3_progress(tier, sent)
+                    _s3_progress(key, sent)
                     yield chunk
 
         headers = _s3_auth_headers(s3, "PUT", url)
@@ -1674,14 +1719,14 @@ def upload_tier_s3(
             resp = client.put(url, content=_gen(), headers=headers)
             _s3_check(resp, "upload")
     else:
-        _s3_multipart_upload(tier, gguf_path, url, s3, size)
+        _s3_multipart_upload(key, gguf_path, url, s3, size)
 
     if not _live_active:
-        log(f"✓ Uploaded tier{tier} → S3 {s3['bucket']}")
+        log(f"✓ Uploaded {label} → S3 {s3['bucket']}")
 
 
 def _s3_multipart_upload(
-    tier: int,
+    key: str,
     gguf_path: Path,
     url: str,
     s3: dict,
@@ -1725,7 +1770,7 @@ def _s3_multipart_upload(
                         raise RuntimeError(
                             f"S3 part {i}/{n_parts}: missing ETag in response")
                     etags.append((i, etag))
-                    _s3_progress(tier, f.tell())
+                    _s3_progress(key, f.tell())
 
             # 3. complete
             parts_xml = "".join(
@@ -1790,6 +1835,7 @@ def run_pipeline(args):
         sys.exit(1)
 
     tiers = args.tiers
+    variants = expand_variants(tiers)
     output_dir = workspace / "quantized"
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1802,28 +1848,29 @@ def run_pipeline(args):
     log(f"  Model:    {args.model}")
     log(f"  Imatrix:  {args.imatrix}")
     log(f"  Output:   {output_base}")
-    log(f"  Tiers:    {tiers}")
+    log(f"  Tiers:    {', '.join(variant_label(t, sp) for t, sp in variants)}")
     log(f"  Workspace: {workspace}")
     if s3:
         auth_desc = ("static key" if s3["auth"]["mode"] == "sigv4" else "IAM token")
         log(f"  S3:       {s3['base_url']}  (bucket: {s3['bucket']}, auth: {auth_desc})")
     log("=" * 60)
 
-    # Migrate state: tiers uploaded before S3 support only went to HF.
+    # Migrate state: variants uploaded before S3 support only went to HF.
     if s3:
         migrated = False
-        for tier in tiers:
-            if state.tier_status(tier) == "uploaded" and not state.upload_done(tier, "hf"):
-                state.mark_upload_done(tier, "hf")
+        for tier, speed in variants:
+            key = variant_key(tier, speed)
+            if state.tier_status(key) == "uploaded" and not state.upload_done(key, "hf"):
+                state.mark_upload_done(key, "hf")
                 migrated = True
         if migrated:
-            log("✓ Marked previously uploaded tiers as HF-complete (S3 enabled)")
+            log("✓ Marked previously uploaded variants as HF-complete (S3 enabled)")
 
     if _lc:
         _lc.state = state
         _lc.source_ok = state.source_info() is not None
         _lc.imatrix_ok = state.imatrix_info() is not None
-        _lc.tiers = tiers
+        _lc.tiers = variants
 
     _init_live()
 
@@ -1975,29 +2022,32 @@ def run_pipeline(args):
     if _lc and _lc.live:
         _lc.live.update(_build_live_renderable())
     else:
-        display_status(state, source_ok=True, imatrix_ok=True, tiers=tiers)
+        display_status(state, source_ok=True, imatrix_ok=True, tiers=variants)
 
     needs_work = []
-    for tier in tiers:
-        st = state.tier_status(tier)
+    for tier, speed in variants:
+        key = variant_key(tier, speed)
+        label = variant_label(tier, speed)
+        st = state.tier_status(key)
         if st == "uploaded":
-            if s3 and not state.upload_done(tier, "s3"):
-                log(f"tier{tier}: already on HF, will upload to S3")
+            if s3 and not state.upload_done(key, "s3"):
+                log(f"{label}: already on HF, will upload to S3")
             else:
-                log(f"✓ tier{tier}: already uploaded, skipping")
+                log(f"✓ {label}: already uploaded, skipping")
                 continue
-        needs_work.append(tier)
+        needs_work.append((tier, speed))
 
     if not needs_work:
-        log("\n✅ All tiers completed. Nothing to do.")
-        _print_summary(state, tiers, output_base)
+        log("\n✅ All variants completed. Nothing to do.")
+        _print_summary(state, variants, output_base)
         if not args.dry_run:
             _upload_readme(readme_path, output_base, token)
         else:
             log(f"DRY RUN: would upload README.md → {output_base}")
         return
 
-    log(f"\nTiers to process: {needs_work}")
+    log(f"\nVariants to process: "
+        f"{[variant_label(t, sp) for t, sp in needs_work]}")
 
     # ── 3. Quantize + Upload pipeline ──
     # At any moment: 1 HF upload running, 1 S3 upload running (if enabled),
@@ -2008,97 +2058,104 @@ def run_pipeline(args):
     _init_live()
     upload_executor = ThreadPoolExecutor(max_workers=1)
     s3_executor = ThreadPoolExecutor(max_workers=1) if s3 else None
-    pending_uploads: list[tuple[int, str, Future]] = []   # (tier, target, Future)
+    # pending_uploads: ((tier, speed), target, Future)
+    pending_uploads: list = []
     _upload_queue_lock = threading.Lock()
 
-    def _active_start(t: int):
-        """Mark tier active in the display when its first upload starts."""
+    def _active_start(key: str):
+        """Mark variant active in the display when its first upload starts."""
         if _lc and _lc.live is not None:
             with _upload_queue_lock:
-                if t not in _lc.active_tiers:
-                    _lc.active_tiers[t] = {
+                if key not in _lc.active_tiers:
+                    _lc.active_tiers[key] = {
                         "status": "uploading",
                         "start": time.time(),
                         "last_line": "",
                     }
 
-    def _maybe_finish_upload(t: int, p: Path):
-        """Mark tier uploaded when every enabled target has finished."""
-        if not state.upload_done(t, "hf"):
+    def _maybe_finish_upload(key: str, p: Path):
+        """Mark variant uploaded when every enabled target has finished."""
+        if not state.upload_done(key, "hf"):
             return
-        if s3 is not None and not state.upload_done(t, "s3"):
+        if s3 is not None and not state.upload_done(key, "s3"):
             return
         sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
-        state.set_tier(t, "uploaded", size_mb=round(sz_gb * 1024, 1))
+        state.set_tier(key, "uploaded", size_mb=round(sz_gb * 1024, 1))
         if _lc:
             with _upload_queue_lock:
-                _lc.active_tiers.pop(t, None)
+                _lc.active_tiers.pop(key, None)
                 if _lc.live:
                     _lc.live.update(_build_live_renderable())
 
-    def _do_upload_hf(t: int, p: Path):
+    def _do_upload_hf(vk: tuple, p: Path):
         """Run in the HF executor thread: upload GGUF to HuggingFace."""
-        _active_start(t)
+        tier, speed = vk
+        key = variant_key(tier, speed)
+        _active_start(key)
         fsize = p.stat().st_size if p.exists() else 0
         if _lc and _lc.live is not None:
             with _upload_queue_lock:
-                _lc.upload_progress[t] = {"current": 0, "total": fsize,
-                                          "stage": "preparing"}
-        upload_tier(t, p, output_base, token)
-        state.mark_upload_done(t, "hf")
+                _lc.upload_progress[key] = {"current": 0, "total": fsize,
+                                            "stage": "preparing"}
+        upload_tier(key, p, output_base, token)
+        state.mark_upload_done(key, "hf")
         if _lc:
             with _upload_queue_lock:
-                _lc.upload_progress.pop(t, None)
+                _lc.upload_progress.pop(key, None)
         # README row tracks the HF copy
         sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
-        tier_name = f"tier{t}"
+        tier_name = variant_label(tier, speed)
         if readme_path.exists() and not _readme_has_tier(readme_path, tier_name):
             _append_readme_row(readme_path, tier_name, sz_gb)
-        _maybe_finish_upload(t, p)
+        _maybe_finish_upload(key, p)
 
-    def _do_upload_s3(t: int, p: Path):
+    def _do_upload_s3(vk: tuple, p: Path):
         """Run in the S3 executor thread: upload GGUF to S3 storage."""
-        _active_start(t)
+        tier, speed = vk
+        key = variant_key(tier, speed)
+        _active_start(key)
         fsize = p.stat().st_size if p.exists() else 0
         if _lc and _lc.live is not None:
             with _upload_queue_lock:
-                _lc.s3_upload_progress[t] = {"current": 0, "total": fsize}
-        upload_tier_s3(t, p, s3)
-        state.mark_upload_done(t, "s3")
+                _lc.s3_upload_progress[key] = {"current": 0, "total": fsize}
+        upload_tier_s3(key, p, s3)
+        state.mark_upload_done(key, "s3")
         if _lc:
             with _upload_queue_lock:
-                _lc.s3_upload_progress.pop(t, None)
-        _maybe_finish_upload(t, p)
+                _lc.s3_upload_progress.pop(key, None)
+        _maybe_finish_upload(key, p)
 
     def _check_completed_uploads():
         """Process all completed upload futures (non-blocking)."""
         nonlocal pending_uploads
         still_pending = []
-        for tier_p, target, fut in pending_uploads:
+        for vk, target, fut in pending_uploads:
             if not fut.done():
-                still_pending.append((tier_p, target, fut))
+                still_pending.append((vk, target, fut))
                 continue
+            key = variant_key(*vk)
+            label = variant_label(*vk)
             try:
                 fut.result()
                 if _lc:
                     with _upload_queue_lock:
                         if target == "hf":
-                            _lc.upload_progress.pop(tier_p, None)
+                            _lc.upload_progress.pop(key, None)
                         else:
-                            _lc.s3_upload_progress.pop(tier_p, None)
+                            _lc.s3_upload_progress.pop(key, None)
                     if _lc.live:
                         _lc.live.update(_build_live_renderable())
             except Exception as exc:
                 err = str(exc)[:300]
-                log_err(f"tier{tier_p} {target} upload failed: {err}")
-                state.set_tier(tier_p, "error", error=f"{target}: {err}",
+                log_err(f"{label} {target} upload failed: {err}")
+                state.set_tier(key, "error", error=f"{target}: {err}",
                                error_short=f"{target}: {err[:180]}")
                 if _lc:
                     with _upload_queue_lock:
                         if target == "hf":
-                            _lc.upload_progress.pop(tier_p, None)
+                            _lc.upload_progress.pop(key, None)
                         else:
-                            _lc.s3_upload_progress.pop(tier_p, None)
+                            _lc.s3_upload_progress.pop(key, None)
                     if _lc.live:
                         _lc.live.update(_build_live_renderable())
         pending_uploads = still_pending
@@ -2119,39 +2176,42 @@ def run_pipeline(args):
     # during quantize or upload kills the process immediately.
     with _allow_hard_interrupt():
         try:
-            for tier in needs_work:
+            for tier, speed in needs_work:
                 if _interruption_requested:
                     log("⚠ Pipeline interrupted by user.")
                     break
 
+                key = variant_key(tier, speed)
+                label = variant_label(tier, speed)
+
                 if args.dry_run:
-                    log(f"DRY RUN: would quantize and upload tier{tier}")
+                    log(f"DRY RUN: would quantize and upload {label}")
                     continue
 
-                output_gguf = output_dir / _tier_filename(source_gguf.name, tier)
-                st = state.tier_status(tier)
+                output_gguf = output_dir / _tier_filename(source_gguf.name, tier, speed)
+                st = state.tier_status(key)
 
                 # ── skip already uploaded ──
                 if st == "uploaded" and output_gguf.exists() and output_gguf.stat().st_size > 0:
-                    if s3 and not state.upload_done(tier, "s3"):
-                        log(f"tier{tier}: on HF, uploading to S3")
+                    if s3 and not state.upload_done(key, "s3"):
+                        log(f"{label}: on HF, uploading to S3")
                     else:
-                        log(f"✓ tier{tier}: already uploaded, skipping")
+                        log(f"✓ {label}: already uploaded, skipping")
                         continue
                 elif st == "quantizing":
-                    log(f"tier{tier}: was quantizing (interrupted) → will re-quantize")
+                    log(f"{label}: was quantizing (interrupted) → will re-quantize")
                     if output_gguf.exists():
                         output_gguf.unlink(missing_ok=True)
-                    state.set_tier(tier, "pending")
+                    state.set_tier(key, "pending")
                     st = "pending"
                 elif st == "uploading":
                     if output_gguf.exists() and output_gguf.stat().st_size > 0:
-                        log(f"tier{tier}: was uploading, output exists → will re-upload")
-                        state.set_tier(tier, "quantized")
+                        log(f"{label}: was uploading, output exists → will re-upload")
+                        state.set_tier(key, "quantized")
                         st = "quantized"
                     else:
-                        log(f"tier{tier}: was uploading, output missing → will re-quantize")
-                        state.set_tier(tier, "pending")
+                        log(f"{label}: was uploading, output missing → will re-quantize")
+                        state.set_tier(key, "pending")
                         st = "pending"
 
                 # ── collect completed uploads (non-blocking) ──
@@ -2163,34 +2223,34 @@ def run_pipeline(args):
                         # Verify file size matches what was recorded at
                         # quantize time; truncated files (Ctrl-C) must be
                         # re-quantized.
-                        expected_mb = state._t(tier).get("file_size_mb")
+                        expected_mb = state._t(key).get("file_size_mb")
                         actual_mb = round(output_gguf.stat().st_size / (1024**2), 1)
                         if expected_mb is None or abs(expected_mb - actual_mb) < 0.5:
-                            log(f"✓ tier{tier}: quantized file exists, skipping quantize")
-                            state.set_tier(tier, "quantized", size_mb=actual_mb,
+                            log(f"✓ {label}: quantized file exists, skipping quantize")
+                            state.set_tier(key, "quantized", size_mb=actual_mb,
                                            file_size_mb=actual_mb)
                         else:
-                            log(f"tier{tier}: size mismatch ({actual_mb} MB vs expected "
+                            log(f"{label}: size mismatch ({actual_mb} MB vs expected "
                                 f"{expected_mb} MB) → will re-quantize")
-                            state.set_tier(tier, "pending")
+                            state.set_tier(key, "pending")
                             st = "pending"
                     else:
-                        state.set_tier(tier, "quantizing")
+                        state.set_tier(key, "quantizing")
                         if _lc:
-                            _lc.active_tiers[tier] = {"status": "quantizing",
-                                                       "start": time.time(),
-                                                       "last_line": ""}
+                            _lc.active_tiers[key] = {"status": "quantizing",
+                                                     "start": time.time(),
+                                                     "last_line": ""}
                         t0 = time.time()
                         try:
-                            run_quantize(tier, source_gguf, imatrix_path, output_gguf)
+                            run_quantize(tier, speed, source_gguf, imatrix_path, output_gguf)
                         except Exception as exc:
                             err = str(exc)[:300]
-                            log_err(f"tier{tier} quantize failed: {err}")
-                            state.set_tier(tier, "error", error=str(exc)[:300],
+                            log_err(f"{label} quantize failed: {err}")
+                            state.set_tier(key, "error", error=str(exc)[:300],
                                            error_short=err[:200])
-                            failed.append(tier)
+                            failed.append((tier, speed))
                             if _lc:
-                                _lc.active_tiers.pop(tier, None)
+                                _lc.active_tiers.pop(key, None)
                             if output_gguf.exists() and output_gguf.stat().st_size == 0:
                                 output_gguf.unlink(missing_ok=True)
                             continue
@@ -2198,15 +2258,15 @@ def run_pipeline(args):
                         m, s = divmod(int(elapsed), 60)
                         h, m = divmod(m, 60)
                         sz_mb = output_gguf.stat().st_size / (1024**2)
-                        log(f"✓ tier{tier}: quantized in {h:02d}:{m:02d}:{s:02d}  "
+                        log(f"✓ {label}: quantized in {h:02d}:{m:02d}:{s:02d}  "
                             f"({sz_mb:.1f} MB)")
-                        state.set_tier(tier, "quantized", size_mb=round(sz_mb, 1),
+                        state.set_tier(key, "quantized", size_mb=round(sz_mb, 1),
                                        file_size_mb=round(sz_mb, 1))
                         if _lc:
-                            _lc.active_tiers.pop(tier, None)
+                            _lc.active_tiers.pop(key, None)
 
                 if not (_lc and _lc.live):
-                    display_status(state, True, True, tiers=tiers)
+                    display_status(state, True, True, tiers=variants)
 
                 # ── skip upload if interrupted ──
                 if _interruption_requested:
@@ -2217,15 +2277,15 @@ def run_pipeline(args):
                 # executor's single worker finishes the previous upload.
                 # HF and S3 uploads run in parallel (separate executors),
                 # so at most one quant uploads to HF and one to S3.
-                state.set_tier(tier, "uploading")
-                info = state._t(tier)
+                state.set_tier(key, "uploading")
+                info = state._t(key)
                 if not info.get("hf_done"):
-                    fut = upload_executor.submit(_do_upload_hf, tier, output_gguf)
-                    pending_uploads.append((tier, "hf", fut))
+                    fut = upload_executor.submit(_do_upload_hf, (tier, speed), output_gguf)
+                    pending_uploads.append(((tier, speed), "hf", fut))
                 if s3 is not None and not info.get("s3_done"):
-                    fut = s3_executor.submit(_do_upload_s3, tier, output_gguf)
-                    pending_uploads.append((tier, "s3", fut))
-                processed.append(tier)
+                    fut = s3_executor.submit(_do_upload_s3, (tier, speed), output_gguf)
+                    pending_uploads.append(((tier, speed), "s3", fut))
+                processed.append((tier, speed))
 
             # ── collect any remaining completions ──
             _wait_all_uploads()
@@ -2251,12 +2311,12 @@ def run_pipeline(args):
     # ── 4. Cleanup incomplete outputs ──
     if not args.dry_run and not args.keep_files:
         _cleanup_incomplete(state, output_dir,
-                            source_name=source_gguf.name, tiers=tiers)
+                            source_name=source_gguf.name, variants=variants)
     elif args.keep_files:
         log("✓ --keep-files: quantized files are kept in " + str(output_dir))
 
     # ── 5. Final report ──
-    _print_summary(state, tiers, output_base)
+    _print_summary(state, variants, output_base)
 
     # ── 6. Upload README to output repo ──
     if readme_path.exists():
@@ -2268,20 +2328,21 @@ def run_pipeline(args):
 
 
 def _cleanup_incomplete(state: BatchState, output_dir: Path,
-                        source_name: str = "", tiers: list = None):
+                        source_name: str = "", variants: list = None):
     """Delete quantized GGUFs that were interrupted mid-quantize.
 
     Preserves files whose quantization completed (status 'quantized',
     'uploading', 'error') so that a re-run only retries the upload.
     """
-    if tiers is None:
-        tiers = TIERS
+    if variants is None:
+        variants = expand_variants(TIERS)
     count = 0
-    for tier in tiers:
-        st = state.tier_status(tier)
+    for tier, speed in variants:
+        key = variant_key(tier, speed)
+        st = state.tier_status(key)
         if st != "quantizing":
             continue
-        gguf = output_dir / _tier_filename(source_name, tier)
+        gguf = output_dir / _tier_filename(source_name, tier, speed)
         if gguf.exists():
             sz = gguf.stat().st_size / (1024**3)
             gguf.unlink()
@@ -2291,7 +2352,7 @@ def _cleanup_incomplete(state: BatchState, output_dir: Path,
         log(f"Cleaned up {count} incomplete file(s).")
 
 
-def _print_summary(state: BatchState, tiers: list, output_base: str):
+def _print_summary(state: BatchState, variants: list, output_base: str):
     """Print a final summary table."""
     log("\n" + "=" * 60)
     log("  Final Report")
@@ -2301,44 +2362,46 @@ def _print_summary(state: BatchState, tiers: list, output_base: str):
     quantized_pending = []
     errors = []
 
-    for tier in tiers:
-        st = state.tier_status(tier)
-        info = state._t(tier)
+    for tier, speed in variants:
+        key = variant_key(tier, speed)
+        label = variant_label(tier, speed)
+        st = state.tier_status(key)
+        info = state._t(key)
         sz = info.get("size_mb", "?")
         if st == "uploaded":
-            uploaded.append((tier, sz))
+            uploaded.append((label, sz))
         elif st in ("quantized", "quantizing", "uploading"):
-            quantized_pending.append((tier, st))
+            quantized_pending.append((label, st))
         elif st == "error":
-            errors.append((tier, info.get("error_short", "unknown")))
-        # pending tiers just sit in neither list
+            errors.append((label, info.get("error_short", "unknown")))
+        # pending variants just sit in neither list
 
-    pending_count = len(tiers) - len(uploaded) - len(quantized_pending) - len(errors)
+    pending_count = len(variants) - len(uploaded) - len(quantized_pending) - len(errors)
 
     log(f"\n  Repo: https://huggingface.co/{output_base}")
 
     if uploaded:
         log(f"\n  ✅ Uploaded ({len(uploaded)}):")
-        for tier, sz in uploaded:
-            log(f"     tier{tier:<3}  {sz} MB")
+        for label, sz in uploaded:
+            log(f"     {label:<9}  {sz} MB")
 
     if quantized_pending:
         log(f"\n  📦 Quantized but not uploaded ({len(quantized_pending)}):")
-        for tier, st in quantized_pending:
-            log(f"     tier{tier:<3}  (status: {st})")
+        for label, st in quantized_pending:
+            log(f"     {label:<9}  (status: {st})")
 
     if errors:
         log(f"\n  ❌ Errors ({len(errors)}):")
-        for tier, err in errors:
-            log(f"     tier{tier:<3}  {err}")
+        for label, err in errors:
+            log(f"     {label:<9}  {err}")
 
     if pending_count > 0:
         log(f"\n  ○  Not started: {pending_count}")
 
-    failed_quant = [t for t, _ in errors]
-    not_uploaded = [t for t, _ in quantized_pending]
+    failed_quant = [lbl for lbl, _ in errors]
+    not_uploaded = [lbl for lbl, _ in quantized_pending]
     if failed_quant or not_uploaded:
-        log(f"\n  ⚠  Incomplete tiers: {sorted(failed_quant + not_uploaded)}")
+        log(f"\n  ⚠  Incomplete variants: {sorted(failed_quant + not_uploaded)}")
         log("     Re-run the script with the same arguments to retry.")
 
     log("\n" + "=" * 60)
@@ -2392,7 +2455,9 @@ def main():
                         help="HF repo id for all output tiers (org/name), "
                              "e.g. user/model-APEX")
     parser.add_argument("--tiers", default="1-13",
-                        help="Tier spec: '1-13', '1-10,13', '3-8', '1,5,7' (default: 1-13)")
+                        help="Tier spec: '1-13', '1-10,13', '3-8', '1,5,7' "
+                             "(default: 1-13; tiers 7-15 are each produced in "
+                             "two variants: normal and -s with --speed)")
     parser.add_argument("--workspace", "-w",
                         default=str(Path.home() / "apex_batch"),
                         help="Workspace directory for state & intermediate files "
@@ -2430,8 +2495,8 @@ def main():
     args = parser.parse_args()
     args.tiers = _parse_tiers(args.tiers)
 
-    if not args.tiers or not all(1 <= t <= 13 for t in args.tiers):
-        log_err("--tiers must be in range 1-13")
+    if not args.tiers or not all(1 <= t <= 15 for t in args.tiers):
+        log_err("--tiers must be in range 1-15")
         sys.exit(1)
 
     try:
