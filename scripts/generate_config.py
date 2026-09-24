@@ -9,9 +9,9 @@ Usage:
   ./scripts/generate_config.py --profile tier7 --layers 40 -o configs/my_config.txt
 
 MoE tier profiles (--arch moe, default):
-  tier1–tier13  Quality-rank indices for each tensor role (experts, shared
+  tier1–tier15  Quality-rank indices for each tensor role (experts, shared
                 experts, attention, embeddings). The ranks step down from
-                tier1 (near-full precision) to tier13 (IQ1/IQ2 band); the
+                tier1 (near-full precision) to tier15 (IQ1/IQ2 band); the
                 concrete quant per rank depends on the quant mode (below).
   i-tierN       Same as tierN (use with --imatrix at quantize time).
 
@@ -29,9 +29,9 @@ e.g. Qwen3.8-27B: 64 layers, 48 linear-attention + 16 full-attention):
 Quant mode (default: speed):
   Profiles assign quality-rank indices; the mode selects which ranked table
   maps each index to a concrete quant type.
-  --speed  QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) for all tensors. Default.
+  --speed  QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) for all tensors.
   --size   QUANTS_RANKED_SIZE (IQ4_NL/IQ3_S/IQ2_S) for all tensors.
-  --mixed  Experts use QUANTS_RANKED_SIZE, everything else QUANTS_RANKED_SPEED.
+  --mixed  Experts use QUANTS_RANKED_SIZE, everything else QUANTS_RANKED_SPEED. Default.
 
 Profile modifiers (used with profiles, positive = lower quality, negative = higher):
   --edge-exp N      Shift edge-expert quality by N steps
@@ -61,7 +61,6 @@ QUANTS_RANKED_SIZE = [
     "IQ3_S",      # 4
     "IQ2_S",      # 5
     "IQ1_M",      # 6
-    "IQ1_S",      # 7
 ]
 
 QUANTS_RANKED_SPEED = [
@@ -71,12 +70,11 @@ QUANTS_RANKED_SPEED = [
     "Q4_K",       # 3
     "Q3_K",       # 4
     "Q2_K",       # 5
-    "IQ1_M",      # 6
-    "IQ1_S",      # 7
+    "IQ1_S",      # 6
 ]
 
 
-_quant_mode = "speed"  # "mixed" | "speed" | "size"
+_quant_mode = "mixed"  # "mixed" | "speed" | "size"
 
 
 def ranked_quant(index, role="expert"):
@@ -119,6 +117,8 @@ PROFILES = {
     "tier11":       (4, 4, 5, 0, 1, 3, 3, 2),
     "tier12":       (4, 5, 5, 0, 1, 3, 3, 2),
     "tier13":       (5, 5, 5, 0, 1, 4, 4, 3),
+    "tier14":       (5, 5, 6, 0, 1, 4, 4, 3),
+    "tier15":       (5, 6, 6, 0, 1, 4, 4, 3),
 }
 
 DENSE_PROFILES = {"dense-flat", "dense-grad", "dense-hybrid", "dense-hybrid-quality"}
@@ -432,7 +432,7 @@ def generate_dense(cfg):
 def main(argv=None):
     global _quant_mode
     args = parse_args(argv)
-    _quant_mode = args.quant_mode or "speed"
+    _quant_mode = args.quant_mode or "mixed"
     cfg = resolve_profile(args)
 
     if cfg["arch"] == "dense":

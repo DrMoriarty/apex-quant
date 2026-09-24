@@ -344,6 +344,8 @@ def main():
         "tier11": "Q5_K", 
         "tier12": "Q5_K", 
         "tier13": "Q4_K", 
+        "tier14": "Q4_K", 
+        "tier14": "Q4_K", 
     }
     base = base_type_map.get(profile, args.base_type).upper()
 

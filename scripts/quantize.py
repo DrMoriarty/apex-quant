@@ -18,7 +18,7 @@ Usage:
   ./scripts/quantize.py --profile tier5 --dry-run input.gguf
 
 Profiles:
-  tier1–tier13   MoE tier profiles (tier1 = near-full precision, tier13 = IQ1/IQ2 band)
+  tier1–tier15   MoE tier profiles (tier1 = near-full precision, tier15 = IQ1/IQ2 band)
   i-tierN        Same as tierN, for use with --imatrix
   dense-*        Dense/hybrid profiles: dense-flat, dense-grad, dense-hybrid,
                  dense-hybrid-quality
@@ -162,6 +162,8 @@ def main():
         "tier11": "Q5_K_M", 
         "tier12": "Q5_K_M", 
         "tier13": "Q4_K_M", 
+        "tier14": "Q4_K_M", 
+        "tier15": "Q4_K_M", 
     }
     args.base_type = base_type_map.get(args.profile, args.base_type)
 
