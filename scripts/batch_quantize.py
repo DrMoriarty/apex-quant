@@ -17,6 +17,9 @@ Concurrency:
     (so Ctrl+C can interrupt them)
   * tiers are quantized sequentially, but tier N upload overlaps with
     tier N+1 quantization (upload runs in a background thread)
+  * when S3 upload is enabled (--s3-endpoint/--s3-token), each tier is
+    uploaded to HF and to S3 in parallel: at most one quant is being
+    uploaded to HF and at most one to S3 at any given moment
 
 Usage:
   python3 scripts/batch_quantize.py \\
@@ -26,8 +29,21 @@ Usage:
 
 Output repo: {output}  (all tier GGUFs in one repo)
 
+S3 upload (optional, S3-compatible API e.g. Yandex Object Storage):
+  The bucket must be embedded in the endpoint URL:
+      https://storage.yandexcloud.net/<bucket>/
+      https://<bucket>.storage.yandexcloud.net/
+  Authentication: static access keys (S3_KEY_ID + S3_SECRET, AWS SigV4
+  signing — recommended for long runs) or an IAM token (S3_TOKEN,
+  Authorization: Bearer, expires in ~12 h).
+
 Environment / .env:
-  HF_TOKEN   HuggingFace access token
+  HF_TOKEN     HuggingFace access token
+  S3_ENDPOINT  S3 endpoint URL with bucket (enables S3 upload)
+  S3_KEY_ID    S3 static access key id (with S3_SECRET)
+  S3_SECRET    S3 static access secret key
+  S3_TOKEN     S3 IAM token (alternative to static keys)
+  S3_REGION    S3 region for SigV4 signing (default: ru-central1)
 """
 
 import argparse
@@ -43,10 +59,11 @@ import tempfile
 import threading
 import time
 import tty
-from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from concurrent.futures import Future, ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -272,6 +289,14 @@ class BatchState:
         self.data["readme_tiers"] = sorted(tiers)
         self.save()
 
+    # -- per-target upload helpers (hf / s3) --
+    def upload_done(self, tier: int, target: str) -> bool:
+        return bool(self._t(tier).get(f"{target}_done"))
+
+    def mark_upload_done(self, tier: int, target: str):
+        self._t(tier)[f"{target}_done"] = True
+        self.save()
+
 
 # ---------------------------------------------------------------------------
 # Rich display  (optional — falls back to plain text)
@@ -306,6 +331,7 @@ class _LiveContext:
         self.live: Optional["_RichLive"] = None
         self.active_tiers: dict[int, dict] = {}
         self.upload_progress: dict[int, dict] = {}
+        self.s3_upload_progress: dict[int, dict] = {}
         self.downloads: dict[str, dict] = {}
         self.state: Optional["BatchState"] = None
         self.source_ok: bool = False
@@ -615,6 +641,10 @@ def _render_active_tier(tier: int, active: dict, lc) -> "Text":
         return Text(f" {frame} quantizing… {elapsed_str}", style="yellow")
     elif st == "uploading":
         prog = lc.upload_progress.get(tier)
+        target_tag = ""
+        if not prog or prog.get("total", 0) <= 0:
+            prog = lc.s3_upload_progress.get(tier)
+            target_tag = "s3 "
         if prog and prog.get("total", 0) > 0:
             cur = prog["current"]
             total = prog["total"]
@@ -632,14 +662,14 @@ def _render_active_tier(tier: int, active: dict, lc) -> "Text":
                 eh, em = divmod(em, 60)
                 eta_str = f"{em:02d}:{es:02d}" if not eh else f"{eh}:{em:02d}:{es:02d}"
                 return Text(
-                    f" ↑ {bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str} ETA {eta_str}",
+                    f" ↑ {target_tag}{bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str} ETA {eta_str}",
                     style="magenta",
                 )
             return Text(
-                f" ↑ {bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str}",
+                f" ↑ {target_tag}{bar} {cur_mb:.0f}/{total_mb:.0f} MB {pct:.0f}% {elapsed_str}",
                 style="magenta",
             )
-        return Text(f" {frame} uploading… {elapsed_str}", style="magenta")
+        return Text(f" {frame} uploading{(' ' + target_tag.strip()) if target_tag else ''}… {elapsed_str}", style="magenta")
     else:
         return Text(f" ? {st}", style="dim")
 
@@ -647,9 +677,14 @@ def _render_active_tier(tier: int, active: dict, lc) -> "Text":
 def _format_active_info(tier: int, active: dict, state: BatchState) -> str:
     """Return hint text for active tier's info column."""
     last = active.get("last_line", "")
-    if not last:
-        return ""
-    return last
+    parts = []
+    if last:
+        parts.append(last)
+    s3p = _lc.s3_upload_progress.get(tier) if _lc else None
+    if s3p and s3p.get("total", 0) > 0:
+        pct = s3p["current"] / s3p["total"] * 100
+        parts.append(f"S3 {pct:.0f}% ({s3p['current'] / (1024**2):.0f} MB)")
+    return " · ".join(parts)
 
 
 class _Capture:
@@ -1400,6 +1435,336 @@ def upload_tier(
 
 
 # ---------------------------------------------------------------------------
+# S3 upload (optional, S3-compatible API e.g. Yandex Object Storage)
+# ---------------------------------------------------------------------------
+
+def _parse_s3_endpoint(endpoint: str) -> tuple[str, str]:
+    """Extract (base_url, bucket) from an S3 endpoint URL.
+
+    The bucket must be embedded in the URL, either as a path segment or
+    as a subdomain:
+      https://storage.yandexcloud.net/<bucket>/   → path form
+      https://<bucket>.storage.yandexcloud.net/   → subdomain form
+    """
+    ep = endpoint.strip()
+    if "://" not in ep:
+        ep = "https://" + ep
+    u = urlsplit(ep)
+    scheme = u.scheme or "https"
+    netloc = u.netloc
+    path = u.path.strip("/")
+    if path:
+        return f"{scheme}://{netloc}", path.split("/", 1)[0]
+    host = (u.hostname or "").lower()
+    labels = host.split(".")
+    if host == "storage.yandexcloud.net" or len(labels) < 3:
+        raise ValueError(
+            f"Cannot determine S3 bucket from endpoint '{endpoint}'. "
+            f"Use https://storage.yandexcloud.net/<bucket>/ or "
+            f"https://<bucket>.storage.yandexcloud.net/")
+    bucket_host = ".".join(labels[1:])
+    if u.port:
+        bucket_host = f"{bucket_host}:{u.port}"
+    return f"{scheme}://{bucket_host}", labels[0]
+
+
+def _get_s3_settings(args) -> Optional[dict]:
+    """Resolve S3 settings from CLI args / env (.env), or None if disabled.
+
+    Authentication modes (in priority order):
+      * static keys — S3_KEY_ID + S3_SECRET (AWS SigV4 signing, does not
+        expire; recommended for long batch runs)
+      * IAM token — S3_TOKEN (Authorization: Bearer, expires in ~12 h)
+    """
+    endpoint = getattr(args, "s3_endpoint", None) or os.environ.get("S3_ENDPOINT")
+    key_id = getattr(args, "s3_key_id", None) or os.environ.get("S3_KEY_ID")
+    secret = getattr(args, "s3_secret", None) or os.environ.get("S3_SECRET")
+    token = getattr(args, "s3_token", None) or os.environ.get("S3_TOKEN")
+
+    if not endpoint and not (key_id or secret or token):
+        return None
+    if not endpoint:
+        log_err("S3 auth found but --s3-endpoint (or S3_ENDPOINT in .env) "
+                "is missing.")
+        sys.exit(1)
+
+    if key_id and secret:
+        auth = {"mode": "sigv4", "key_id": key_id, "secret": secret}
+    elif key_id or secret:
+        log_err("Incomplete S3 static keys: both --s3-key-id and --s3-secret "
+                "(or S3_KEY_ID / S3_SECRET in .env) are required.")
+        sys.exit(1)
+    elif token:
+        auth = {"mode": "bearer", "token": token}
+    else:
+        log_err("No S3 credentials: set S3_KEY_ID + S3_SECRET (static keys) "
+                "or S3_TOKEN (IAM token) in .env.")
+        sys.exit(1)
+
+    try:
+        base_url, bucket = _parse_s3_endpoint(endpoint)
+    except ValueError as exc:
+        log_err(str(exc))
+        sys.exit(1)
+    return {"base_url": base_url, "bucket": bucket, "auth": auth}
+
+
+# ---------------------------------------------------------------------------
+# AWS SigV4 request signing (for static-key authentication)
+# ---------------------------------------------------------------------------
+
+def _aws_sigv4_headers(method: str, url: str, key_id: str, secret: str,
+                       body: Optional[bytes] = None) -> dict:
+    """Build AWS Signature Version 4 headers for an S3 request.
+
+    Signs host, x-amz-content-sha256 and x-amz-date.  When *body* is None
+    the payload is streamed and declared as UNSIGNED-PAYLOAD; when bytes
+    are given their real hash is used.
+    """
+    import hashlib
+    import hmac
+
+    u = urlsplit(url)
+    host = u.netloc
+    region = os.environ.get("S3_REGION", "ru-central1")
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    datestamp = amz_date[:8]
+    payload_hash = (hashlib.sha256(body).hexdigest()
+                    if body is not None else "UNSIGNED-PAYLOAD")
+
+    canonical_uri = u.path or "/"
+    if u.query:
+        pairs = []
+        for part in u.query.split("&"):
+            k, _, v = part.partition("=")
+            pairs.append((_uri_encode(k), _uri_encode(v)))
+        pairs.sort()
+        canonical_query = "&".join(f"{k}={v}" for k, v in pairs)
+    else:
+        canonical_query = ""
+
+    canonical_headers = (
+        f"host:{host}\n"
+        f"x-amz-content-sha256:{payload_hash}\n"
+        f"x-amz-date:{amz_date}\n")
+    signed_headers = "host;x-amz-content-sha256;x-amz-date"
+
+    canonical_request = "\n".join([
+        method, canonical_uri, canonical_query,
+        canonical_headers, signed_headers, payload_hash,
+    ])
+    scope = f"{datestamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join([
+        "AWS4-HMAC-SHA256", amz_date, scope,
+        hashlib.sha256(canonical_request.encode()).hexdigest(),
+    ])
+
+    def _h(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode(), hashlib.sha256).digest()
+
+    k = _h(("AWS4" + secret).encode(), datestamp)
+    k = _h(k, region)
+    k = _h(k, "s3")
+    k = _h(k, "aws4_request")
+    signature = hmac.new(k, string_to_sign.encode(),
+                         hashlib.sha256).hexdigest()
+
+    return {
+        "Authorization": (
+            f"AWS4-HMAC-SHA256 Credential={key_id}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}"),
+        "x-amz-date": amz_date,
+        "x-amz-content-sha256": payload_hash,
+    }
+
+
+def _uri_encode(s: str) -> str:
+    """RFC 3986 URI-encode (AWS SigV4 flavour: keep unreserved chars)."""
+    import urllib.parse
+    return urllib.parse.quote(s, safe="-_.~")
+
+
+def _s3_auth_headers(s3: dict, method: str, url: str,
+                     body: Optional[bytes] = None) -> dict:
+    """Return authentication headers for an S3 request."""
+    auth = s3["auth"]
+    if auth["mode"] == "sigv4":
+        return _aws_sigv4_headers(method, url, auth["key_id"],
+                                  auth["secret"], body)
+    return {"Authorization": f"Bearer {auth['token']}"}
+
+
+_S3_PART_SIZE = 64 * 1024 * 1024   # 64 MB per multipart part
+
+
+def _s3_progress(tier: int, sent: int):
+    """Update S3 upload progress in the live display."""
+    if _lc is not None and tier in _lc.s3_upload_progress:
+        _lc.s3_upload_progress[tier]["current"] = sent
+        if _lc.live is not None:
+            _lc.live.update()
+
+
+def _s3_check(resp: httpx.Response, what: str):
+    """Raise with server details on a non-2xx S3 response."""
+    if resp.status_code >= 300:
+        raise RuntimeError(
+            f"S3 {what} failed: HTTP {resp.status_code}: {resp.text[:300]}")
+
+
+@_retry_on_network_error
+def _s3_put_part(url: str, s3: dict, data: bytes) -> str:
+    """PUT a single multipart part, return its ETag. Retries on network
+    errors and transient server errors (5xx/429)."""
+    headers = _s3_auth_headers(s3, "PUT", url, data)
+    headers["Content-Length"] = str(len(data))
+    with httpx.Client(timeout=httpx.Timeout(600, connect=30)) as client:
+        resp = client.put(url, content=data, headers=headers)
+        if resp.status_code >= 500 or resp.status_code == 429:
+            # Re-raised as httpx error so _retry_on_network_error retries it.
+            raise httpx.HTTPStatusError(
+                f"S3 part upload HTTP {resp.status_code}",
+                request=resp.request, response=resp)
+        _s3_check(resp, "part upload")
+        return resp.headers.get("ETag", "")
+
+
+@_retry_on_network_error
+def upload_tier_s3(
+    tier: int,
+    gguf_path: Path,
+    s3: dict,
+) -> None:
+    """Upload a quantized GGUF to an S3-compatible storage.
+
+    Files larger than _S3_PART_SIZE are uploaded via multipart upload
+    (simple PUT is rejected by the storage frontend for large bodies
+    with HTTP 413).  Authentication: static keys (SigV4) or IAM token.
+    """
+    if not gguf_path.exists():
+        raise FileNotFoundError(f"GGUF file not found for upload: {gguf_path}")
+    if gguf_path.stat().st_size == 0:
+        raise ValueError(f"GGUF file is empty: {gguf_path}")
+
+    size = gguf_path.stat().st_size
+    url = f"{s3['base_url']}/{s3['bucket']}/{gguf_path.name}"
+
+    _live_active = _HAS_RICH and _lc is not None and _lc.live is not None
+    if not _live_active:
+        log(f"Uploading tier{tier} ({gguf_path.name}, {size / (1024**3):.2f} GB) "
+            f"→ S3 {s3['bucket']}")
+
+    if size <= _S3_PART_SIZE:
+        # Simple PUT — small files fit in a single request (unsigned payload).
+        def _gen():
+            sent = 0
+            with open(gguf_path, "rb") as f:
+                while True:
+                    chunk = f.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    sent += len(chunk)
+                    _s3_progress(tier, sent)
+                    yield chunk
+
+        headers = _s3_auth_headers(s3, "PUT", url)
+        headers["Content-Length"] = str(size)
+        with httpx.Client(timeout=httpx.Timeout(600, connect=30)) as client:
+            resp = client.put(url, content=_gen(), headers=headers)
+            _s3_check(resp, "upload")
+    else:
+        _s3_multipart_upload(tier, gguf_path, url, s3, size)
+
+    if not _live_active:
+        log(f"✓ Uploaded tier{tier} → S3 {s3['bucket']}")
+
+
+def _s3_multipart_upload(
+    tier: int,
+    gguf_path: Path,
+    url: str,
+    s3: dict,
+    size: int,
+):
+    """Multipart upload: initiate → sequential part PUTs → complete.
+
+    Each part PUT is retried independently on network errors; on any
+    unrecoverable failure the multipart upload is aborted server-side.
+    """
+    import re as _re
+
+    part_size = _S3_PART_SIZE
+    n_parts = (size + part_size - 1) // part_size
+    timeout = httpx.Timeout(600, connect=30)
+
+    with httpx.Client(timeout=timeout) as client:
+        # 1. initiate
+        resp = client.post(f"{url}?uploads=",
+                           headers=_s3_auth_headers(s3, "POST",
+                                                    f"{url}?uploads="))
+        _s3_check(resp, "multipart initiate")
+        m = _re.search(r"<UploadId>([^<]+)</UploadId>", resp.text)
+        if not m:
+            raise RuntimeError(
+                f"S3 multipart initiate: no UploadId in response: "
+                f"{resp.text[:300]}")
+        upload_id = m.group(1)
+
+        # 2. parts
+        etags: list[tuple[int, str]] = []
+        try:
+            with open(gguf_path, "rb") as f:
+                for i in range(1, n_parts + 1):
+                    chunk = f.read(part_size)
+                    if not chunk:
+                        break
+                    part_url = (f"{url}?partNumber={i}&uploadId={upload_id}")
+                    etag = _s3_put_part(part_url, s3, chunk)
+                    if not etag:
+                        raise RuntimeError(
+                            f"S3 part {i}/{n_parts}: missing ETag in response")
+                    etags.append((i, etag))
+                    _s3_progress(tier, f.tell())
+
+            # 3. complete
+            parts_xml = "".join(
+                f"<Part><PartNumber>{n}</PartNumber>"
+                f"<ETag>{_escape_xml(etag)}</ETag></Part>"
+                for n, etag in etags)
+            complete_xml = (
+                "<CompleteMultipartUpload>"
+                f"{parts_xml}</CompleteMultipartUpload>")
+            body = complete_xml.encode()
+            resp = client.post(
+                f"{url}?uploadId={upload_id}",
+                content=body,
+                headers={**_s3_auth_headers(s3, "POST",
+                                            f"{url}?uploadId={upload_id}",
+                                            body),
+                         "Content-Type": "application/xml",
+                         "Content-Length": str(len(body))},
+            )
+            _s3_check(resp, "multipart complete")
+        except BaseException:
+            # Abort server-side so no orphaned parts linger in the bucket.
+            try:
+                with httpx.Client(timeout=timeout) as abort_client:
+                    abort_client.delete(
+                        f"{url}?uploadId={upload_id}",
+                        headers=_s3_auth_headers(s3, "DELETE",
+                                                 f"{url}?uploadId={upload_id}"))
+            except Exception:
+                pass
+            raise
+
+
+def _escape_xml(s: str) -> str:
+    return (s.replace("&", "&amp;").replace("<", "&lt;")
+             .replace(">", "&gt;"))
+
+
+# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
@@ -1410,6 +1775,8 @@ def run_pipeline(args):
     if not token:
         log_err("No HF token found. Set HF_TOKEN in .env or pass --token.")
         sys.exit(1)
+
+    s3 = _get_s3_settings(args)
 
     workspace = Path(args.workspace).resolve()
     workspace.mkdir(parents=True, exist_ok=True)
@@ -1437,7 +1804,20 @@ def run_pipeline(args):
     log(f"  Output:   {output_base}")
     log(f"  Tiers:    {tiers}")
     log(f"  Workspace: {workspace}")
+    if s3:
+        auth_desc = ("static key" if s3["auth"]["mode"] == "sigv4" else "IAM token")
+        log(f"  S3:       {s3['base_url']}  (bucket: {s3['bucket']}, auth: {auth_desc})")
     log("=" * 60)
+
+    # Migrate state: tiers uploaded before S3 support only went to HF.
+    if s3:
+        migrated = False
+        for tier in tiers:
+            if state.tier_status(tier) == "uploaded" and not state.upload_done(tier, "hf"):
+                state.mark_upload_done(tier, "hf")
+                migrated = True
+        if migrated:
+            log("✓ Marked previously uploaded tiers as HF-complete (S3 enabled)")
 
     if _lc:
         _lc.state = state
@@ -1601,8 +1981,11 @@ def run_pipeline(args):
     for tier in tiers:
         st = state.tier_status(tier)
         if st == "uploaded":
-            log(f"✓ tier{tier}: already uploaded, skipping")
-            continue
+            if s3 and not state.upload_done(tier, "s3"):
+                log(f"tier{tier}: already on HF, will upload to S3")
+            else:
+                log(f"✓ tier{tier}: already uploaded, skipping")
+                continue
         needs_work.append(tier)
 
     if not needs_work:
@@ -1617,56 +2000,105 @@ def run_pipeline(args):
     log(f"\nTiers to process: {needs_work}")
 
     # ── 3. Quantize + Upload pipeline ──
-    # At any moment: 1 upload running (executor queue), 1 quantize running.
-    # Uploads go to a single-threaded executor queue immediately; the live
-    # display shows only the tier whose upload is *currently executing*
-    # (set via callback inside _do_upload), not every queued tier.
+    # At any moment: 1 HF upload running, 1 S3 upload running (if enabled),
+    # 1 quantize running.  HF and S3 uploads run in parallel, each via its
+    # own single-threaded executor queue.  The live display shows only the
+    # tier whose upload is *currently executing* (set via callback inside
+    # the upload workers), not every queued tier.
     _init_live()
     upload_executor = ThreadPoolExecutor(max_workers=1)
-    pending_uploads: list[tuple[int, "Future"]] = []   # (tier, Future)
+    s3_executor = ThreadPoolExecutor(max_workers=1) if s3 else None
+    pending_uploads: list[tuple[int, str, Future]] = []   # (tier, target, Future)
     _upload_queue_lock = threading.Lock()
 
-    def _do_upload_and_record(t: int, p: Path):
-        """Run in the executor thread: upload GGUF + mark uploaded + append README row immediately."""
+    def _active_start(t: int):
+        """Mark tier active in the display when its first upload starts."""
+        if _lc and _lc.live is not None:
+            with _upload_queue_lock:
+                if t not in _lc.active_tiers:
+                    _lc.active_tiers[t] = {
+                        "status": "uploading",
+                        "start": time.time(),
+                        "last_line": "",
+                    }
+
+    def _maybe_finish_upload(t: int, p: Path):
+        """Mark tier uploaded when every enabled target has finished."""
+        if not state.upload_done(t, "hf"):
+            return
+        if s3 is not None and not state.upload_done(t, "s3"):
+            return
+        sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
+        state.set_tier(t, "uploaded", size_mb=round(sz_gb * 1024, 1))
+        if _lc:
+            with _upload_queue_lock:
+                _lc.active_tiers.pop(t, None)
+                if _lc.live:
+                    _lc.live.update(_build_live_renderable())
+
+    def _do_upload_hf(t: int, p: Path):
+        """Run in the HF executor thread: upload GGUF to HuggingFace."""
+        _active_start(t)
         fsize = p.stat().st_size if p.exists() else 0
         if _lc and _lc.live is not None:
             with _upload_queue_lock:
-                _lc.active_tiers[t] = {
-                    "status": "uploading",
-                    "start": time.time(),
-                    "last_line": "",
-                }
-                _lc.upload_progress[t] = {"current": 0, "total": fsize, "stage": "preparing"}
+                _lc.upload_progress[t] = {"current": 0, "total": fsize,
+                                          "stage": "preparing"}
         upload_tier(t, p, output_base, token)
+        state.mark_upload_done(t, "hf")
+        if _lc:
+            with _upload_queue_lock:
+                _lc.upload_progress.pop(t, None)
+        # README row tracks the HF copy
         sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
-        state.set_tier(t, "uploaded", size_mb=round(sz_gb * 1024, 1))
         tier_name = f"tier{t}"
         if readme_path.exists() and not _readme_has_tier(readme_path, tier_name):
             _append_readme_row(readme_path, tier_name, sz_gb)
+        _maybe_finish_upload(t, p)
+
+    def _do_upload_s3(t: int, p: Path):
+        """Run in the S3 executor thread: upload GGUF to S3 storage."""
+        _active_start(t)
+        fsize = p.stat().st_size if p.exists() else 0
+        if _lc and _lc.live is not None:
+            with _upload_queue_lock:
+                _lc.s3_upload_progress[t] = {"current": 0, "total": fsize}
+        upload_tier_s3(t, p, s3)
+        state.mark_upload_done(t, "s3")
+        if _lc:
+            with _upload_queue_lock:
+                _lc.s3_upload_progress.pop(t, None)
+        _maybe_finish_upload(t, p)
 
     def _check_completed_uploads():
         """Process all completed upload futures (non-blocking)."""
         nonlocal pending_uploads
         still_pending = []
-        for tier_p, fut in pending_uploads:
+        for tier_p, target, fut in pending_uploads:
             if not fut.done():
-                still_pending.append((tier_p, fut))
+                still_pending.append((tier_p, target, fut))
                 continue
             try:
                 fut.result()
                 if _lc:
-                    _lc.active_tiers.pop(tier_p, None)
-                    _lc.upload_progress.pop(tier_p, None)
+                    with _upload_queue_lock:
+                        if target == "hf":
+                            _lc.upload_progress.pop(tier_p, None)
+                        else:
+                            _lc.s3_upload_progress.pop(tier_p, None)
                     if _lc.live:
                         _lc.live.update(_build_live_renderable())
             except Exception as exc:
                 err = str(exc)[:300]
-                log_err(f"tier{tier_p} upload failed: {err}")
-                state.set_tier(tier_p, "error", error=str(exc)[:300],
-                               error_short=err[:200])
+                log_err(f"tier{tier_p} {target} upload failed: {err}")
+                state.set_tier(tier_p, "error", error=f"{target}: {err}",
+                               error_short=f"{target}: {err[:180]}")
                 if _lc:
-                    _lc.active_tiers.pop(tier_p, None)
-                    _lc.upload_progress.pop(tier_p, None)
+                    with _upload_queue_lock:
+                        if target == "hf":
+                            _lc.upload_progress.pop(tier_p, None)
+                        else:
+                            _lc.s3_upload_progress.pop(tier_p, None)
                     if _lc.live:
                         _lc.live.update(_build_live_renderable())
         pending_uploads = still_pending
@@ -1701,8 +2133,11 @@ def run_pipeline(args):
 
                 # ── skip already uploaded ──
                 if st == "uploaded" and output_gguf.exists() and output_gguf.stat().st_size > 0:
-                    log(f"✓ tier{tier}: already uploaded, skipping")
-                    continue
+                    if s3 and not state.upload_done(tier, "s3"):
+                        log(f"tier{tier}: on HF, uploading to S3")
+                    else:
+                        log(f"✓ tier{tier}: already uploaded, skipping")
+                        continue
                 elif st == "quantizing":
                     log(f"tier{tier}: was quantizing (interrupted) → will re-quantize")
                     if output_gguf.exists():
@@ -1777,30 +2212,39 @@ def run_pipeline(args):
                 if _interruption_requested:
                     break
 
-                # ── submit upload to executor queue ──
-                # Doesn't block.  The task sits in the queue until the
+                # ── submit uploads to executor queues ──
+                # Doesn't block.  Each task sits in its queue until the
                 # executor's single worker finishes the previous upload.
-                # A callback inside _do_upload_and_record sets _lc.active_tiers
-                # right when the executor picks this task up, so the
-                # display only shows the *actually running* upload.
+                # HF and S3 uploads run in parallel (separate executors),
+                # so at most one quant uploads to HF and one to S3.
                 state.set_tier(tier, "uploading")
-
-                fut = upload_executor.submit(_do_upload_and_record, tier, output_gguf)
-                pending_uploads.append((tier, fut))
+                info = state._t(tier)
+                if not info.get("hf_done"):
+                    fut = upload_executor.submit(_do_upload_hf, tier, output_gguf)
+                    pending_uploads.append((tier, "hf", fut))
+                if s3 is not None and not info.get("s3_done"):
+                    fut = s3_executor.submit(_do_upload_s3, tier, output_gguf)
+                    pending_uploads.append((tier, "s3", fut))
                 processed.append(tier)
 
             # ── collect any remaining completions ──
             _wait_all_uploads()
             upload_executor.shutdown(wait=True)
+            if s3_executor is not None:
+                s3_executor.shutdown(wait=True)
 
         except KeyboardInterrupt:
             log_err("Forced interrupt — saving state and cleaning up.")
             _check_completed_uploads()
             upload_executor.shutdown(wait=False, cancel_futures=True)
+            if s3_executor is not None:
+                s3_executor.shutdown(wait=False, cancel_futures=True)
         except Exception as exc:
             log_err(f"Unexpected error: {exc}")
             _check_completed_uploads()
             upload_executor.shutdown(wait=False, cancel_futures=True)
+            if s3_executor is not None:
+                s3_executor.shutdown(wait=False, cancel_futures=True)
         finally:
             _stop_live()
 
@@ -1955,6 +2399,22 @@ def main():
                              "(default: ~/apex_batch)")
     parser.add_argument("--token", "-t",
                         help="HF token (default: $HF_TOKEN from env / .env)")
+    parser.add_argument("--s3-endpoint",
+                        help="S3 endpoint URL with bucket embedded "
+                             "(e.g. https://storage.yandexcloud.net/my-bucket/ or "
+                             "https://my-bucket.storage.yandexcloud.net/). "
+                             "Enables parallel S3 upload. "
+                             "(default: $S3_ENDPOINT from env / .env)")
+    parser.add_argument("--s3-token",
+                        help="S3 IAM token, sent as Authorization: Bearer "
+                             "(default: $S3_TOKEN from env / .env)")
+    parser.add_argument("--s3-key-id",
+                        help="S3 static access key id, used with --s3-secret "
+                             "(AWS SigV4 signing; does not expire, recommended "
+                             "for long runs). (default: $S3_KEY_ID from env / .env)")
+    parser.add_argument("--s3-secret",
+                        help="S3 static access secret key, used with "
+                             "--s3-key-id (default: $S3_SECRET from env / .env)")
     parser.add_argument("--source-file",
                         help="Explicit source GGUF filename (skip auto-detection)")
     parser.add_argument("--imatrix-file",

@@ -5,19 +5,15 @@ Creates a tensor-type file for llama-quantize's --tensor-type-file flag.
 Supports any number of layers and all APEX profiles.
 
 Usage:
-  ./scripts/generate_config.py --profile balanced --layers 40 > config.txt
-  ./scripts/generate_config.py --profile mini --layers 40 -o configs/my_config.txt
+  ./scripts/generate_config.py --profile tier5 --layers 40 > config.txt
+  ./scripts/generate_config.py --profile tier7 --layers 40 -o configs/my_config.txt
 
-Profiles:
-  quality     Q6_K/Q5_K/IQ4_XS experts, Q8_0 shared, Q6_K attn
-  i-quality   Same as quality (use with --imatrix at quantize time)
-  balanced    Q6_K/Q5_K experts, Q8_0 shared, Q6_K attn
-  i-balanced  Same as balanced (use with --imatrix at quantize time)
-  compact     Q4_K/Q3_K experts, Q6_K shared, Q4_K attn
-  i-compact   Same as compact (use with --imatrix at quantize time)
-  mini        Q3_K edge / IQ2_S mid experts, Q5_K/Q4_K shared, Q4_K/Q3_K attn
-  nano        Q3_K edge / IQ2_S near / IQ2_XXS mid experts (2.06 bpw mid) — needs imatrix
-  micro       Q3_K edge / IQ2_XS near / IQ1_M mid experts (1.75 bpw mid) — needs imatrix, experimental
+MoE tier profiles (--arch moe, default):
+  tier1–tier13  Quality-rank indices for each tensor role (experts, shared
+                experts, attention, embeddings). The ranks step down from
+                tier1 (near-full precision) to tier13 (IQ1/IQ2 band); the
+                concrete quant per rank depends on the quant mode (below).
+  i-tierN       Same as tierN (use with --imatrix at quantize time).
 
 Dense/hybrid profiles (--arch dense is implied; for models whose FFN is dense,
 e.g. Qwen3.8-27B: 64 layers, 48 linear-attention + 16 full-attention):
@@ -30,11 +26,12 @@ e.g. Qwen3.8-27B: 64 layers, 48 linear-attention + 16 full-attention):
   dense-hybrid-quality  dense-hybrid rebuilt in the Q5/Q6 band, to check the
                         winning allocation still wins away from the Q4 band.
 
-Quant mode (default: mixed):
-  By default, experts use QUANTS_RANKED_SIZE (IQ4_NL/IQ3_S/IQ2_S) while
-  attention, shared experts and embeddings use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K).
-  --speed  Use QUANTS_RANKED_SPEED for all tensors unconditionally.
-  --size   Use QUANTS_RANKED_SIZE for all tensors unconditionally.
+Quant mode (default: speed):
+  Profiles assign quality-rank indices; the mode selects which ranked table
+  maps each index to a concrete quant type.
+  --speed  QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) for all tensors. Default.
+  --size   QUANTS_RANKED_SIZE (IQ4_NL/IQ3_S/IQ2_S) for all tensors.
+  --mixed  Experts use QUANTS_RANKED_SIZE, everything else QUANTS_RANKED_SPEED.
 
 Profile modifiers (used with profiles, positive = lower quality, negative = higher):
   --edge-exp N      Shift edge-expert quality by N steps
@@ -85,7 +82,7 @@ _quant_mode = "speed"  # "mixed" | "speed" | "size"
 def ranked_quant(index, role="expert"):
     """Return quant string for a quality-rank index, clamping to valid range.
 
-    *role* selects the quant table when mode is "default":
+    *role* selects the quant table when mode is "mixed":
       "expert"  → QUANTS_RANKED_SIZE
       "shared"  → QUANTS_RANKED_SPEED
       "attn"    → QUANTS_RANKED_SPEED
@@ -106,7 +103,8 @@ def ranked_quant(index, role="expert"):
 
 
 # Profile definitions: (edge_exp, near_exp, mid_exp, edge_shared, mid_shared, edge_attn, mid_attn, embd_type)
-# Values are indices into QUANTS_RANKED (0=Q8_0, 1=Q6_K, 2=Q5_K, ...).
+# Values are quality-rank indices into the ranked quant tables (0=Q8_0, 1=Q6_K, 2=Q5_K, ...);
+# the table is chosen by the quant mode (see ranked_quant).
 PROFILES = {
     "tier1":        (0, 0, 1, 0, 0, 0, 0, 0),
     "tier2":        (1, 1, 1, 0, 0, 0, 0, 0),
@@ -302,7 +300,7 @@ def get_zone(i, layers, dense_layers=0):
     for edge and near per-side sizes.
     """
     non_dense = layers - dense_layers
-    zone_size = max(1, math.ceil(non_dense * 0.1))  # 0.125
+    zone_size = max(1, math.ceil(non_dense * 0.1))  # edge/near = 10% of layers per side
 
     # Dense layers are always edge
     if i < dense_layers:
@@ -346,7 +344,7 @@ def generate_moe(cfg):
             exp = mi
             sh = msi
 
-        # Attention index: narrower edge band (3/40 vs 5/40)
+        # Attention index: narrower edge band (7.5% per side vs 10% for zones)
         non_dense = layers - dense_layers
         attn_edge_size = max(1, math.ceil(non_dense * 3 / 40))
         if i < dense_layers + attn_edge_size or i >= layers - attn_edge_size:

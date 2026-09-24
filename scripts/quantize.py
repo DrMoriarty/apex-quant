@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
-"""APEX quantization for llama.cpp (Python version of quantize.sh).
+"""APEX quantization for llama.cpp.
 
 Usage:
-  # Using a built-in profile
-  ./scripts/quantize.py --profile balanced input.gguf output.gguf
+  # Using a built-in tier profile
+  ./scripts/quantize.py --profile tier5 input.gguf output.gguf
 
   # Using a custom tensor-type file
   ./scripts/quantize.py --config configs/my_config.txt input.gguf output.gguf
 
-  # With imatrix (for I-variants and Mini)
-  ./scripts/quantize.py --profile mini --imatrix imatrix.dat input.gguf output.gguf
+  # With imatrix (for i-tierN variants)
+  ./scripts/quantize.py --profile i-tier5 --imatrix imatrix.dat input.gguf output.gguf
 
   # Generate config only (no quantization)
-  ./scripts/quantize.py --profile quality --generate-config -o config.txt
+  ./scripts/quantize.py --profile tier1 --generate-config -o config.txt
 
   # Estimate output size (no quantization)
-  ./scripts/quantize.py --profile balanced --dry-run input.gguf
+  ./scripts/quantize.py --profile tier5 --dry-run input.gguf
 
-Profiles: quality, i-quality, balanced, i-balanced, compact, i-compact, mini, custom
+Profiles:
+  tier1–tier13   MoE tier profiles (tier1 = near-full precision, tier13 = IQ1/IQ2 band)
+  i-tierN        Same as tierN, for use with --imatrix
+  dense-*        Dense/hybrid profiles: dense-flat, dense-grad, dense-hybrid,
+                 dense-hybrid-quality
+
+Architecture (--arch moe|dense) and layer count are auto-detected from the GGUF
+file; can be overridden via --arch, --layers, --dense-layers.
 
 Environment:
   LLAMA_QUANTIZE    Path to llama-quantize binary (auto-detected)
   LLAMA_CPP_DIR     Path to llama.cpp build/bin directory
-Layer count is explicitly set via --layers or auto-detected from the GGUF file.
 """
 
 import argparse
@@ -132,6 +138,8 @@ def main():
                             help="Use QUANTS_RANKED_SPEED (Q4_K/Q3_K/Q2_K) for all tensors")
     quant_mode.add_argument("--size", action="store_const", dest="quant_mode", const="size",
                             help="Use QUANTS_RANKED_SIZE (IQ4_NL/IQ3_S/IQ2_S) for all tensors")
+    quant_mode.add_argument("--mixed", action="store_const", dest="quant_mode", const="mixed",
+                            help="Experts use QUANTS_RANKED_SIZE, everything else QUANTS_RANKED_SPEED")
     parser.add_argument("-o", "--output",
                         help="Output config file (for --generate-config)")
     parser.add_argument("input", nargs="?", help="Input GGUF file")
@@ -180,10 +188,8 @@ def main():
             cmd.extend(["--dense-layers", str(args.dense_layers)])
         if args.arch:
             cmd.extend(["--arch", args.arch])
-        if args.quant_mode == "speed":
-            cmd.append("--speed")
-        elif args.quant_mode == "size":
-            cmd.append("--size")
+        if args.quant_mode:
+            cmd.append(f"--{args.quant_mode}")
         if args.output:
             cmd.extend(["-o", args.output])
         subprocess.run(cmd, check=True)
@@ -214,10 +220,8 @@ def main():
             cmd.extend(["--dense-layers", str(args.dense_layers)])
         if args.arch:
             cmd.extend(["--arch", args.arch])
-        if args.quant_mode == "speed":
-            cmd.append("--speed")
-        elif args.quant_mode == "size":
-            cmd.append("--size")
+        if args.quant_mode:
+            cmd.append(f"--{args.quant_mode}")
         subprocess.run(cmd, check=True)
         print(f">>> Generated config for profile '{args.profile}' ({args.layers} layers)")
 
@@ -232,6 +236,8 @@ def main():
                    "--base-type", args.base_type, args.input]
         if config_file:
             est_cmd.extend(["--config", config_file])
+        if args.quant_mode:
+            est_cmd.append(f"--{args.quant_mode}")
         try:
             subprocess.run(est_cmd, check=True)
         finally:
