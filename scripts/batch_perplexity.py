@@ -126,26 +126,29 @@ def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S")
 
 
-def _refresh_live():
-    """Throttled explicit refresh of the live display."""
-    if _ls is not None and _ls.live is not None:
-        now = time.time()
-        if now - _ls._last_refresh >= 0.2:
-            _ls._last_refresh = now
-            try:
-                _ls.live._live.refresh()
-            except Exception:
-                pass
-
-
-def log(msg: str):
-    line = f"[{_ts()}] {msg}"
+def _append_log_line(line: str):
+    """Append *line* to the live log ring (no-op without live display)."""
     if _ls is not None and _ls.live is not None:
         with _ls.lock:
             _ls.lines.append(line)
             if len(_ls.lines) > _LOG_RING_SIZE * 3:
                 _ls.lines = _ls.lines[-_LOG_RING_SIZE:]
         _refresh_live()
+
+
+def _refresh_live():
+    """Throttled explicit refresh of the live display."""
+    if _ls is not None and _ls.live is not None:
+        now = time.time()
+        if now - _ls._last_refresh >= 0.2:
+            _ls._last_refresh = now
+            _ls.live.refresh()
+
+
+def log(msg: str):
+    line = f"[{_ts()}] {msg}"
+    if _ls is not None and _ls.live is not None:
+        _append_log_line(line)
     else:
         print(line, flush=True)
 
@@ -153,12 +156,7 @@ def log(msg: str):
 def log_err(msg: str):
     line = f"[{_ts()}] \u274c {msg}"
     print(line, file=sys.stderr, flush=True)
-    if _ls is not None and _ls.live is not None:
-        with _ls.lock:
-            _ls.lines.append(line)
-            if len(_ls.lines) > _LOG_RING_SIZE * 3:
-                _ls.lines = _ls.lines[-_LOG_RING_SIZE:]
-        _refresh_live()
+    _append_log_line(line)
 
 
 def _elide_middle(text: str, width: int) -> str:
@@ -323,6 +321,13 @@ class _PerpLive:
     def stop(self):
         self._live.stop()
 
+    def refresh(self):
+        """Public refresh — swallows render errors (console may be gone)."""
+        try:
+            self._live.refresh()
+        except Exception:
+            pass
+
     def _composite(self):
         try:
             with _ls.lock:
@@ -349,12 +354,7 @@ class _ShimLive:
     """
 
     def append_log(self, msg: str):
-        if _ls is not None and _ls.live is not None:
-            with _ls.lock:
-                _ls.lines.append(msg)
-                if len(_ls.lines) > _LOG_RING_SIZE * 3:
-                    _ls.lines = _ls.lines[-_LOG_RING_SIZE:]
-            _refresh_live()
+        _append_log_line(msg)
 
     def update(self, *_args, **_kwargs):
         _refresh_live()
@@ -433,7 +433,9 @@ class PplState:
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(self.data, indent=2))
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.data, indent=2))
+        os.replace(tmp, self.path)
 
     def get(self, key: str, default=None):
         return self.data.get(key, default)
@@ -603,6 +605,9 @@ def _s3_download_file(s3: dict, key: str, dest: Path, label: str) -> Path:
                         bytes_done = 0
                     resp.raise_for_status()
                     for chunk in resp.iter_bytes(chunk_size=1024 * 1024):
+                        if _bq._interruption_requested:
+                            raise KeyboardInterrupt(
+                                "S3 download interrupted by user")
                         f.write(chunk)
                         bytes_done += len(chunk)
                         now = time.time()
@@ -747,6 +752,8 @@ def _prefetch_task(ctx: Context, group: dict):
     try:
         path = _download_entry(ctx, group)
         ctx.downloaded[name] = path
+    except KeyboardInterrupt:
+        log_err(f"Prefetch of {name} interrupted by user")
     except Exception as exc:
         log_err(f"Prefetch of {name} failed: {str(exc)[:300]}")
 
@@ -1021,6 +1028,8 @@ def _run_pipeline_body(args, ctx: Context, state: PplState, ppl_bin,
                               - ctx.source.get("start", time.time())}
                 _refresh_live()
                 log_err(f"Source model evaluation failed: {str(exc)[:300]}")
+                if not args.keep_files:
+                    _cleanup_model(ctx, source_group, src_local)
                 sys.exit(1)
             metrics = parse_metrics(src_report.read_text())
             ctx.source = {"status": "done",
@@ -1060,78 +1069,85 @@ def _run_pipeline_body(args, ctx: Context, state: PplState, ppl_bin,
                     return g
             return None
 
-        for i, group in enumerate(quant_groups):
-            if _bq._interruption_requested:
-                log("⚠ Pipeline interrupted by user.")
-                break
+        try:
+            for i, group in enumerate(quant_groups):
+                if _bq._interruption_requested:
+                    log("⚠ Pipeline interrupted by user.")
+                    break
 
-            key = group["name"]
-            if state.status(key) == "done":
-                log(f"✓ {key}: already evaluated, skipping")
-                continue
-
-            # Download (or pick up prefetch result)
-            local = ctx.downloaded.pop(key, None)
-            if local is None or not Path(local).exists():
-                try:
-                    local = _download_entry(ctx, group)
-                except Exception as exc:
-                    log_err(f"{key}: download failed: {str(exc)[:300]}")
-                    state.set_file(key, "error", error=str(exc)[:300])
-                    failed.append(key)
+                key = group["name"]
+                if state.status(key) == "done":
+                    log(f"✓ {key}: already evaluated, skipping")
                     continue
-            held = Path(local).stat().st_size
 
-            # Start prefetch of the next pending quant (single lookahead)
-            fut = _maybe_prefetch(ctx, _next_pending(i + 1), held)
+                # Download (or pick up prefetch result)
+                local = ctx.downloaded.pop(key, None)
+                if local is None or not Path(local).exists():
+                    try:
+                        local = _download_entry(ctx, group)
+                    except Exception as exc:
+                        log_err(f"{key}: download failed: {str(exc)[:300]}")
+                        state.set_file(key, "error", error=str(exc)[:300])
+                        failed.append(key)
+                        continue
+                held = Path(local).stat().st_size
 
-            # Evaluate
-            report_path = ctx.reports_dir / report_name_for(key)
-            state.set_file(key, "evaluating")
-            ctx.active_eval = {"name": key, "start": time.time()}
-            _refresh_live()
-            try:
-                run_llama_ppl(ppl_bin, local, data_file, report_path,
-                              kl_base=logits_path, ngl=args.ngl,
-                              chunks=args.chunks)
-                metrics = parse_metrics(report_path.read_text())
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                err = str(exc)[:300]
-                log_err(f"{key}: evaluation failed: {err}")
-                state.set_file(key, "error", error=err)
-                failed.append(key)
-                if fut is not None:
-                    fut.result()
-                continue
-            finally:
-                ctx.active_eval = None
+                # Start prefetch of the next pending quant (single lookahead)
+                next_group = _next_pending(i + 1)
+                fut = _maybe_prefetch(ctx, next_group, held)
+
+                # Evaluate
+                report_path = ctx.reports_dir / report_name_for(key)
+                state.set_file(key, "evaluating")
+                ctx.active_eval = {"name": key, "start": time.time()}
                 _refresh_live()
+                try:
+                    run_llama_ppl(ppl_bin, local, data_file, report_path,
+                                  kl_base=logits_path, ngl=args.ngl,
+                                  chunks=args.chunks)
+                    metrics = parse_metrics(report_path.read_text())
+                except KeyboardInterrupt:
+                    raise
+                except Exception as exc:
+                    err = str(exc)[:300]
+                    log_err(f"{key}: evaluation failed: {err}")
+                    state.set_file(key, "error", error=err)
+                    failed.append(key)
+                    if not args.keep_files:
+                        _cleanup_model(ctx, group, local)
+                    if fut is not None:
+                        log(f"⏳ Waiting for prefetch of "
+                            f"{next_group['name']}…")
+                        fut.result()
+                    continue
+                finally:
+                    ctx.active_eval = None
+                    _refresh_live()
 
-            log(f"  {key}: PPL={metrics.get('ppl', '?')} "
-                f"KL mean={metrics.get('kl_mean', '?')} "
-                f"max={metrics.get('kl_max', '?')}")
-            state.set_file(key, "evaluated", **metrics)
+                log(f"  {key}: PPL={metrics.get('ppl', '?')} "
+                    f"KL mean={metrics.get('kl_mean', '?')} "
+                    f"max={metrics.get('kl_max', '?')}")
+                state.set_file(key, "evaluated", **metrics)
 
-            # Upload report
-            try:
-                upload_report(ctx, group, report_path)
-            except Exception as exc:
-                log_err(f"{key}: report upload failed: {str(exc)[:300]}")
+                # Upload report
+                try:
+                    upload_report(ctx, group, report_path)
+                except Exception as exc:
+                    log_err(f"{key}: report upload failed: {str(exc)[:300]}")
 
-            # Free disk: the local model file is no longer needed
-            if not args.keep_files:
-                _cleanup_model(ctx, group, local)
+                # Free disk: the local model file is no longer needed
+                if not args.keep_files:
+                    _cleanup_model(ctx, group, local)
 
-            state.set_file(key, "done", **metrics)
-            results[key] = metrics
+                state.set_file(key, "done", **metrics)
+                results[key] = metrics
 
-            # Wait for the prefetch to complete before the next iteration
-            if fut is not None:
-                fut.result()
-
-        ctx.executor.shutdown(wait=True)
+                # Wait for the prefetch to complete before the next iteration
+                if fut is not None:
+                    log(f"⏳ Waiting for prefetch of {next_group['name']}…")
+                    fut.result()
+        finally:
+            ctx.executor.shutdown(wait=True)
 
     # ── 5. Final summary ──
     _print_summary(state, source_name, quant_groups)
