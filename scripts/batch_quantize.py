@@ -1971,20 +1971,37 @@ def _s3_check(resp: httpx.Response, what: str):
 
 
 @_retry_on_network_error
-def _s3_put_part(url: str, s3: dict, data: bytes) -> str:
+def _s3_put_part(client: "httpx.Client", url: str, s3: dict,
+                 path: Path, offset: int, length: int) -> str:
     """PUT a single multipart part, return its ETag. Retries on network
-    errors and transient server errors (5xx/429)."""
-    headers = _s3_auth_headers(s3, "PUT", url, data)
-    headers["Content-Length"] = str(len(data))
-    with httpx.Client(timeout=httpx.Timeout(600, connect=30)) as client:
-        resp = client.put(url, content=data, headers=headers)
-        if resp.status_code >= 500 or resp.status_code == 429:
-            # Re-raised as httpx error so _retry_on_network_error retries it.
-            raise httpx.HTTPStatusError(
-                f"S3 part upload HTTP {resp.status_code}",
-                request=resp.request, response=resp)
-        _s3_check(resp, "part upload")
-        return resp.headers.get("ETag", "")
+    errors and transient server errors (5xx/429).
+
+    The part body is streamed from disk in small chunks — the full
+    part is never held in memory (httpx retains byte bodies on the
+    request object, which leaked 64 MB per part on large uploads).
+    """
+    headers = _s3_auth_headers(s3, "PUT", url)
+    headers["Content-Length"] = str(length)
+
+    def _gen():
+        remaining = length
+        with open(path, "rb") as f:
+            f.seek(offset)
+            while remaining > 0:
+                b = f.read(min(4 * 1024 * 1024, remaining))
+                if not b:
+                    break
+                remaining -= len(b)
+                yield b
+
+    resp = client.put(url, content=_gen(), headers=headers)
+    if resp.status_code >= 500 or resp.status_code == 429:
+        # Re-raised as httpx error so _retry_on_network_error retries it.
+        raise httpx.HTTPStatusError(
+            f"S3 part upload HTTP {resp.status_code}",
+            request=resp.request, response=resp)
+    _s3_check(resp, "part upload")
+    return resp.headers.get("ETag", "")
 
 
 @_retry_on_network_error
@@ -2074,18 +2091,17 @@ def _s3_multipart_upload(
         # 2. parts
         etags: list[tuple[int, str]] = []
         try:
-            with open(gguf_path, "rb") as f:
-                for i in range(1, n_parts + 1):
-                    chunk = f.read(part_size)
-                    if not chunk:
-                        break
-                    part_url = (f"{url}?partNumber={i}&uploadId={upload_id}")
-                    etag = _s3_put_part(part_url, s3, chunk)
-                    if not etag:
-                        raise RuntimeError(
-                            f"S3 part {i}/{n_parts}: missing ETag in response")
-                    etags.append((i, etag))
-                    _s3_progress(key, f.tell())
+            for i in range(1, n_parts + 1):
+                offset = (i - 1) * part_size
+                length = min(part_size, size - offset)
+                part_url = (f"{url}?partNumber={i}&uploadId={upload_id}")
+                etag = _s3_put_part(client, part_url, s3,
+                                    gguf_path, offset, length)
+                if not etag:
+                    raise RuntimeError(
+                        f"S3 part {i}/{n_parts}: missing ETag in response")
+                etags.append((i, etag))
+                _s3_progress(key, offset + length)
 
             # 3. complete
             parts_xml = "".join(
