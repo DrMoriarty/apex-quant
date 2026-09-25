@@ -14,7 +14,9 @@ creates one with source info, mAPEX attribution, and a quantization table.
 After all tiers are uploaded the README is pushed to the same repo.
 
 Supports **resumable** execution: state is persisted to a JSON file so that
-re-running with identical arguments only performs remaining work.
+re-running with identical arguments only performs remaining work.  All
+input parameters are saved into the state file at startup; ``--continue``
+restarts the pipeline from the saved state (no other arguments allowed).
 
 Concurrency:
   * model + imatrix downloads run sequentially in the main thread
@@ -2148,6 +2150,9 @@ def run_pipeline(args):
     state_path = workspace / ".batch_quant_state.json"
     state = BatchState(state_path)
 
+    # Persist all input parameters so that --continue can restore them.
+    state.set("args", _args_record(args))
+
     # Parse output base repo id (org/name)
     output_base = args.output.rstrip("/")
     if not output_base or "/" not in output_base:
@@ -2896,6 +2901,72 @@ def _parse_tiers(s: str) -> list:
     return sorted(tiers)
 
 
+_ARG_DESTS = [
+    "model", "imatrix", "output", "tiers", "workspace", "token",
+    "s3_endpoint", "s3_token", "s3_key_id", "s3_secret",
+    "s3_upload_source", "source_file", "imatrix_file",
+    "dry_run", "keep_files",
+]
+
+
+def _args_record(args: argparse.Namespace) -> dict:
+    """Serialize CLI arguments for persistence in the state file."""
+    return {
+        "model": args.model,
+        "imatrix": args.imatrix,
+        "output": args.output,
+        "tiers": args.tiers,
+        "workspace": args.workspace,
+        "token": args.token,
+        "s3_endpoint": args.s3_endpoint,
+        "s3_token": args.s3_token,
+        "s3_key_id": args.s3_key_id,
+        "s3_secret": args.s3_secret,
+        "s3_upload_source": args.s3_upload_source,
+        "source_file": args.source_file,
+        "imatrix_file": args.imatrix_file,
+        "dry_run": args.dry_run,
+        "keep_files": args.keep_files,
+    }
+
+
+def _restore_args_from_state(parser: argparse.ArgumentParser,
+                             args: argparse.Namespace) -> argparse.Namespace:
+    """Rebuild the args namespace from the state file (--continue mode).
+
+    Rejects any other CLI arguments alongside --continue; raises if no
+    state file or no saved argument record exists.
+    """
+    extras = [d for d in _ARG_DESTS
+              if getattr(args, d) != parser.get_default(d)]
+    if extras:
+        log_err("--continue cannot be combined with other arguments: "
+                + ", ".join(f"--{d.replace('_', '-')}" for d in extras))
+        sys.exit(1)
+
+    workspace = Path(args.workspace).resolve()
+    state_path = workspace / ".batch_quant_state.json"
+    if not state_path.exists():
+        log_err(f"No state file found at {state_path}. "
+                f"Run without --continue first.")
+        sys.exit(1)
+    try:
+        data = json.loads(state_path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        log_err(f"Cannot read state file {state_path}: {exc}")
+        sys.exit(1)
+    saved = data.get("args")
+    if not saved:
+        log_err(f"State file {state_path} has no saved arguments. "
+                f"Re-run without --continue to start a fresh pipeline.")
+        sys.exit(1)
+
+    ns = argparse.Namespace(**{d: saved.get(d, parser.get_default(d))
+                               for d in _ARG_DESTS})
+    ns.continue_run = True
+    return ns
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="mAPEX Batch Quantization Pipeline",
@@ -2960,9 +3031,18 @@ def main():
                              "successful upload. Without this flag, files that "
                              "are fully uploaded (HF and S3 if enabled) are "
                              "deleted from disk to save space.")
+    parser.add_argument("--continue", dest="continue_run", action="store_true",
+                        help="Resume the pipeline from the saved state file. "
+                             "All parameters (model, imatrix, output, tiers, "
+                             "S3 settings, …) are restored from the state — "
+                             "no other arguments are allowed with --continue.")
 
     args = parser.parse_args()
-    args.tiers = _parse_tiers(args.tiers)
+
+    if args.continue_run:
+        args = _restore_args_from_state(parser, args)
+
+    args.tiers = _parse_tiers(args.tiers) if isinstance(args.tiers, str) else args.tiers
 
     if not args.tiers or not all(1 <= t <= 15 for t in args.tiers):
         log_err("--tiers must be in range 1-15")
