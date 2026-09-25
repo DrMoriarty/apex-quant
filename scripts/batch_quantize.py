@@ -414,6 +414,8 @@ _lc = _LiveContext() if _HAS_RICH else None
 # ---------------------------------------------------------------------------
 
 _LOG_RING_SIZE = 8
+_CAPTURE_MAX_LINES = 2000
+_CAPTURE_MAX_BUF = 1 * 1024 * 1024
 
 
 class _RichLive:
@@ -438,7 +440,7 @@ class _RichLive:
         self._live = Live(
             console=Console(file=sys.stdout, force_terminal=True),
             auto_refresh=True,
-            refresh_per_second=5,
+            refresh_per_second=1,
             transient=True,
             get_renderable=self._composite,
         )
@@ -454,7 +456,7 @@ class _RichLive:
     def update(self, _renderable=None):
         """Explicit refresh — throttled to avoid starving auto-refresh."""
         now = time.time()
-        if now - self._last_refresh >= 0.2:       # ≤ 5/sec
+        if now - self._last_refresh >= 1.0:       # ≤ 1/sec (ssh-friendly)
             self._last_refresh = now
             self._live.refresh()
 
@@ -904,6 +906,8 @@ class _Capture:
             if line:
                 with self._lock:
                     self._lines.append(line)
+                    if len(self._lines) > _CAPTURE_MAX_LINES:
+                        self._lines = self._lines[-_CAPTURE_MAX_LINES:]
                     self.last_line = line
                 if _lc and _lc.active_tiers.get(self.key):
                     _lc.active_tiers[self.key]["last_line"] = self.last_line[:120]
@@ -913,6 +917,8 @@ class _Capture:
                         _lc.active_tiers[self.key]["tensor_total"] = int(m.group(2))
                     if _lc.live is not None:
                         _lc.live.update()
+        if len(self._buf) > _CAPTURE_MAX_BUF:
+            self._buf = self._buf[-_CAPTURE_MAX_BUF:]
         if self._stream is not None and not (_lc and _lc.live):
             try:
                 return self._stream.write(data)
@@ -1580,6 +1586,8 @@ def run_quantize(
                     text = chunk.decode("utf-8", errors="replace")
                     cap.write(text)
                     err_buf += text
+                    if len(err_buf) > _CAPTURE_MAX_BUF:
+                        err_buf = err_buf[-_CAPTURE_MAX_BUF:]
             finally:
                 try:
                     os.close(master_fd)
@@ -1707,6 +1715,19 @@ class _UploadProgressWrapper(io.BufferedIOBase):
         super().close()
 
 
+class _DiscardIO(io.TextIOBase):
+    """Write-only sink: swallows output instead of accumulating it."""
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, s: str) -> int:
+        return len(s)
+
+    def flush(self) -> None:
+        pass
+
+
 @_retry_on_network_error
 def upload_tier(
     key: str,
@@ -1730,13 +1751,11 @@ def upload_tier(
     create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=token)
 
     if _live_active:
-        import io as _io
-
         wrapper = _UploadProgressWrapper(gguf_path, key)
         _old_stdout = sys.stdout
         _old_stderr = sys.stderr
-        sys.stdout = _io.StringIO()
-        sys.stderr = _io.StringIO()
+        sys.stdout = _DiscardIO()
+        sys.stderr = _DiscardIO()
         try:
             try:
                 HfApi(token=token).upload_file(
