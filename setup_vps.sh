@@ -58,7 +58,7 @@ echo "Installing Python dependencies from requirements.txt..."
 
 python3 -m venv .venv
 source .venv/bin/activate
-python3 -m pip3 install -r requirements.txt
+python3 -m pip install -r requirements.txt
 
 echo "✅ Setup completed successfully!"
 echo "You can now run the application using: python3 main.py"
