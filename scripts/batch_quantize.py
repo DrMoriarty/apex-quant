@@ -1188,11 +1188,16 @@ def _append_readme_row(readme_path: Path, tier_name: str, size_gb: float):
 
 def _rebuild_readme_rows(readme_path: Path, state: "BatchState"):
     """Populate README with rows for all variants already marked uploaded in state."""
+    src = state.source_info()
+    source_name = Path(src["path"]).name if src and src.get("path") else None
     for tier, speed in expand_variants(TIERS):
         key = variant_key(tier, speed)
         if state.tier_status(key) != "uploaded":
             continue
-        tier_name = variant_label(tier, speed)
+        if source_name:
+            tier_name = _tier_filename(source_name, tier, speed)
+        else:
+            tier_name = variant_label(tier, speed)
         if _readme_has_tier(readme_path, tier_name):
             continue
         info = state._t(key)
@@ -2549,7 +2554,7 @@ def run_pipeline(args):
                 _lc.upload_progress.pop(key, None)
         # README row tracks the HF copy
         sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
-        tier_name = variant_label(tier, speed)
+        tier_name = p.name
         if readme_path.exists() and not _readme_has_tier(readme_path, tier_name):
             _append_readme_row(readme_path, tier_name, sz_gb)
         _maybe_finish_upload(key, p)
