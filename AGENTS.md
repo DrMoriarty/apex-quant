@@ -29,6 +29,7 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 
 | Script | Purpose |
 |--------|---------|
+| `scripts/cloudcp.py` | s3cmd-like `cp`/`ls`/`rm` across `s3://`, `hf://` and local paths; streaming, resumable (Range / S3 multipart ListParts) |
 | `scripts/estimate_config_size.py` | Predicts GGUF size from a config + tensor inventory |
 | `scripts/eval.sh` | Runs PPL, KL, HellaSwag, Winogrande, MMLU, ARC, TruthfulQA, speed; outputs JSON |
 | `scripts/benchmark.sh` | Batch benchmarking with TSV output and optional plots |

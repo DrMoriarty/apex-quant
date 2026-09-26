@@ -1,5 +1,6 @@
 # ── Core (batch quantization pipeline) ──────────────────────
 huggingface_hub>=0.20.0        # download/upload models from HuggingFace
+httpx>=0.27                    # HTTP client (S3 REST, HF downloads, cloudcp)
 rich>=13.0                     # rich terminal display (optional, falls back to plain text)
 
 # ── Plotting (benchmark visualization scripts) ─────────────
