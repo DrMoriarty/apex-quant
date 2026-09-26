@@ -429,10 +429,16 @@ class S3Client:
 
     def delete(self, bucket: str, key: str) -> None:
         url = self._url(bucket, key)
-        resp = with_retries("DELETE", lambda: self.client.delete(
-            url, headers=self._headers("DELETE", url)))
-        if resp.status_code not in (200, 204):
-            raise RuntimeError(f"S3 delete: HTTP {resp.status_code}")
+
+        def go():
+            resp = self.client.delete(url, headers=self._headers("DELETE", url))
+            if resp.status_code == 404:
+                return None
+            check_status(resp, f"S3 delete {key}")
+            return resp
+
+        if with_retries("DELETE", go) is None:
+            raise RuntimeError(f"not found: s3://{bucket}/{key}")
 
     def get_range_iter(self, bucket: str, key: str, offset: int, length: int):
         """Yield chunks of bytes [offset, offset+length) of an object."""
@@ -702,6 +708,15 @@ class HFClient:
                               if token else ""))
             resp = with_retries("tree", lambda: self.client.get(
                 url, headers=self._headers()))
+            if resp.status_code == 404:
+                raise RuntimeError(
+                    f"hf://{uri.repo_id}/{uri.path}: repository, revision "
+                    f"'{uri.revision}' or directory does not exist — or the "
+                    f"current HF token has no access to it")
+            if resp.status_code == 401:
+                raise RuntimeError(
+                    "HuggingFace: unauthorized — set a valid HF_TOKEN in "
+                    ".env (private repos require a token with read access)")
             check_status(resp, "HF tree listing")
             for item in resp.json():
                 size = (item.get("lfs") or {}).get("size") or \
@@ -716,8 +731,17 @@ class HFClient:
 
     def delete(self, uri: URI) -> None:
         """Delete a file (creates a commit; git history keeps the blob)."""
-        self.api.delete_file(path_in_repo=uri.path, repo_id=uri.repo_id,
-                             repo_type="model", revision=uri.revision)
+        try:
+            from huggingface_hub.errors import RepositoryNotFoundError
+        except ImportError:
+            from huggingface_hub.utils import RepositoryNotFoundError
+        try:
+            self.api.delete_file(path_in_repo=uri.path, repo_id=uri.repo_id,
+                                 repo_type="model", revision=uri.revision)
+        except RepositoryNotFoundError:
+            raise RuntimeError(
+                f"hf://{uri.repo_id}: repository does not exist — or the "
+                f"current HF token has no access to it") from None
 
     def upload(self, src: URI, dest: URI, force: bool) -> None:
         """Upload to HF via huggingface_hub (LFS protocol for big files).
@@ -1336,6 +1360,21 @@ def main() -> None:
         {"cp": cmd_cp, "ls": cmd_ls, "rm": cmd_rm}[args.cmd](args)
     except KeyboardInterrupt:
         sys.exit("\ninterrupted")
+    except Exception as exc:  # noqa: BLE001 — CLI prints errors, no tracebacks
+        msg = str(exc).strip().replace("\n", " — ")
+        if exc.__class__.__name__ not in ("RuntimeError", "OSError"):
+            name = exc.__class__.__name__
+            msg = f"{name}: {msg}" if msg else name
+        if msg.startswith("HTTP ") and ":" in msg:
+            code, _, body = msg.partition(": ")
+            try:
+                import json as _json
+                body = _json.loads(body).get("error", body)
+            except Exception:
+                body = body.split("\n")[0][:120]
+            msg = f"HTTP {code}: {body}"
+        msg = msg[:300]
+        sys.exit(f"error: {msg}")
 
 
 if __name__ == "__main__":
