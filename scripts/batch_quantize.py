@@ -2,8 +2,15 @@
 """mAPEX Batch Quantization Pipeline.
 
 Downloads a source GGUF model (bf16/f16/f32) and an importance matrix from
-HuggingFace, quantizes through mAPEX tiers using quantize.py, and
-uploads every resulting GGUF to HuggingFace.
+HuggingFace or S3-compatible storage, quantizes through mAPEX tiers using
+quantize.py, and uploads every resulting GGUF to HuggingFace.
+
+--model and --imatrix accept universal URLs:
+  hf://account/repo/folder/file.gguf   HuggingFace model repo
+  s3://bucket/folder/file.gguf         S3-compatible storage
+  account/repo                         legacy shorthand for an HF repo
+The file and folder parts are optional — when omitted, a suitable file is
+auto-detected (bf16/f16/f32 source GGUF; imatrix/.dat for the imatrix).
 
 Each tier in the speed range (9-15) is produced in two variants:
   * normal   — default quantize.py parameters          (Tier9)
@@ -27,14 +34,17 @@ Concurrency:
     uploaded to HF and to S3 in parallel: at most one quant is being
     uploaded to HF and at most one to S3 at any given moment
   * with --s3-upload-source the source model (the merged GGUF when the
-    source was split into shards) is uploaded to S3 as a separate "SRC"
-    task shown in the live table.  While it runs, tier uploads are
-    blocked; quantization itself is not blocked.
+    source was split into shards) and the imatrix file are uploaded to S3
+    as a separate "SRC" task shown in the live table.  While it runs,
+    tier uploads are blocked; quantization itself is not blocked.
+    Files that already exist in the destination bucket (by name) are
+    skipped; if both files are already there, a warning is printed and
+    no upload is performed.
 
 Usage:
   python3 scripts/batch_quantize.py \\
-      --model user/source-model-GGUF \\
-      --imatrix user/imatrix-repo \\
+      --model hf://user/source-model-GGUF \\
+      --imatrix s3://my-bucket/imatrix/model.imatrix \\
       --output user/model-mAPEX
 
 Output repo: {output}  (all tier GGUFs in one repo)
@@ -1054,6 +1064,268 @@ def _pick_imatrix_file(files: list) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Remote source specs (hf:// / s3:// URLs)
+# ---------------------------------------------------------------------------
+
+def _parse_remote_spec(spec: str) -> dict:
+    """Parse a --model/--imatrix value into a location spec.
+
+    Supported forms:
+      hf://account/repo/folder/file.gguf   HF repo (file/folder optional)
+      s3://bucket/folder/file.gguf         S3 object (file/folder optional)
+      account/repo                         legacy shorthand for an HF repo
+
+    Returns {"kind": "hf"|"s3", "repo"/"bucket": ..., "path": str, "raw": str}.
+    """
+    raw = spec
+    s = spec.strip().rstrip("/")
+    if s.startswith("s3://"):
+        bucket, _, path = s[5:].partition("/")
+        return {"kind": "s3", "bucket": bucket.strip("/"),
+                "path": path.strip("/"), "raw": raw}
+    if s.startswith("hf://"):
+        parts = [p for p in s[5:].split("/") if p]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            log_err(f"hf:// path must be hf://account/repository[/path] "
+                    f"— got '{spec}'")
+            sys.exit(1)
+        return {"kind": "hf", "repo": f"{parts[0]}/{parts[1]}",
+                "path": "/".join(parts[2:]), "raw": raw}
+    parts = s.split("/")
+    if len(parts) >= 2 and parts[0] and parts[1]:
+        return {"kind": "hf", "repo": "/".join(parts[:2]),
+                "path": "/".join(parts[2:]), "raw": raw}
+    log_err("--model/--imatrix must be hf://account/repo[/path], "
+            f"s3://bucket[/path] or account/repo — got '{spec}'")
+    sys.exit(1)
+
+
+def _spec_repo_label(spec: dict) -> str:
+    """Human/README label for a source spec: HF repo id or the raw URL."""
+    return spec["repo"] if spec["kind"] == "hf" else spec["raw"]
+
+
+def _s3_key_url(s3: dict, bucket: str, key: str) -> str:
+    from urllib.parse import quote
+    return f"{s3['base_url']}/{bucket}/{quote(key, safe='/-_.~')}"
+
+
+@_retry_on_network_error
+def _s3_head_size(s3: dict, bucket: str, key: str) -> Optional[int]:
+    """Size of an S3 object, or None if it does not exist."""
+    url = _s3_key_url(s3, bucket, key)
+    with httpx.Client(timeout=httpx.Timeout(60, connect=30)) as client:
+        resp = client.head(url, headers=_s3_auth_headers(s3, "HEAD", url))
+        if resp.status_code == 404:
+            return None
+        _s3_check(resp, f"HEAD s3://{bucket}/{key}")
+        return int(resp.headers.get("content-length", 0))
+
+
+@_retry_on_network_error
+def _s3_list_all(s3: dict, bucket: str, prefix: str) -> list:
+    """Recursively list S3 object keys under *prefix* (ListObjectsV2)."""
+    import xml.etree.ElementTree as ET
+
+    keys = []
+    token = ""
+    base = f"{s3['base_url']}/{bucket}"
+    with httpx.Client(timeout=httpx.Timeout(120, connect=30)) as client:
+        while True:
+            q = f"list-type=2&prefix={_uri_encode(prefix)}"
+            if token:
+                q += f"&continuation-token={_uri_encode(token)}"
+            url = f"{base}?{q}"
+            resp = client.get(url, headers=_s3_auth_headers(s3, "GET", url))
+            _s3_check(resp, f"list s3://{bucket}/{prefix}")
+            root = ET.fromstring(resp.text)
+            for el in root.iter():
+                if el.tag == "Key" or el.tag.endswith("}Key"):
+                    keys.append(el.text or "")
+            token = ""
+            truncated = False
+            for el in root.iter():
+                if el.tag.endswith("IsTruncated"):
+                    truncated = (el.text or "").lower() == "true"
+                elif el.tag.endswith("NextContinuationToken"):
+                    token = el.text or ""
+            if not truncated or not token:
+                break
+    return [k for k in keys if k]
+
+
+def _s3_download_file(s3: dict, bucket: str, key: str, dest_dir: Path,
+                      *, label: str = "file") -> Path:
+    """Download an S3 object to *dest_dir*, preserving the key path.
+
+    Resumable: incomplete data is kept as ``{dest}.part`` and a Range
+    request continues from the stored offset on the next attempt.
+    """
+    dest = dest_dir / key
+    if dest.exists() and dest.stat().st_size > 0:
+        if _lc:
+            _lc.downloads[label] = {"label": label, "status": "done",
+                                    "bytes": dest.stat().st_size,
+                                    "total": dest.stat().st_size,
+                                    "start": time.time()}
+        log(f"{label} already exists: {dest.name}  "
+            f"({dest.stat().st_size / (1024**3):.2f} GB)")
+        return dest
+
+    size = _s3_head_size(s3, bucket, key)
+    if size is None:
+        raise FileNotFoundError(f"not found: s3://{bucket}/{key}")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    part = dest.with_suffix(dest.suffix + ".part")
+    existing = part.stat().st_size if part.exists() else 0
+
+    extra_headers: dict[str, str] = {"Accept-Encoding": "identity"}
+    if existing > 0 and existing < size:
+        log(f"Resuming {label} from {existing / (1024**2):.1f} MB  "
+            f"({existing / size * 100:.1f}%)")
+        extra_headers["Range"] = f"bytes={existing}-"
+    elif existing >= size and size > 0:
+        if dest.exists():
+            dest.unlink()
+        part.rename(dest)
+        return dest
+    else:
+        existing = 0
+
+    if _lc:
+        _lc.downloads[label] = {"label": label, "status": "downloading",
+                                "bytes": 0, "total": 0, "start": time.time()}
+        _lc.downloads[label]["resumed_from"] = existing
+        if _lc.live:
+            _lc.live.update(_build_live_renderable())
+
+    url = _s3_key_url(s3, bucket, key)
+    mode = "ab" if existing > 0 else "wb"
+    downloaded = existing
+    last_live_update = time.time()
+
+    with open(part, mode) as f, \
+         httpx.Client(follow_redirects=True,
+                      timeout=httpx.Timeout(300, connect=30)) as client:
+        with client.stream("GET", url, headers=_s3_auth_headers(
+                s3, "GET", url, extra=extra_headers)) as response:
+            if existing > 0 and response.status_code == 200:
+                # Server ignored Range — restart from scratch
+                f.seek(0)
+                f.truncate()
+                downloaded = 0
+                if _lc and _lc.downloads.get(label):
+                    _lc.downloads[label]["resumed_from"] = 0
+            response.raise_for_status()
+            for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                f.write(chunk)
+                downloaded += len(chunk)
+                now = time.time()
+                if _lc and _lc.downloads.get(label):
+                    _lc.downloads[label]["bytes"] = downloaded
+                    _lc.downloads[label]["total"] = size
+                    if _lc.live and now - last_live_update >= 1.0:
+                        _lc.live.update(_build_live_renderable())
+                        last_live_update = now
+
+    actual = part.stat().st_size
+    if actual != size:
+        raise ValueError(
+            f"Download size mismatch: expected {size}, got {actual} "
+            f"({label})")
+    if dest.exists():
+        dest.unlink()
+    part.rename(dest)
+    log(f"{label} complete: {dest.name}  ({actual / (1024**3):.2f} GB)")
+    return dest
+
+
+@_retry_on_network_error
+def _hf_list_repo_files(repo_id: str, token: Optional[str]) -> list:
+    """List all files in a HuggingFace model repo."""
+    from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    return list(api.list_repo_files(repo_id=repo_id, repo_type="model"))
+
+
+def _resolve_spec_listing(spec: dict, token: Optional[str], s3: Optional[dict],
+                          *, what: str) -> tuple[Optional[str], list]:
+    """List candidate files for a --model/--imatrix spec.
+
+    Returns ``(exact, files)`` where *exact* is the spec path when it
+    names an existing file (skipping auto-detection) and *files* is the
+    listing limited to the spec's folder (or the whole repo/bucket root
+    when no folder is given).
+    """
+    path = spec["path"]
+    if spec["kind"] == "hf":
+        all_files = _hf_list_repo_files(spec["repo"], token)
+        if path and path in all_files:
+            folder = path.rsplit("/", 1)[0] if "/" in path else ""
+            if folder:
+                files = [f for f in all_files if f.startswith(folder + "/")]
+            else:
+                files = list(all_files)
+            return path, files
+        if path:
+            prefix = path.rstrip("/") + "/"
+            files = [f for f in all_files if f.startswith(prefix)]
+        else:
+            files = list(all_files)
+        return None, files
+
+    # s3://
+    if s3 is None:
+        log_err(f"{what}: s3:// source URL requires S3_ENDPOINT and S3 "
+                f"credentials (set them in .env).")
+        sys.exit(1)
+    bucket = spec["bucket"] or s3["bucket"]
+    if not bucket:
+        log_err(f"{what}: cannot determine S3 bucket for {spec['raw']}")
+        sys.exit(1)
+    if path and _s3_head_size(s3, bucket, path) is not None:
+        folder = path.rsplit("/", 1)[0] if "/" in path else ""
+        files = _s3_list_all(s3, bucket, folder + "/" if folder else "")
+        return path, files
+    prefix = (path + "/") if path else ""
+    return None, _s3_list_all(s3, bucket, prefix)
+
+
+def _download_spec_file(spec: dict, s3: Optional[dict], token: Optional[str],
+                        rel_path: str, dest_dir: Path, *,
+                        label: str) -> Path:
+    """Download one file according to the spec kind (hf:// or s3://)."""
+    if spec["kind"] == "hf":
+        return _download_single_file(spec["repo"], rel_path, dest_dir,
+                                     token, label=label)
+    bucket = spec["bucket"] or s3["bucket"]
+    return _s3_download_file(s3, bucket, rel_path, dest_dir, label=label)
+
+
+@_retry_on_network_error
+def _download_spec_files(spec: dict, files: list, workspace: Path,
+                         token: Optional[str], s3: Optional[dict],
+                         subdir: str, label_base: str) -> list:
+    """Download the resolved file list for a spec, return local paths."""
+    target_dir = workspace / subdir
+    paths = []
+    n = len(files)
+    for i, rel_path in enumerate(files):
+        label = label_base if n == 1 else f"{label_base} {i + 1}/{n}"
+        result = _download_spec_file(spec, s3, token, rel_path, target_dir,
+                                     label=label)
+        if not result.exists():
+            raise FileNotFoundError(f"{label} not found after download: {result}")
+        sz = result.stat().st_size
+        sz_str = (f"{sz / (1024**3):.2f} GB" if sz >= 1024**3
+                  else f"{sz / (1024**2):.1f} MB")
+        log(f"{label} ready: {result.name}  ({sz_str})")
+        paths.append(result)
+    return paths
+
+
+# ---------------------------------------------------------------------------
 # README management
 # ---------------------------------------------------------------------------
 
@@ -1385,47 +1657,6 @@ def _download_single_file(
         _lc.downloads[label]["status"] = "done"
         if _lc.live:
             _lc.live.update(_build_live_renderable())
-    return result
-
-
-@_retry_on_network_error
-def download_source_model(
-    repo_id: str,
-    workspace: Path,
-    token: Optional[str],
-    source_files: list,
-) -> list:
-    """Download the source GGUF shard(s) from HF, return list of local paths."""
-    target_dir = workspace / "source_model"
-    paths = []
-    n = len(source_files)
-    for i, filename in enumerate(source_files):
-        label = "source model" if n == 1 else f"source model {i + 1}/{n}"
-        result = _download_single_file(
-            repo_id, filename, target_dir, token, label=label,
-        )
-        if not result.exists():
-            raise FileNotFoundError(f"Source file not found after download: {result}")
-        log(f"Source shard ready: {result.name}  ({result.stat().st_size / (1024**3):.2f} GB)")
-        paths.append(result)
-    return paths
-
-
-@_retry_on_network_error
-def download_imatrix(
-    repo_id: str,
-    workspace: Path,
-    token: Optional[str],
-    imatrix_file: str,
-) -> Path:
-    """Download the imatrix file from HF, return local path."""
-    target_dir = workspace / "imatrix"
-    result = _download_single_file(
-        repo_id, imatrix_file, target_dir, token, label="imatrix",
-    )
-    if not result.exists():
-        raise FileNotFoundError(f"Imatrix file not found after download: {result}")
-    log(f"Imatrix ready: {result.name}  ({result.stat().st_size / (1024**2):.1f} MB)")
     return result
 
 
@@ -1803,10 +2034,13 @@ def upload_tier(
 def _parse_s3_endpoint(endpoint: str) -> tuple[str, str]:
     """Extract (base_url, bucket) from an S3 endpoint URL.
 
-    The bucket must be embedded in the URL, either as a path segment or
+    The bucket may be embedded in the URL, either as a path segment or
     as a subdomain:
       https://storage.yandexcloud.net/<bucket>/   → path form
       https://<bucket>.storage.yandexcloud.net/   → subdomain form
+    A bucketless endpoint (e.g. plain https://storage.yandexcloud.net/)
+    returns an empty bucket — it can then be inferred from an s3://
+    source URL (--model/--imatrix) or must be provided explicitly.
     """
     ep = endpoint.strip()
     if "://" not in ep:
@@ -1820,10 +2054,8 @@ def _parse_s3_endpoint(endpoint: str) -> tuple[str, str]:
     host = (u.hostname or "").lower()
     labels = host.split(".")
     if host == "storage.yandexcloud.net" or len(labels) < 3:
-        raise ValueError(
-            f"Cannot determine S3 bucket from endpoint '{endpoint}'. "
-            f"Use https://storage.yandexcloud.net/<bucket>/ or "
-            f"https://<bucket>.storage.yandexcloud.net/")
+        # Bucketless endpoint — bucket resolved later (s3:// URL / error).
+        return f"{scheme}://{netloc}", ""
     bucket_host = ".".join(labels[1:])
     if u.port:
         bucket_host = f"{bucket_host}:{u.port}"
@@ -1876,7 +2108,8 @@ def _get_s3_settings(args) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 def _aws_sigv4_headers(method: str, url: str, key_id: str, secret: str,
-                       body: Optional[bytes] = None) -> dict:
+                       body: Optional[bytes] = None,
+                       extra_headers: Optional[dict] = None) -> dict:
     """Build AWS Signature Version 4 headers for an S3 request.
 
     Signs host, x-amz-content-sha256 and x-amz-date.  When *body* is None
@@ -1912,6 +2145,15 @@ def _aws_sigv4_headers(method: str, url: str, key_id: str, secret: str,
         f"x-amz-date:{amz_date}\n")
     signed_headers = "host;x-amz-content-sha256;x-amz-date"
 
+    extra = {k.lower(): v for k, v in (extra_headers or {}).items()}
+    if extra:
+        all_headers = {"host": host,
+                       "x-amz-content-sha256": payload_hash,
+                       "x-amz-date": amz_date, **extra}
+        signed = sorted(all_headers)
+        canonical_headers = "".join(f"{k}:{all_headers[k]}\n" for k in signed)
+        signed_headers = ";".join(signed)
+
     canonical_request = "\n".join([
         method, canonical_uri, canonical_query,
         canonical_headers, signed_headers, payload_hash,
@@ -1938,6 +2180,7 @@ def _aws_sigv4_headers(method: str, url: str, key_id: str, secret: str,
             f"SignedHeaders={signed_headers}, Signature={signature}"),
         "x-amz-date": amz_date,
         "x-amz-content-sha256": payload_hash,
+        **(extra_headers or {}),
     }
 
 
@@ -1948,13 +2191,16 @@ def _uri_encode(s: str) -> str:
 
 
 def _s3_auth_headers(s3: dict, method: str, url: str,
-                     body: Optional[bytes] = None) -> dict:
+                     body: Optional[bytes] = None,
+                     extra: Optional[dict] = None) -> dict:
     """Return authentication headers for an S3 request."""
     auth = s3["auth"]
     if auth["mode"] == "sigv4":
         return _aws_sigv4_headers(method, url, auth["key_id"],
-                                  auth["secret"], body)
-    return {"Authorization": f"Bearer {auth['token']}"}
+                                  auth["secret"], body, extra)
+    out = {"Authorization": f"Bearer {auth['token']}"}
+    out.update(extra or {})
+    return out
 
 
 _S3_PART_SIZE = 64 * 1024 * 1024   # 64 MB per multipart part
@@ -2160,6 +2406,23 @@ def _estimate_tier_size(tier: int, speed: bool, source_gguf: Path) -> int:
 # Pipeline
 # ---------------------------------------------------------------------------
 
+def _partition_s3_upload_files(s3: dict, candidates: list) -> tuple[list, list]:
+    """Split SRC-upload candidates into (to_upload, already_in_s3).
+
+    *candidates* is a list of (label, path, spec_kind).  A file whose
+    source spec was s3:// and whose name already exists in the
+    destination bucket is reported in *already_in_s3* and not uploaded.
+    """
+    to_upload, already = [], []
+    for lbl, p, spc_kind in candidates:
+        if (spc_kind == "s3"
+                and _s3_head_size(s3, s3["bucket"], p.name) is not None):
+            already.append(lbl)
+        else:
+            to_upload.append((lbl, p))
+    return to_upload, already
+
+
 def run_pipeline(args):
     _check_hf_import()
 
@@ -2169,6 +2432,38 @@ def run_pipeline(args):
         sys.exit(1)
 
     s3 = _get_s3_settings(args)
+
+    # Parse --model/--imatrix universal URLs (hf:// / s3:// / legacy repo id).
+    model_spec = _parse_remote_spec(args.model)
+    imx_spec = _parse_remote_spec(args.imatrix)
+    source_model_label = _spec_repo_label(model_spec)
+
+    # s3:// sources require S3 settings (endpoint + credentials).
+    if s3 is None and "s3" in (model_spec["kind"], imx_spec["kind"]):
+        log_err("s3:// source URL requires S3_ENDPOINT and credentials "
+                "(set them in .env).")
+        sys.exit(1)
+
+    # Bucket fallbacks: endpoint bucket ↔ s3:// URL bucket.
+    for spc in (model_spec, imx_spec):
+        if spc["kind"] == "s3" and not spc["bucket"]:
+            if s3 is None or not s3["bucket"]:
+                log_err(f"{spc['raw']}: s3:// path must include a bucket "
+                        f"(or set S3_ENDPOINT with an embedded bucket).")
+                sys.exit(1)
+            spc["bucket"] = s3["bucket"]
+    if s3 is not None and not s3["bucket"]:
+        for spc in (model_spec, imx_spec):
+            if spc["kind"] == "s3":
+                s3["bucket"] = spc["bucket"]
+                log(f"  S3 bucket inferred from source URL: {s3['bucket']}")
+                break
+        if not s3["bucket"]:
+            log_err("Cannot determine S3 bucket: S3_ENDPOINT has no embedded "
+                    "bucket and no s3:// source URL to infer it from. "
+                    "Use https://storage.yandexcloud.net/<bucket>/ or "
+                    "https://<bucket>.storage.yandexcloud.net/")
+            sys.exit(1)
 
     # Optional S3 upload of the source (merged) model.  While the upload
     # task runs, tier uploads are blocked (they wait on *source_upload_done*);
@@ -2282,93 +2577,88 @@ def run_pipeline(args):
             state.data.pop("imatrix", None)
             state.save()
 
-    # ── discover files + download both in parallel ──
-    if not source_info or not imatrix_info:
-        from huggingface_hub import HfApi
-        api = HfApi(token=token)
+    # ── discover files + download both (main thread so Ctrl+C works) ──
+    source_files = None
+    imatrix_file = None
 
-        @_retry_on_network_error
-        def _list_all(repo_id):
-            return api.list_repo_files(repo_id=repo_id, repo_type="model")
-
-        if not source_info:
-            src_files = _list_all(args.model)
+    if not source_info:
+        source_exact, source_listing = _resolve_spec_listing(
+            model_spec, token, s3, what="source model")
+        gguf_files = [f for f in source_listing if f.endswith(".gguf")]
+        if not gguf_files:
+            log_err(f"No .gguf files found in {model_spec['raw']}")
+            sys.exit(1)
+        if source_exact and source_exact.endswith(".gguf"):
+            source_file = source_exact
+            log(f"Using source file from URL: {source_file}")
         else:
-            src_files = []
-        if not imatrix_info:
-            imx_files = _list_all(args.imatrix)
-        else:
-            imx_files = []
+            source_file = _pick_source_gguf(gguf_files)
+        if not source_file:
+            log_err(f"Could not determine source file in {model_spec['raw']}. "
+                    f"Found: {gguf_files}")
+            sys.exit(1)
+        if not source_exact and len(gguf_files) > 1:
+            log(f"Found {len(gguf_files)} .gguf files, selected: {source_file}")
+        source_files = _expand_shard_files(source_file, gguf_files)
+        if len(source_files) > 1:
+            log(f"Source model is split into {len(source_files)} shards: "
+                f"{source_files[0]} … {source_files[-1]}")
 
-        # resolve source file
-        if not source_info:
-            gguf_files = [f for f in src_files if f.endswith(".gguf")]
-            if not gguf_files:
-                log_err(f"No .gguf files found in {args.model}")
-                sys.exit(1)
-            source_file = (getattr(args, "source_file", None)
-                           or _pick_source_gguf(gguf_files))
-            if not source_file:
-                log_err(f"Could not determine source file in {args.model}. "
-                        f"Found: {gguf_files}")
-                sys.exit(1)
-            if len(gguf_files) > 1:
-                log(f"Found {len(gguf_files)} .gguf files, selected: {source_file}")
-            source_files = _expand_shard_files(source_file, gguf_files)
+    if not imatrix_info:
+        imx_exact, imx_listing = _resolve_spec_listing(
+            imx_spec, token, s3, what="imatrix")
+        imatrix_file = imx_exact or _pick_imatrix_file(imx_listing)
+        if not imatrix_file:
+            log_err(f"Could not find imatrix file in {imx_spec['raw']}. "
+                    f"Files: {imx_listing}")
+            sys.exit(1)
+        log(f"Selected imatrix file: {imatrix_file}")
+
+    if args.dry_run:
+        if source_files is not None:
+            log(f"DRY RUN: would download source model {model_spec['raw']} "
+                f"({', '.join(source_files)})")
             if len(source_files) > 1:
-                log(f"Source model is split into {len(source_files)} shards: "
-                    f"{source_files[0]} … {source_files[-1]}")
-
-        # resolve imatrix file
-        if not imatrix_info:
-            imatrix_file = (getattr(args, "imatrix_file", None)
-                            or _pick_imatrix_file(imx_files))
-            if not imatrix_file:
-                log_err(f"Could not find imatrix file in {args.imatrix}. "
-                        f"Files: {imx_files}")
-                sys.exit(1)
-            log(f"Selected imatrix file: {imatrix_file}")
-
-        # download both in the main thread so Ctrl+C actually stops them
-        if args.dry_run:
-            if not source_info:
-                log(f"DRY RUN: would download source model {args.model} "
-                    f"({', '.join(source_files)})")
-                if len(source_files) > 1:
-                    log("DRY RUN: shards would be merged into a single GGUF "
-                        "before quantization")
-                source_gguf = Path(f"/dry-run/{source_files[0]}")
+                log("DRY RUN: shards would be merged into a single GGUF "
+                    "before quantization")
+            source_gguf = Path(f"/dry-run/{source_files[0]}")
+            state.mark_source(str(source_gguf), source_files[0])
+        if imatrix_file is not None:
+            log(f"DRY RUN: would download imatrix {imx_spec['raw']} "
+                f"({imatrix_file})")
+            imatrix_path = Path(f"/dry-run/{imatrix_file}")
+            state.mark_imatrix(str(imatrix_path))
+    else:
+        with _allow_hard_interrupt():
+            if source_files is not None:
+                try:
+                    result = _download_spec_files(
+                        model_spec, source_files, workspace, token, s3,
+                        "source_model", "source model")
+                except KeyboardInterrupt:
+                    log("\nDownload interrupted by user.")
+                    sys.exit(130)
+                except Exception as exc:
+                    log_err(f"Download failed (source model): {exc}")
+                    sys.exit(1)
+                if len(result) == 1:
+                    source_gguf = result[0]
+                else:
+                    source_gguf = merge_gguf_shards(
+                        result, keep_shards=args.keep_files, state=state)
                 state.mark_source(str(source_gguf), source_files[0])
-            if not imatrix_info:
-                log(f"DRY RUN: would download imatrix {args.imatrix} ({imatrix_file})")
-                imatrix_path = Path(f"/dry-run/{imatrix_file}")
+            if imatrix_file is not None:
+                try:
+                    imatrix_path = _download_spec_files(
+                        imx_spec, [imatrix_file], workspace, token, s3,
+                        "imatrix", "imatrix")[0]
+                except KeyboardInterrupt:
+                    log("\nDownload interrupted by user.")
+                    sys.exit(130)
+                except Exception as exc:
+                    log_err(f"Download failed (imatrix): {exc}")
+                    sys.exit(1)
                 state.mark_imatrix(str(imatrix_path))
-        else:
-            with _allow_hard_interrupt():
-                downloads = []
-                if not source_info:
-                    downloads.append(("source", download_source_model, (args.model, workspace, token, source_files)))
-                if not imatrix_info:
-                    downloads.append(("imatrix", download_imatrix, (args.imatrix, workspace, token, imatrix_file)))
-                for key, fn, a in downloads:
-                    try:
-                        result = fn(*a)
-                    except KeyboardInterrupt:
-                        log("\nDownload interrupted by user.")
-                        sys.exit(130)
-                    except Exception as exc:
-                        log_err(f"Download failed ({key}): {exc}")
-                        sys.exit(1)
-                    if key == "source":
-                        if len(result) == 1:
-                            source_gguf = result[0]
-                        else:
-                            source_gguf = merge_gguf_shards(
-                                result, keep_shards=args.keep_files, state=state)
-                        state.mark_source(str(source_gguf), source_files[0])
-                    else:
-                        imatrix_path = result
-                        state.mark_imatrix(str(result))
 
         if _lc:
             _lc.source_ok = True
@@ -2384,53 +2674,77 @@ def run_pipeline(args):
     # upload blocks all tier uploads (HF and S3) but not quantization.
     if upload_source and not args.dry_run:
         if state.source_upload_done():
-            log("✓ Source model already uploaded to S3")
+            log("✓ Source files already uploaded to S3")
             source_upload_done.set()
         else:
-            def _do_upload_source_s3():
-                fsize = (source_gguf.stat().st_size
-                         if source_gguf.exists() else 0)
-                if _lc:
-                    with _upload_queue_lock:
-                        _lc.source_upload = {"status": "uploading",
-                                             "start": time.time()}
-                        _lc.s3_upload_progress["src"] = {
-                            "current": 0, "total": fsize,
-                            "start_ts": time.time()}
-                    if _lc.live:
-                        _lc.live.update(_build_live_renderable())
-                log(f"Uploading source model ({source_gguf.name}, "
-                    f"{fsize / (1024**3):.2f} GB) → S3 {s3['bucket']}")
-                try:
-                    upload_tier_s3("src", source_gguf, s3, label="source")
-                    elapsed = (time.time()
-                               - _lc.source_upload.get("start", time.time())
-                               ) if _lc and _lc.source_upload else 0.0
-                    state.mark_source_upload("done", elapsed=round(elapsed, 1))
+            # Files whose source was s3:// and which are already present
+            # in the destination bucket are skipped; if nothing remains,
+            # warn and skip the upload entirely.
+            src_upload_files, already_in_s3 = _partition_s3_upload_files(
+                s3, [("source model", source_gguf, model_spec["kind"]),
+                     ("imatrix", imatrix_path, imx_spec["kind"])])
+            if already_in_s3 and not src_upload_files:
+                log(f"⚠ --s3-upload-source: {' и '.join(already_in_s3)} уже "
+                    f"есть в S3 (bucket {s3['bucket']}) — аплоад выполнен "
+                    f"не будет")
+                upload_source = False
+                source_upload_done.set()
+            else:
+                if already_in_s3:
+                    log(f"✓ Already in S3, skipping upload: "
+                        f"{', '.join(already_in_s3)}")
+
+                def _do_upload_source_s3():
+                    failed_lbl = None
+                    for lbl, p in src_upload_files:
+                        fsize = (p.stat().st_size if p.exists() else 0)
+                        if _lc:
+                            with _upload_queue_lock:
+                                _lc.source_upload = {"status": "uploading",
+                                                     "start": time.time()}
+                                _lc.s3_upload_progress["src"] = {
+                                    "current": 0, "total": fsize,
+                                    "start_ts": time.time()}
+                            if _lc.live:
+                                _lc.live.update(_build_live_renderable())
+                        log(f"Uploading {lbl} ({p.name}, "
+                            f"{fsize / (1024**3):.2f} GB) → S3 {s3['bucket']}")
+                        try:
+                            upload_tier_s3("src", p, s3, label=lbl)
+                        except Exception as exc:
+                            err = str(exc)[:300]
+                            log_err(f"{lbl} S3 upload failed: {err}")
+                            failed_lbl = lbl
+                            break
+                        log(f"✓ {lbl} uploaded to S3 {s3['bucket']}")
                     if _lc:
                         with _upload_queue_lock:
                             _lc.s3_upload_progress.pop("src", None)
+                    if failed_lbl is not None:
+                        if _lc:
+                            _lc.source_upload = {"status": "error"}
+                        state.mark_source_upload("error", error=failed_lbl)
+                    else:
+                        elapsed = (time.time()
+                                   - _lc.source_upload.get("start", time.time())
+                                   ) if _lc and _lc.source_upload else 0.0
+                        state.mark_source_upload("done",
+                                                 elapsed=round(elapsed, 1))
+                        if _lc:
                             _lc.source_upload = {"status": "done",
                                                  "elapsed": elapsed}
-                    log(f"✓ Source model uploaded to S3 {s3['bucket']} "
-                        f"in {_format_elapsed(elapsed)}")
-                except Exception as exc:
-                    err = str(exc)[:300]
-                    log_err(f"Source model S3 upload failed: {err}")
-                    state.mark_source_upload("error", error=err)
-                    if _lc:
-                        with _upload_queue_lock:
-                            _lc.s3_upload_progress.pop("src", None)
-                            _lc.source_upload = {"status": "error"}
-                finally:
+                        log(f"✓ Source files uploaded to S3 {s3['bucket']} "
+                            f"in {_format_elapsed(elapsed)}")
                     source_upload_done.set()
                     if _lc and _lc.live:
                         _lc.live.update(_build_live_renderable())
 
-            source_executor = ThreadPoolExecutor(max_workers=1)
-            source_upload_future = source_executor.submit(_do_upload_source_s3)
+                source_executor = ThreadPoolExecutor(max_workers=1)
+                source_upload_future = source_executor.submit(
+                    _do_upload_source_s3)
     elif upload_source and args.dry_run:
-        log(f"DRY RUN: would upload source model {source_gguf.name} "
+        names = ", ".join(p.name for p in (source_gguf, imatrix_path))
+        log(f"DRY RUN: would upload source files ({names}) "
             f"→ S3 {s3['bucket']}")
         source_upload_done.set()
 
@@ -2442,14 +2756,14 @@ def run_pipeline(args):
             downloaded = _download_readme(output_base, token, readme_path)
             if downloaded:
                 log(f"✓ README.md downloaded from {output_base}")
-                _ensure_apex_header(readme_path, args.model,
+                _ensure_apex_header(readme_path, source_model_label,
                                    state.source_info()["format"])
             else:
-                _create_readme(readme_path, args.model,
+                _create_readme(readme_path, source_model_label,
                                state.source_info()["format"])
                 log("✓ Created new README.md (download failed, created fresh)")
         else:
-            _create_readme(readme_path, args.model,
+            _create_readme(readme_path, source_model_label,
                            state.source_info()["format"])
             log("✓ Created new README.md")
         _rebuild_readme_rows(readme_path, state)
@@ -2944,8 +3258,7 @@ def _parse_tiers(s: str) -> list:
 _ARG_DESTS = [
     "model", "imatrix", "output", "tiers", "workspace", "token",
     "s3_endpoint", "s3_token", "s3_key_id", "s3_secret",
-    "s3_upload_source", "source_file", "imatrix_file",
-    "dry_run", "keep_files",
+    "s3_upload_source", "dry_run", "keep_files",
 ]
 
 
@@ -2963,8 +3276,6 @@ def _args_record(args: argparse.Namespace) -> dict:
         "s3_key_id": args.s3_key_id,
         "s3_secret": args.s3_secret,
         "s3_upload_source": args.s3_upload_source,
-        "source_file": args.source_file,
-        "imatrix_file": args.imatrix_file,
         "dry_run": args.dry_run,
         "keep_files": args.keep_files,
     }
@@ -3017,12 +3328,23 @@ def main():
             "    --model bullerwins/Qwen3.5-35B-A3B-GGUF \\\n"
             "    --imatrix bullerwins/Qwen3.5-35B-A3B-imatrix-GGUF \\\n"
             "    --output user/Qwen3.5-35B-A3B-mAPEX\n"
+            "\n"
+            "  python3 scripts/batch_quantize.py \\\n"
+            "    --model hf://user/source-model-GGUF/big_folder \\\n"
+            "    --imatrix s3://my-bucket/imatrix/model.imatrix \\\n"
+            "    --output user/model-mAPEX --s3-upload-source\n"
         ),
     )
     parser.add_argument("--model", "-m", required=True,
-                        help="HF repo with source GGUF  (e.g. user/model-GGUF)")
+                        help="Source GGUF location: hf://account/repo[/folder"
+                             "[/file]], s3://bucket[/folder[/file]] or legacy "
+                             "account/repo. The file is auto-detected "
+                             "(bf16/f16/f32 GGUF) when omitted.")
     parser.add_argument("--imatrix", "-i", required=True,
-                        help="HF repo with imatrix file (e.g. user/imatrix-GGUF)")
+                        help="Imatrix location: hf://account/repo[/folder"
+                             "[/file]], s3://bucket[/folder[/file]] or legacy "
+                             "account/repo. The file is auto-detected "
+                             "(imatrix*/.dat) when omitted.")
     parser.add_argument("--output", "-o", required=True,
                         help="HF repo id for all output tiers (org/name), "
                              "e.g. user/model-mAPEX")
@@ -3053,16 +3375,14 @@ def main():
                         help="S3 static access secret key, used with "
                              "--s3-key-id (default: $S3_SECRET from env / .env)")
     parser.add_argument("--s3-upload-source", action="store_true",
-                        help="Upload the source model to S3 (the merged GGUF "
-                             "when the source is split into shards, otherwise "
-                             "the single source file). Requires S3 credentials. "
-                             "Runs as a separate SRC task in the live table and "
-                             "blocks tier uploads until it finishes "
-                             "(quantization is not blocked).")
-    parser.add_argument("--source-file",
-                        help="Explicit source GGUF filename (skip auto-detection)")
-    parser.add_argument("--imatrix-file",
-                        help="Explicit imatrix filename (skip auto-detection)")
+                        help="Upload the source model (the merged GGUF when "
+                             "the source is split into shards) and the "
+                             "imatrix file to S3. Runs as a separate SRC task "
+                             "in the live table and blocks tier uploads until "
+                             "it finishes (quantization is not blocked). "
+                             "Files already present in the destination bucket "
+                             "are skipped; if both are already there, a "
+                             "warning is shown and no upload is performed.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the pipeline without downloading, quantizing, "
                              "or uploading. Still creates/updates README.md locally.")
