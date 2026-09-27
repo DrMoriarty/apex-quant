@@ -198,6 +198,17 @@ def resolve_profile(args):
         print("       --arch dense means the model has no expert layers at all.", file=sys.stderr)
         sys.exit(1)
 
+    # Validate arch vs profile family
+    if arch == "dense" and profile in PROFILES:
+        print("Error: MoE profile '{}' cannot be combined with --arch dense.".format(profile),
+              file=sys.stderr)
+        print("       --arch dense means no expert tensors (ffn_gate_exps) were detected;",
+              file=sys.stderr)
+        print("       use a dense-* profile (--arch dense is implied) or check that the",
+              file=sys.stderr)
+        print("       GGUF tensor names follow the standard llama.cpp MoE naming.", file=sys.stderr)
+        sys.exit(1)
+
     lookup = profile[2:] if profile.startswith("i-") else profile
     if lookup in PROFILES:
         indices = list(PROFILES[lookup])

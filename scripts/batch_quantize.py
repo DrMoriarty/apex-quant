@@ -251,6 +251,10 @@ def variant_key(tier: int, speed: bool) -> str:
     return f"{tier}-s" if speed else str(tier)
 
 
+_DISK_FULL_RE = re.compile(
+    r"no space left on device|disk.?full|errno 28|enospc", re.IGNORECASE)
+
+
 def variant_label(tier: int, speed: bool) -> str:
     """Display/README name for a tier variant: 'tier7' or 'tier7-s'."""
     return f"tier{tier}-s" if speed else f"tier{tier}"
@@ -268,6 +272,10 @@ def expand_variants(tiers: list) -> list:
         if t in SPEED_TIERS:
             out.append((t, True))
     return out
+
+
+class DiskFullError(RuntimeError):
+    """Raised when quantization fails because the disk is full."""
 
 
 # ---------------------------------------------------------------------------
@@ -1923,6 +1931,8 @@ def run_quantize(
             clean_err = _Capture._ANSI_RE.sub("", err_buf)
             tail_lines = [l for l in clean_err.splitlines() if l.strip()]
             tail = "\n".join(tail_lines[-15:]) or f"(exit code {proc.returncode})"
+            if _DISK_FULL_RE.search(clean_err):
+                raise DiskFullError(tail)
             raise RuntimeError(
                 f"quantize.py ({label}) failed:\n{tail}"
             )
@@ -2561,9 +2571,19 @@ def _estimate_tier_size(tier: int, speed: bool, source_gguf: Path) -> int:
            "--profile", f"tier{tier}", "--json", str(source_gguf)]
     if speed:
         cmd.append("--speed")
-    result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    data = json.loads(result.stdout)
-    return int(data["estimated_size_gb"] * 1e9)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        err = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"estimate_size.py exited with code {result.returncode} "
+            f"(tier{tier}{' --speed' if speed else ''}): {err[-800:]}")
+    try:
+        data = json.loads(result.stdout)
+        return int(data["estimated_size_gb"] * 1e9)
+    except (json.JSONDecodeError, KeyError, TypeError) as exc:
+        raise RuntimeError(
+            f"estimate_size.py produced unparseable output: {exc}; "
+            f"stdout tail: {result.stdout[-400:]!r}") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -3161,6 +3181,37 @@ def run_pipeline(args):
     processed = []
     failed = []
 
+    # Conservative mode: enabled when no size estimate is available (unknown
+    # model type).  Quantizes strictly one file at a time — a new quant starts
+    # only after the previous one has been uploaded and deleted from disk.
+    conservative = {"on": False}
+
+    def _enable_conservative(label: str, reason: str):
+        if conservative["on"]:
+            return
+        conservative["on"] = True
+        log_err(
+            f"⚠ {label}: no size estimate available ({reason}) —\n"
+            f"  DISK OVERFLOW RISK.  Switching to conservative mode:\n"
+            f"  quantizing ONE file at a time; the next quant starts only\n"
+            f"  after the previous one is fully uploaded and deleted from disk.\n"
+            f"  If the disk still fills up, the run aborts with an error.")
+
+    def _wait_conservative_slot(label: str):
+        """Conservative mode: block until no uploads are pending and all
+        previously quantized files are uploaded (and deleted)."""
+        if pending_uploads:
+            log(f"⏳ {label}: conservative mode — waiting for pending "
+                f"upload(s) to finish before starting a new quant …")
+        _wait_all_uploads()
+        _check_completed_uploads()
+        if not args.keep_files:
+            leftover = [p.name for p in output_dir.glob("*.gguf")
+                        if p.is_file() and p.stat().st_size > 0]
+            if leftover:
+                log(f"⚠ {label}: conservative mode — quant files still on "
+                    f"disk (not uploading): {', '.join(leftover)}")
+
     # huggingface_hub catches KeyboardInterrupt in its retry/tqdm loops
     # and swallows it, so _wait_all_uploads / fut.result() will block
     # forever on a normal SIGINT.  Use _allow_hard_interrupt so Ctrl+C
@@ -3235,8 +3286,24 @@ def run_pipeline(args):
                             state.set_tier(key, "pending")
                             st = "pending"
                     else:
-                        est_size = _estimate_tier_size(tier, speed, source_gguf)
-                        _wait_for_disk_space(int(est_size * DISK_MARGIN), label)
+                        est_size = None
+                        try:
+                            est_size = _estimate_tier_size(tier, speed, source_gguf)
+                        except Exception as exc:
+                            err = str(exc)[:300]
+                            log_err(f"{label} size estimate failed: {err}")
+                            _enable_conservative(label, err[:120])
+                        if est_size is not None:
+                            _wait_for_disk_space(int(est_size * DISK_MARGIN), label)
+                        else:
+                            # No estimate: gate on the source model size (a
+                            # quantized file is never larger than its source),
+                            # serialized one-quant-at-a-time.
+                            if conservative["on"]:
+                                _wait_conservative_slot(label)
+                            _wait_for_disk_space(
+                                int(source_gguf.stat().st_size * DISK_MARGIN),
+                                label)
                         state.set_tier(key, "quantizing")
                         if _lc:
                             _lc.active_tiers[key] = {"status": "quantizing",
@@ -3245,6 +3312,20 @@ def run_pipeline(args):
                         t0 = time.time()
                         try:
                             run_quantize(tier, speed, source_gguf, imatrix_path, output_gguf)
+                        except DiskFullError as exc:
+                            log_err(f"❌ {label}: DISK FULL during quantization:\n{exc}")
+                            log_err(
+                                "Aborting the run.  State is saved — completed "
+                                "tiers resume on re-run; this tier restarts "
+                                "from scratch.  Free up disk space and re-run.")
+                            state.set_tier(key, "error", error=str(exc)[:300],
+                                           error_short="disk full")
+                            failed.append((tier, speed))
+                            if _lc:
+                                _lc.active_tiers.pop(key, None)
+                            if output_gguf.exists() and output_gguf.stat().st_size == 0:
+                                output_gguf.unlink(missing_ok=True)
+                            raise
                         except Exception as exc:
                             err = str(exc)[:300]
                             log_err(f"{label} quantize failed: {err}")
@@ -3306,6 +3387,14 @@ def run_pipeline(args):
                 s3_executor.shutdown(wait=False, cancel_futures=True)
             if source_executor is not None:
                 source_executor.shutdown(wait=False, cancel_futures=True)
+        except DiskFullError:
+            _check_completed_uploads()
+            upload_executor.shutdown(wait=False, cancel_futures=True)
+            if s3_executor is not None:
+                s3_executor.shutdown(wait=False, cancel_futures=True)
+            if source_executor is not None:
+                source_executor.shutdown(wait=False, cancel_futures=True)
+            sys.exit(1)
         except Exception as exc:
             log_err(f"Unexpected error: {exc}")
             _check_completed_uploads()
