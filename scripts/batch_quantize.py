@@ -30,16 +30,22 @@ Concurrency:
     (so Ctrl+C can interrupt them)
   * tiers are quantized sequentially, but tier N upload overlaps with
     tier N+1 quantization (upload runs in a background thread)
-  * when S3 upload is enabled (--s3-endpoint/--s3-token), each tier is
-    uploaded to HF and to S3 in parallel: at most one quant is being
-    uploaded to HF and at most one to S3 at any given moment
-  * with --s3-upload-source the source model (the merged GGUF when the
-    source was split into shards) and the imatrix file are uploaded to S3
-    as a separate "SRC" task shown in the live table.  While it runs,
+  * when --quant-backup is given, each tier is uploaded to HF and to S3
+    in parallel: at most one quant is being uploaded to HF and at most
+    one to S3 at any given moment
+  * with --source-backup the source model (the merged GGUF when the
+    source was split into shards) and the imatrix file are uploaded to
+    S3 as a separate "SRC" task shown in the live table.  While it runs,
     tier uploads are blocked; quantization itself is not blocked.
-    Files that already exist in the destination bucket (by name) are
-    skipped; if both files are already there, a warning is printed and
-    no upload is performed.
+    Files that already exist in the destination (by name) are skipped;
+    if both files are already there, a warning is printed and no upload
+    is performed.
+
+Before any download or quantization the pipeline runs **preflight
+checks**: every remote target (source model, imatrix, output HF repo,
+--quant-backup / --source-backup locations) must be reachable and
+writable.  On any failure the script reports the error and exits
+immediately — it never starts heavy work with broken targets.
 
 Usage:
   python3 scripts/batch_quantize.py \\
@@ -49,8 +55,12 @@ Usage:
 
 Output repo: {output}  (all tier GGUFs in one repo)
 
-S3 upload (optional, S3-compatible API e.g. Yandex Object Storage):
-  The bucket must be embedded in the endpoint URL:
+S3 backup (optional, S3-compatible API e.g. Yandex Object Storage):
+  --quant-backup  s3://bucket/folder/   destination for quantized tiers
+  --source-backup s3://bucket/folder/   destination for the source model
+                                        (merged GGUF) and the imatrix
+  Both require S3_ENDPOINT + credentials.  The bucket must also be
+  embedded in the endpoint URL:
       https://storage.yandexcloud.net/<bucket>/
       https://<bucket>.storage.yandexcloud.net/
   Authentication: static access keys (S3_KEY_ID + S3_SECRET, AWS SigV4
@@ -59,7 +69,8 @@ S3 upload (optional, S3-compatible API e.g. Yandex Object Storage):
 
 Environment / .env:
   HF_TOKEN     HuggingFace access token
-  S3_ENDPOINT  S3 endpoint URL with bucket (enables S3 upload)
+   S3_ENDPOINT  S3 endpoint URL with bucket (enables S3 access:
+                s3:// sources and --quant-backup/--source-backup)
   S3_KEY_ID    S3 static access key id (with S3_SECRET)
   S3_SECRET    S3 static access secret key
   S3_TOKEN     S3 IAM token (alternative to static keys)
@@ -1121,6 +1132,37 @@ def _parse_remote_spec(spec: str) -> dict:
 def _spec_repo_label(spec: dict) -> str:
     """Human/README label for a source spec: HF repo id or the raw URL."""
     return spec["repo"] if spec["kind"] == "hf" else spec["raw"]
+
+
+def _parse_s3_backup_url(url: str, argname: str) -> dict:
+    """Parse a --quant-backup/--source-backup value: s3://bucket/folder/.
+
+    Returns {"bucket": str, "prefix": str} — *prefix* is the folder
+    path without trailing slash ("" for the bucket root).
+    """
+    s = url.strip().rstrip("/")
+    if not s.startswith("s3://"):
+        log_err(f"{argname} must be an s3:// URL (s3://bucket/folder/) — "
+                f"got '{url}'")
+        sys.exit(1)
+    bucket, _, prefix = s[5:].partition("/")
+    bucket = bucket.strip("/")
+    prefix = prefix.strip("/")
+    if not bucket:
+        log_err(f"{argname} must include a bucket: s3://bucket/folder/ — "
+                f"got '{url}'")
+        sys.exit(1)
+    return {"bucket": bucket, "prefix": prefix}
+
+
+def _s3_backup_key(dest: dict, name: str) -> str:
+    """Object key for *name* inside a backup destination."""
+    return f"{dest['prefix']}/{name}" if dest["prefix"] else name
+
+
+def _s3_backup_str(dest: dict) -> str:
+    """Human-readable s3:// label for a backup destination."""
+    return f"s3://{dest['bucket']}/{dest['prefix']}".rstrip("/")
 
 
 def _s3_key_url(s3: dict, bucket: str, key: str) -> str:
@@ -2281,6 +2323,8 @@ def upload_tier_s3(
     gguf_path: Path,
     s3: dict,
     *,
+    bucket: Optional[str] = None,
+    prefix: str = "",
     label: Optional[str] = None,
 ) -> None:
     """Upload a quantized GGUF to an S3-compatible storage.
@@ -2288,6 +2332,8 @@ def upload_tier_s3(
     Files larger than _S3_PART_SIZE are uploaded via multipart upload
     (simple PUT is rejected by the storage frontend for large bodies
     with HTTP 413).  Authentication: static keys (SigV4) or IAM token.
+    *bucket*/*prefix* select the destination (defaults: endpoint bucket,
+    bucket root).
     """
     label = label or f"tier{key}"
     if not gguf_path.exists():
@@ -2295,13 +2341,16 @@ def upload_tier_s3(
     if gguf_path.stat().st_size == 0:
         raise ValueError(f"GGUF file is empty: {gguf_path}")
 
+    bucket = bucket or s3["bucket"]
+    key_path = f"{prefix}/{gguf_path.name}" if prefix else gguf_path.name
+    dest = f"s3://{bucket}/{key_path}"
     size = gguf_path.stat().st_size
-    url = f"{s3['base_url']}/{s3['bucket']}/{gguf_path.name}"
+    url = _s3_key_url(s3, bucket, key_path)
 
     _live_active = _HAS_RICH and _lc is not None and _lc.live is not None
     if not _live_active:
         log(f"Uploading {label} ({gguf_path.name}, {size / (1024**3):.2f} GB) "
-            f"→ S3 {s3['bucket']}")
+            f"→ {dest}")
 
     if size <= _S3_PART_SIZE:
         # Simple PUT — small files fit in a single request (unsigned payload).
@@ -2325,7 +2374,7 @@ def upload_tier_s3(
         _s3_multipart_upload(key, gguf_path, url, s3, size)
 
     if not _live_active:
-        log(f"✓ Uploaded {label} → S3 {s3['bucket']}")
+        log(f"✓ Uploaded {label} → {dest}")
 
 
 def _s3_multipart_upload(
@@ -2411,6 +2460,101 @@ def _escape_xml(s: str) -> str:
              .replace(">", "&gt;"))
 
 
+# ---------------------------------------------------------------------------
+# Preflight — remote target reachability checks
+# ---------------------------------------------------------------------------
+
+@_retry_on_network_error
+def _hf_whoami(token: Optional[str]) -> None:
+    """Verify the HF token is valid."""
+    from huggingface_hub import HfApi
+    HfApi(token=token).whoami()
+
+
+@_retry_on_network_error
+def _hf_check_repo_writable(repo_id: str, token: Optional[str]) -> None:
+    """Verify an HF repo exists and the token can write to it.
+
+    ``create_repo(exist_ok=True)`` doubles as a write-permission probe:
+    a read-only token fails right here instead of after a 6-hour run.
+    """
+    from huggingface_hub import create_repo
+    create_repo(repo_id=repo_id, repo_type="model", exist_ok=True, token=token)
+
+
+def _s3_check_prefix_readable(s3: dict, bucket: str, prefix: str,
+                              what: str) -> None:
+    """Verify an S3 bucket/prefix is listable with current credentials."""
+    _s3_list_all(s3, bucket, f"{prefix}/" if prefix else "")
+
+
+def _s3_check_prefix_writable(s3: dict, bucket: str, prefix: str,
+                              what: str) -> None:
+    """Verify write access to an S3 bucket/prefix via a probe PUT+DELETE."""
+    probe = _s3_backup_key({"prefix": prefix},
+                           f"_apex_write_probe_{int(time.time())}.tmp")
+    url = _s3_key_url(s3, bucket, probe)
+    with httpx.Client(timeout=httpx.Timeout(60, connect=30)) as client:
+        resp = client.put(url, content=b"apex preflight write probe",
+                          headers=_s3_auth_headers(s3, "PUT", url))
+        _s3_check(resp, f"write probe ({what})")
+        resp = client.delete(url, headers=_s3_auth_headers(s3, "DELETE", url))
+        _s3_check(resp, f"write probe cleanup ({what})")
+
+
+def _preflight_remote_targets(*, token, s3, model_spec, imx_spec,
+                              output_base, quant_backup, source_backup,
+                              dry_run: bool):
+    """Fail fast: verify every remote target before any heavy work.
+
+    Checks source model, imatrix, output HF repo and both backup
+    destinations.  Any failure (unreachable host, bad credentials,
+    missing bucket/repo, missing write permission) is reported and the
+    script exits — downloads and quantization never start.
+    """
+    log("Preflight: checking remote targets …")
+
+    def _spec_check(spec: dict):
+        if spec["kind"] == "hf":
+            return lambda: _hf_list_repo_files(spec["repo"], token)
+        bucket = spec["bucket"] or (s3["bucket"] if s3 else "")
+        prefix = f"{spec['path']}/" if spec["path"] else ""
+        return lambda: _s3_check_prefix_readable(s3, bucket, prefix,
+                                                 spec["raw"])
+
+    checks: list = [
+        ("HF token (whoami)", lambda: _hf_whoami(token)),
+        (f"source model {model_spec['raw']}", _spec_check(model_spec)),
+        (f"imatrix {imx_spec['raw']}", _spec_check(imx_spec)),
+        (f"output repo {output_base}",
+         lambda: _hf_check_repo_writable(output_base, token)),
+    ]
+    for argname, dest in (("--quant-backup", quant_backup),
+                          ("--source-backup", source_backup)):
+        if dest is None:
+            continue
+        target = _s3_backup_str(dest)
+
+        def _fn(dest=dest, target=target):
+            _s3_check_prefix_readable(s3, dest["bucket"], dest["prefix"],
+                                      target)
+            if not dry_run:
+                _s3_check_prefix_writable(s3, dest["bucket"], dest["prefix"],
+                                          target)
+
+        checks.append((f"{argname} {target}", _fn))
+
+    for label, thunk in checks:
+        try:
+            thunk()
+        except Exception as exc:
+            log_err(f"Preflight failed — {label}: {exc}")
+            sys.exit(1)
+        log(f"  ✓ {label}")
+    if dry_run:
+        log("  (dry run: S3 write probes skipped)")
+
+
 def _estimate_tier_size(tier: int, speed: bool, source_gguf: Path) -> int:
     """Estimate quantized output size in bytes via estimate_size.py --json."""
     cmd = [sys.executable, str(SCRIPT_DIR / "estimate_size.py"),
@@ -2426,17 +2570,19 @@ def _estimate_tier_size(tier: int, speed: bool, source_gguf: Path) -> int:
 # Pipeline
 # ---------------------------------------------------------------------------
 
-def _partition_s3_upload_files(s3: dict, candidates: list) -> tuple[list, list]:
-    """Split SRC-upload candidates into (to_upload, already_in_s3).
+def _partition_s3_upload_files(s3: dict, dest: dict, candidates: list) -> tuple[list, list]:
+    """Split SRC-upload candidates into (to_upload, already_in_dest).
 
-    *candidates* is a list of (label, path, spec_kind).  A file whose
-    source spec was s3:// and whose name already exists in the
-    destination bucket is reported in *already_in_s3* and not uploaded.
+    *dest* is a backup target {"bucket", "prefix"}.  *candidates* is a
+    list of (label, path, spec_kind).  A file whose source spec was s3://
+    and whose name already exists in the destination is reported in
+    *already_in_dest* and not uploaded.
     """
     to_upload, already = [], []
     for lbl, p, spc_kind in candidates:
         if (spc_kind == "s3"
-                and _s3_head_size(s3, s3["bucket"], p.name) is not None):
+                and _s3_head_size(s3, dest["bucket"],
+                                  _s3_backup_key(dest, p.name)) is not None):
             already.append(lbl)
         else:
             to_upload.append((lbl, p))
@@ -2452,6 +2598,22 @@ def run_pipeline(args):
         sys.exit(1)
 
     s3 = _get_s3_settings(args)
+
+    # Parse --quant-backup / --source-backup (s3://bucket/folder/ URLs).
+    quant_backup = None
+    if getattr(args, "quant_backup", None):
+        if s3 is None:
+            log_err("--quant-backup requires S3_ENDPOINT and credentials "
+                    "(set them in .env).")
+            sys.exit(1)
+        quant_backup = _parse_s3_backup_url(args.quant_backup, "--quant-backup")
+    source_backup = None
+    if getattr(args, "source_backup", None):
+        if s3 is None:
+            log_err("--source-backup requires S3_ENDPOINT and credentials "
+                    "(set them in .env).")
+            sys.exit(1)
+        source_backup = _parse_s3_backup_url(args.source_backup, "--source-backup")
 
     # Parse --model/--imatrix universal URLs (hf:// / s3:// / legacy repo id).
     model_spec = _parse_remote_spec(args.model)
@@ -2478,21 +2640,21 @@ def run_pipeline(args):
                 s3["bucket"] = spc["bucket"]
                 log(f"  S3 bucket inferred from source URL: {s3['bucket']}")
                 break
-        if not s3["bucket"]:
+        # A bucketless endpoint is only fatal when an s3:// source needs
+        # it for downloads; backup URLs carry their own buckets.
+        if not s3["bucket"] and "s3" in (model_spec["kind"], imx_spec["kind"]):
             log_err("Cannot determine S3 bucket: S3_ENDPOINT has no embedded "
                     "bucket and no s3:// source URL to infer it from. "
                     "Use https://storage.yandexcloud.net/<bucket>/ or "
                     "https://<bucket>.storage.yandexcloud.net/")
             sys.exit(1)
 
-    # Optional S3 upload of the source (merged) model.  While the upload
-    # task runs, tier uploads are blocked (they wait on *source_upload_done*);
-    # quantization itself is not blocked.
-    upload_source = bool(getattr(args, "s3_upload_source", False))
-    if upload_source and s3 is None:
-        log_err("--s3-upload-source ignored: S3 endpoint/credentials are "
-                "not configured (set S3_ENDPOINT + keys in .env).")
-        upload_source = False
+    # Optional S3 backup of the source (merged) model + imatrix
+    # (--source-backup).  While the upload task runs, tier uploads are
+    # blocked (they wait on *source_upload_done*); quantization itself
+    # is not blocked.
+    upload_source = source_backup is not None
+    source_dest_str = _s3_backup_str(source_backup) if source_backup else ""
     source_upload_done = threading.Event()
     _upload_queue_lock = threading.Lock()
     if not upload_source:
@@ -2533,12 +2695,21 @@ def run_pipeline(args):
     if s3:
         auth_desc = ("static key" if s3["auth"]["mode"] == "sigv4" else "IAM token")
         log(f"  S3:       {s3['base_url']}  (bucket: {s3['bucket']}, auth: {auth_desc})")
-    if upload_source:
-        log("  S3 source upload: enabled (merged source model → S3)")
+    if quant_backup:
+        log(f"  Quant backup:  {_s3_backup_str(quant_backup)}")
+    if source_backup:
+        log(f"  Source backup: {source_dest_str}")
     log("=" * 60)
 
+    # ── 0. Preflight: verify all remote targets before any heavy work ──
+    _preflight_remote_targets(token=token, s3=s3, model_spec=model_spec,
+                              imx_spec=imx_spec, output_base=output_base,
+                              quant_backup=quant_backup,
+                              source_backup=source_backup,
+                              dry_run=args.dry_run)
+
     # Migrate state: variants uploaded before S3 support only went to HF.
-    if s3:
+    if quant_backup:
         migrated = False
         for tier, speed in variants:
             key = variant_key(tier, speed)
@@ -2698,20 +2869,20 @@ def run_pipeline(args):
             source_upload_done.set()
         else:
             # Files whose source was s3:// and which are already present
-            # in the destination bucket are skipped; if nothing remains,
-            # warn and skip the upload entirely.
+            # in the destination are skipped; if nothing remains, warn
+            # and skip the upload entirely.
             src_upload_files, already_in_s3 = _partition_s3_upload_files(
-                s3, [("source model", source_gguf, model_spec["kind"]),
-                     ("imatrix", imatrix_path, imx_spec["kind"])])
+                s3, source_backup,
+                [("source model", source_gguf, model_spec["kind"]),
+                 ("imatrix", imatrix_path, imx_spec["kind"])])
             if already_in_s3 and not src_upload_files:
-                log(f"⚠ --s3-upload-source: {' и '.join(already_in_s3)} уже "
-                    f"есть в S3 (bucket {s3['bucket']}) — аплоад выполнен "
-                    f"не будет")
+                log(f"⚠ --source-backup: {' и '.join(already_in_s3)} уже "
+                    f"есть в {source_dest_str} — аплоад выполнен не будет")
                 upload_source = False
                 source_upload_done.set()
             else:
                 if already_in_s3:
-                    log(f"✓ Already in S3, skipping upload: "
+                    log(f"✓ Already in {source_dest_str}, skipping upload: "
                         f"{', '.join(already_in_s3)}")
 
                 def _do_upload_source_s3():
@@ -2728,15 +2899,17 @@ def run_pipeline(args):
                             if _lc.live:
                                 _lc.live.update(_build_live_renderable())
                         log(f"Uploading {lbl} ({p.name}, "
-                            f"{fsize / (1024**3):.2f} GB) → S3 {s3['bucket']}")
+                            f"{fsize / (1024**3):.2f} GB) → {source_dest_str}")
                         try:
-                            upload_tier_s3("src", p, s3, label=lbl)
+                            upload_tier_s3("src", p, s3, label=lbl,
+                                           bucket=source_backup["bucket"],
+                                           prefix=source_backup["prefix"])
                         except Exception as exc:
                             err = str(exc)[:300]
                             log_err(f"{lbl} S3 upload failed: {err}")
                             failed_lbl = lbl
                             break
-                        log(f"✓ {lbl} uploaded to S3 {s3['bucket']}")
+                        log(f"✓ {lbl} uploaded to {source_dest_str}")
                     if _lc:
                         with _upload_queue_lock:
                             _lc.s3_upload_progress.pop("src", None)
@@ -2753,7 +2926,7 @@ def run_pipeline(args):
                         if _lc:
                             _lc.source_upload = {"status": "done",
                                                  "elapsed": elapsed}
-                        log(f"✓ Source files uploaded to S3 {s3['bucket']} "
+                        log(f"✓ Source files uploaded to {source_dest_str} "
                             f"in {_format_elapsed(elapsed)}")
                     source_upload_done.set()
                     if _lc and _lc.live:
@@ -2765,7 +2938,7 @@ def run_pipeline(args):
     elif upload_source and args.dry_run:
         names = ", ".join(p.name for p in (source_gguf, imatrix_path))
         log(f"DRY RUN: would upload source files ({names}) "
-            f"→ S3 {s3['bucket']}")
+            f"→ {source_dest_str}")
         source_upload_done.set()
 
     # ── 2. Initialize README.md ──
@@ -2803,7 +2976,7 @@ def run_pipeline(args):
         label = variant_label(tier, speed)
         st = state.tier_status(key)
         if st == "uploaded":
-            if s3 and not state.upload_done(key, "s3"):
+            if quant_backup and not state.upload_done(key, "s3"):
                 log(f"{label}: already on HF, will upload to S3")
             else:
                 log(f"✓ {label}: already uploaded, skipping")
@@ -2834,7 +3007,7 @@ def run_pipeline(args):
     # the upload workers), not every queued tier.
     _init_live()
     upload_executor = ThreadPoolExecutor(max_workers=1)
-    s3_executor = ThreadPoolExecutor(max_workers=1) if s3 else None
+    s3_executor = ThreadPoolExecutor(max_workers=1) if quant_backup else None
     # pending_uploads: ((tier, speed), target, Future)
     pending_uploads: list = []
 
@@ -2853,7 +3026,7 @@ def run_pipeline(args):
         """Mark variant uploaded when every enabled target has finished."""
         if not state.upload_done(key, "hf"):
             return
-        if s3 is not None and not state.upload_done(key, "s3"):
+        if quant_backup is not None and not state.upload_done(key, "s3"):
             return
         sz_gb = p.stat().st_size / (1024**3) if p.exists() else 0
         state.set_tier(key, "uploaded", size_mb=round(sz_gb * 1024, 1))
@@ -2894,7 +3067,7 @@ def run_pipeline(args):
         _maybe_finish_upload(key, p)
 
     def _do_upload_s3(vk: tuple, p: Path):
-        """Run in the S3 executor thread: upload GGUF to S3 storage."""
+        """Run in the S3 executor thread: upload GGUF to the S3 backup."""
         tier, speed = vk
         key = variant_key(tier, speed)
         source_upload_done.wait()
@@ -2903,7 +3076,8 @@ def run_pipeline(args):
         if _lc and _lc.live is not None:
             with _upload_queue_lock:
                 _lc.s3_upload_progress[key] = {"current": 0, "total": fsize, "start_ts": time.time()}
-        upload_tier_s3(key, p, s3)
+        upload_tier_s3(key, p, s3, bucket=quant_backup["bucket"],
+                       prefix=quant_backup["prefix"])
         state.mark_upload_done(key, "s3")
         if _lc:
             with _upload_queue_lock:
@@ -3011,12 +3185,12 @@ def run_pipeline(args):
                 # ── skip already uploaded ──
                 if st == "uploaded":
                     if output_gguf.exists() and output_gguf.stat().st_size > 0:
-                        if s3 and not state.upload_done(key, "s3"):
+                        if quant_backup and not state.upload_done(key, "s3"):
                             log(f"{label}: on HF, uploading to S3")
                         else:
                             log(f"✓ {label}: already uploaded, skipping")
                             continue
-                    elif s3 and not state.upload_done(key, "s3"):
+                    elif quant_backup and not state.upload_done(key, "s3"):
                         log(f"{label}: on HF, file was cleaned up → "
                             f"will re-quantize for S3 upload")
                         state.set_tier(key, "pending")
@@ -3110,7 +3284,7 @@ def run_pipeline(args):
                 if not info.get("hf_done"):
                     fut = upload_executor.submit(_do_upload_hf, (tier, speed), output_gguf)
                     pending_uploads.append(((tier, speed), "hf", fut))
-                if s3 is not None and not info.get("s3_done"):
+                if quant_backup is not None and not info.get("s3_done"):
                     fut = s3_executor.submit(_do_upload_s3, (tier, speed), output_gguf)
                     pending_uploads.append(((tier, speed), "s3", fut))
                 processed.append((tier, speed))
@@ -3278,7 +3452,7 @@ def _parse_tiers(s: str) -> list:
 _ARG_DESTS = [
     "model", "imatrix", "output", "tiers", "workspace", "token",
     "s3_endpoint", "s3_token", "s3_key_id", "s3_secret",
-    "s3_upload_source", "dry_run", "keep_files",
+    "quant_backup", "source_backup", "dry_run", "keep_files",
 ]
 
 
@@ -3295,7 +3469,8 @@ def _args_record(args: argparse.Namespace) -> dict:
         "s3_token": args.s3_token,
         "s3_key_id": args.s3_key_id,
         "s3_secret": args.s3_secret,
-        "s3_upload_source": args.s3_upload_source,
+        "quant_backup": args.quant_backup,
+        "source_backup": args.source_backup,
         "dry_run": args.dry_run,
         "keep_files": args.keep_files,
     }
@@ -3352,7 +3527,9 @@ def main():
             "  python3 scripts/batch_quantize.py \\\n"
             "    --model hf://user/source-model-GGUF/big_folder \\\n"
             "    --imatrix s3://my-bucket/imatrix/model.imatrix \\\n"
-            "    --output user/model-mAPEX --s3-upload-source\n"
+            "    --output user/model-mAPEX \\\n"
+            "    --quant-backup s3://my-bucket/quants/ \\\n"
+            "    --source-backup s3://my-bucket/source/\n"
         ),
     )
     parser.add_argument("--model", "-m", required=True,
@@ -3382,7 +3559,8 @@ def main():
                         help="S3 endpoint URL with bucket embedded "
                              "(e.g. https://storage.yandexcloud.net/my-bucket/ or "
                              "https://my-bucket.storage.yandexcloud.net/). "
-                             "Enables parallel S3 upload. "
+                             "Enables S3 access: s3:// sources and the "
+                             "--quant-backup/--source-backup destinations. "
                              "(default: $S3_ENDPOINT from env / .env)")
     parser.add_argument("--s3-token",
                         help="S3 IAM token, sent as Authorization: Bearer "
@@ -3394,15 +3572,24 @@ def main():
     parser.add_argument("--s3-secret",
                         help="S3 static access secret key, used with "
                              "--s3-key-id (default: $S3_SECRET from env / .env)")
-    parser.add_argument("--s3-upload-source", action="store_true",
-                        help="Upload the source model (the merged GGUF when "
-                             "the source is split into shards) and the "
-                             "imatrix file to S3. Runs as a separate SRC task "
-                             "in the live table and blocks tier uploads until "
-                             "it finishes (quantization is not blocked). "
-                             "Files already present in the destination bucket "
-                             "are skipped; if both are already there, a "
-                             "warning is shown and no upload is performed.")
+    parser.add_argument("--quant-backup", default=None, metavar="S3_URL",
+                        help="s3://bucket/folder/ — upload every quantized "
+                             "tier GGUF to this S3 location (in addition to "
+                             "the HF output repo). Requires S3_ENDPOINT and "
+                             "credentials. Without it, quants are uploaded "
+                             "to HF only.")
+    parser.add_argument("--source-backup", default=None, metavar="S3_URL",
+                        help="s3://bucket/folder/ — upload the source model "
+                             "(the merged GGUF when the source is split into "
+                             "shards) and the imatrix file to this S3 "
+                             "location (replaces the removed "
+                             "--s3-upload-source). Runs as a separate SRC "
+                             "task in the live table and blocks tier uploads "
+                             "until it finishes (quantization is not "
+                             "blocked). Files already present in the "
+                             "destination are skipped; if both are already "
+                             "there, a warning is shown and no upload is "
+                             "performed.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Simulate the pipeline without downloading, quantizing, "
                              "or uploading. Still creates/updates README.md locally.")
