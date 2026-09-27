@@ -45,7 +45,8 @@ def main():
     mtp_layers = set()
 
     pattern_ffn = re.compile(r"blk\.(\d+)\.ffn_")
-    pattern_expert = re.compile(r"blk\.(\d+)\.ffn_gate_exps")
+    # Gate-less MoE (Nemotron Lightning etc.) ship only ffn_up_exps/ffn_down_exps.
+    pattern_expert = re.compile(r"blk\.(\d+)\.ffn_(?:gate|up|down)_exps")
     pattern_mtp = re.compile(r"blk\.(\d+)\.(nextn|mtl|mtp|future)\.")
     pattern_moe_mtp = re.compile(r"blk\.(\d+)\.moe\.")
 
