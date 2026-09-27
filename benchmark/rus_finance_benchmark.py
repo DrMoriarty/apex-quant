@@ -199,12 +199,15 @@ def run_items(items, port, temperature, parallel):
 
     results = [None] * len(items)
     done = 0
+    t0 = time.time()
     with ThreadPoolExecutor(max_workers=parallel) as pool:
         for idx, item, out, pred, ok in pool.map(work, enumerate(items)):
+            if done == 0:
+                eta = (time.time() - t0) * len(items)
+                print(f"ETA: {eta:.0f}s")
             results[idx] = (item, out, pred, ok)
             done += 1
-            if done % 25 == 0 or done == len(items):
-                print(f"  progress: {done}/{len(items)}", file=sys.stderr)
+            print(f"[{done}]{'+' if ok else '-'}", end="", flush=True)
     return results
 
 
