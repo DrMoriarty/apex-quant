@@ -84,7 +84,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 # ---------------------------------------------------------------------------
 # Setup
@@ -171,6 +171,20 @@ _NETWORK_ERRORS = (
 ) + _HTTPX_ERRORS
 
 
+def _is_http_client_error(exc: Exception) -> bool:
+    """True for permanent HTTP 4xx errors (except 429 rate limiting).
+
+    Covers both httpx.HTTPStatusError and huggingface_hub's
+    HfHubHTTPError (RepositoryNotFoundError etc.), which also carry a
+    ``.response``.
+    """
+    resp = getattr(exc, "response", None)
+    status = getattr(resp, "status_code", None)
+    if status is None:
+        return False
+    return 400 <= status < 500 and status != 429
+
+
 def _retry_on_network_error(fn=None, *, max_retries=5, delay=10):
     """Decorator: retry a function on transient network errors.
 
@@ -186,6 +200,10 @@ def _retry_on_network_error(fn=None, *, max_retries=5, delay=10):
                 try:
                     return func(*args, **kwargs)
                 except _NETWORK_ERRORS as exc:
+                    # Client-side HTTP errors (4xx) are permanent — retrying
+                    # a 404/401 is pointless.  429 (rate limit) is retried.
+                    if _is_http_client_error(exc):
+                        raise
                     if attempt == max_retries:
                         raise
                     log_err(f"Network error in {func.__name__}: {exc}")
@@ -1370,7 +1388,7 @@ def _readme_in_repo(repo_id: str, token: Optional[str]) -> bool:
         files = api.list_repo_files(repo_id=repo_id, repo_type="model")
         return "README.md" in files
     except Exception as exc:
-        if _is_network_error(exc):
+        if _is_network_error(exc) and not _is_http_client_error(exc):
             raise
         return False
 
@@ -1392,7 +1410,7 @@ def _download_readme(repo_id: str, token: Optional[str], dest: Path) -> bool:
             dest.write_text(src.read_text())
         return dest.exists()
     except Exception as exc:
-        if _is_network_error(exc):
+        if _is_network_error(exc) and not _is_http_client_error(exc):
             raise
         return False
 
@@ -2133,7 +2151,9 @@ def _aws_sigv4_headers(method: str, url: str, key_id: str, secret: str,
         pairs = []
         for part in u.query.split("&"):
             k, _, v = part.partition("=")
-            pairs.append((_uri_encode(k), _uri_encode(v)))
+            # query values arrive URL-encoded — decode first so the
+            # canonical form is encoded exactly once
+            pairs.append((_uri_encode(unquote(k)), _uri_encode(unquote(v))))
         pairs.sort()
         canonical_query = "&".join(f"{k}={v}" for k, v in pairs)
     else:
