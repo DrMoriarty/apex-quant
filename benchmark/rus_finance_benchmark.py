@@ -10,10 +10,16 @@ Usage:
 Options:
     --model PATH        GGUF model file (required)
     --lora PATH         Optional LoRA adapter (gguf)
-    --level LEVEL       Run only one level: Basic | Intermediate | Advanced
+    --level LEVEL       Run only specific levels (comma-separated):
+                        Basic | Intermediate | Advanced
     --temperature T     Sampling temperature (default: 0.0 = greedy)
     --parallel N        Concurrent requests to the server (default: 1)
-    --limit N           Limit number of questions (for smoke runs)
+    --limit N           Limit number of questions (default: 400).
+                        Randomly sampled (evenly split across levels when
+                        several are selected). Use -1 or "all" for the
+                        whole file.
+    --top-list          Disable random sampling: take the first --limit
+                        questions from the file (legacy behavior)
     --ngl N             GPU layers (default: 99, env NGL)
     --context N         Context size (default: 4096)
     --dataset PATH      Path to benchmark jsonl (default: dataset/rus_finance_benchmark.jsonl)
@@ -36,6 +42,7 @@ import socket
 import subprocess
 import sys
 import time
+import random
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -46,6 +53,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_DATASET = REPO_ROOT / "dataset" / "rus_finance_benchmark.jsonl"
 
 LEVELS = ["Basic", "Intermediate", "Advanced"]
+
+DEFAULT_LIMIT = 400
 
 SYSTEM_PROMPT = (
     "Ты — точный вычислительный ассистент. Реши задачу и дай ответ в виде "
@@ -172,7 +181,33 @@ def is_correct(predicted, expected, rel_tol=0.005, abs_tol=1e-9):
     return abs(predicted - expected) <= max(abs_tol, rel_tol * abs(expected))
 
 
-def load_dataset(path: Path, level: str | None, limit: int | None):
+def parse_limit(value: str | None) -> int | None:
+    """None means 'no limit' (whole file)."""
+    if value is None:
+        return DEFAULT_LIMIT
+    v = str(value).strip().lower()
+    if v in ("-1", "all"):
+        return None
+    try:
+        n = int(v)
+    except ValueError:
+        sys.exit(f"Error: invalid --limit value: {value!r}")
+    return n if n > 0 else None
+
+
+def parse_levels(value: str | None) -> list[str] | None:
+    if not value:
+        return None
+    levels = [p.strip() for p in value.split(",") if p.strip()]
+    for lv in levels:
+        if lv not in LEVELS:
+            sys.exit(f"Error: invalid --level value: {lv!r} "
+                     f"(choose from {', '.join(LEVELS)})")
+    return levels
+
+
+def load_dataset(path: Path, levels: list[str] | None,
+                 limit: int | None, top_list: bool = False):
     items = []
     with path.open() as f:
         for line in f:
@@ -180,12 +215,30 @@ def load_dataset(path: Path, level: str | None, limit: int | None):
             if not line:
                 continue
             d = json.loads(line)
-            if level and d["level"] != level:
+            if levels and d["level"] not in levels:
                 continue
             items.append(d)
-    if limit:
-        items = items[:limit]
-    return items
+    if limit is None or len(items) <= limit:
+        return items
+    if top_list:
+        return items[:limit]
+    # Random sampling: evenly split the limit across selected levels.
+    if levels:
+        by_level = defaultdict(list)
+        for it in items:
+            by_level[it["level"]].append(it)
+        k = len(levels)
+        base, rem = divmod(limit, k)
+        picked = []
+        for i, lv in enumerate(levels):
+            n = base + (1 if i < rem else 0)
+            pool = by_level.get(lv, [])
+            if len(pool) <= n:
+                picked.extend(pool)
+            else:
+                picked.extend(random.sample(pool, n))
+        return picked
+    return random.sample(items, limit)
 
 
 def run_items(items, port, temperature, parallel):
@@ -241,14 +294,19 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", required=True, help="Path to GGUF model")
     ap.add_argument("--lora", default=None, help="Optional LoRA adapter (gguf)")
-    ap.add_argument("--level", choices=LEVELS, default=None,
-                    help="Run only one level")
+    ap.add_argument("--level", type=str, default=None,
+                    help="Run only specific levels, comma-separated "
+                         "(e.g. Basic or Basic,Advanced)")
     ap.add_argument("--temperature", type=float, default=0.0,
                     help="Sampling temperature (default: 0.0)")
     ap.add_argument("--parallel", type=int, default=1,
                     help="Concurrent requests (default: 1)")
-    ap.add_argument("--limit", type=int, default=None,
-                    help="Limit number of questions")
+    ap.add_argument("--limit", type=str, default=None,
+                    help="Limit number of questions (default: 400; "
+                         "-1 or 'all' = whole file)")
+    ap.add_argument("--top-list", action="store_true",
+                    help="Disable random sampling, take first --limit "
+                         "questions from the file")
     ap.add_argument("--ngl", type=int,
                     default=int(os.environ.get("NGL", 99)),
                     help="GPU layers (default: env NGL or 99)")
@@ -261,7 +319,9 @@ def main():
 
     repo_env = load_env(REPO_ROOT / ".env")
     server_bin = find_server_binary(repo_env)
-    items = load_dataset(args.dataset, args.level, args.limit)
+    levels = parse_levels(args.level)
+    limit = parse_limit(args.limit)
+    items = load_dataset(args.dataset, levels, limit, args.top_list)
     if not items:
         sys.exit("No questions selected (check --level / --limit).")
 
@@ -270,7 +330,8 @@ def main():
         print(f"LoRA:         {args.lora}")
     print(f"Server:       {server_bin} (port {args.port})")
     print(f"Questions:    {len(items)}"
-          + (f" (level={args.level})" if args.level else ""))
+          + (f" (level={args.level})" if args.level else "")
+          + (" (top-of-list)" if args.top_list else " (random sample)"))
     print(f"Temperature:  {args.temperature}")
 
     cmd = [
