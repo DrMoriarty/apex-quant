@@ -231,8 +231,20 @@ def main():
         print(f"ERROR: Input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
-    # Dry-run: estimate size without quantizing
+    # Dry-run: ask llama-quantize itself to compute the output size
     if args.dry_run:
+        quantize_bin = find_quantize()
+        if quantize_bin:
+            est_cmd = [quantize_bin, "--tensor-type-file", config_file, "--dry-run",
+                       args.input, args.base_type]
+            try:
+                subprocess.run(est_cmd, check=True)
+            finally:
+                if tmpfile:
+                    os.unlink(tmpfile.name)
+            sys.exit(0)
+        # Fallback: no llama-quantize binary available, use offline estimator
+        print(">>> llama-quantize not found, falling back to estimate_size.py", file=sys.stderr)
         est_cmd = [sys.executable, os.path.join(SCRIPT_DIR, "estimate_size.py"),
                    "--profile", args.profile, "--layers", str(args.layers),
                    "--base-type", args.base_type, args.input]
