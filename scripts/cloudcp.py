@@ -16,6 +16,8 @@ Paths are distinguished by scheme:
 Optional revision for HF: hf://[datasets/]account/repo@revision/path
 (default: main).
 `ls` supports a glob mask (* and ?) in the last path component.
+`cp` accepts a single file, a directory (copied recursively) or a glob
+mask (* and ?) in the last path component as SRC.
 
 `cp` streams data in small chunks in both directions: the full file is never
 held in memory and no temporary content files are created — the destination
@@ -48,7 +50,7 @@ import sys
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dc_replace
 
 import httpx
 
@@ -1315,6 +1317,97 @@ def cmd_rm(args) -> None:
 # cp dispatcher & CLI
 # ---------------------------------------------------------------------------
 
+def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
+    """Expand a cp source (file, directory or glob mask) into files.
+
+    Returns (pairs, plain) where pairs is a list of (file_uri, rel_name)
+    and plain is True when the source was a single literal file (rel_name
+    is then just its basename).
+    """
+    if src.kind == "local":
+        import glob as _glob
+        if any(c in src.path for c in "*?["):
+            matches = sorted(p for p in _glob.glob(src.path)
+                             if os.path.isfile(p))
+            if not matches:
+                sys.exit(f"error: no such file: {src.path}")
+            return ([(URI("local", path=m, raw=m), os.path.basename(m))
+                     for m in matches], False)
+        if os.path.isfile(src.path):
+            return [(src, os.path.basename(src.path))], True
+        if os.path.isdir(src.path):
+            out = []
+            for root, _dirs, files in os.walk(src.path):
+                for name in sorted(files):
+                    p = os.path.join(root, name)
+                    out.append((URI("local", path=p, raw=p),
+                                os.path.relpath(p, src.path)))
+            if not out:
+                sys.exit(f"error: directory is empty: {src.path}")
+            return out, False
+        sys.exit(f"error: no such file: {src.path}")
+
+    dir_part, mask = split_glob(src.path)
+    dir_part = dir_part.rstrip("/")
+    prefix = (dir_part + "/") if dir_part else ""
+
+    def make(path: str) -> URI:
+        return dc_replace(src, path=path)
+
+    def finish(out: list[tuple[URI, str]], what: str):
+        if not out:
+            sys.exit(f"error: {what}: {src.label()}")
+        return out, False
+
+    if src.kind == "hf":
+        hf = get_hf()
+        if mask:
+            regex = glob_to_regex(mask)
+            out = []
+            for kind, path, _size in hf.list(dc_replace(src, path=dir_part)):
+                base = path[len(prefix):]
+                if kind == "file" and "/" not in base and regex.match(base):
+                    out.append((make(path), base))
+            return finish(out, "nothing found under")
+        if src.path and hf.stat(src) is not None:
+            return [(src, os.path.basename(src.path))], True
+        out = []
+
+        def walk_hf(u: URI) -> None:
+            for kind, path, _size in hf.list(u):
+                if kind == "dir":
+                    walk_hf(dc_replace(src, path=path))
+                else:
+                    out.append((make(path), path[len(prefix):]))
+
+        walk_hf(dc_replace(src, path=dir_part))
+        return finish(out, "no such file or directory")
+
+    s3 = get_s3()
+    if mask:
+        regex = glob_to_regex(mask)
+        out = []
+        for kind, key, _size in s3.list(src.bucket, prefix):
+            base = key[len(prefix):]
+            if kind == "file" and "/" not in base and regex.match(base):
+                out.append((make(key), base))
+        return finish(out, "nothing found under")
+    if src.path and not src.path.endswith("/") \
+            and s3.stat(src.bucket, src.path) is not None:
+        return [(src, os.path.basename(src.path))], True
+    out = []
+
+    def walk_s3(pfx: str) -> None:
+        for kind, key, _size in s3.list(src.bucket, pfx):
+            if kind == "dir":
+                walk_s3(key)
+            else:
+                out.append((make(key), key[len(prefix):]))
+
+    walk_s3(prefix)
+    return finish(out, "no such file or directory")
+
+
 def cmd_cp(args) -> None:
     global S3_PART_SIZE
     if args.part_size_mb:
@@ -1325,30 +1418,55 @@ def cmd_cp(args) -> None:
     resolve_s3(dest)
     force = args.force
 
-    if dest.kind == "local" and (dest.path.endswith("/")
-                                 or os.path.isdir(dest.path)):
-        dest.path = os.path.join(
-            dest.path, os.path.basename(src.path.rstrip("/")))
-    if src.kind == "hf" and dest.kind == "hf" and src.repo_id == dest.repo_id \
-            and src.path == dest.path:
-        sys.exit("error: source and destination are the same file")
+    pairs, plain = expand_cp_sources(src)
+    multi = len(pairs) > 1
+    if multi and dest.kind == "local" and not dest.path.endswith("/") \
+            and not os.path.isdir(dest.path):
+        sys.exit("error: multiple sources need a directory destination — "
+                 f"add a trailing '/': {args.dst}")
+    if multi and dest.kind != "local" and not dest.raw.endswith("/"):
+        sys.exit("error: multiple sources need a directory destination — "
+                 f"add a trailing '/': {args.dst}")
+    dest_is_dir = (dest.kind == "local"
+                   and (dest.path.endswith("/") or os.path.isdir(dest.path))) \
+        or (dest.kind != "local" and dest.raw.endswith("/"))
+    if multi and dest.kind == "local":
+        os.makedirs(dest.path, exist_ok=True)
+        dest_is_dir = True
+    if multi:
+        print(f"{len(pairs)} file(s) to copy")
 
-    if src.kind == "local" and dest.kind == "local":
-        copy_local_to_local(src, dest, force)
-    elif dest.kind == "s3":
-        copy_to_s3(src, dest, force)
-    elif dest.kind == "local":
-        copy_to_local(src, dest, force)
-    elif dest.kind == "hf":
-        if src.kind == "hf":
-            copy_hf_to_hf(src, dest, force)
-        elif src.kind == "local":
-            get_hf().upload(src, dest, force)
+    for i, (s, rel) in enumerate(pairs, 1):
+        if plain or not dest_is_dir:
+            d = dest
         else:
-            get_hf().upload(src, dest, force)
-    else:
-        sys.exit(f"error: unsupported combination: "
-                 f"{src.kind} -> {dest.kind}")
+            rel_posix = rel.replace(os.sep, "/")
+            if dest.kind == "local":
+                dpath = os.path.join(dest.path, rel_posix)
+            else:
+                dpath = (dest.path.rstrip("/") + "/" + rel_posix) \
+                    if dest.path else rel_posix
+            d = dc_replace(dest, path=dpath)
+        if multi:
+            print(f"[{i}/{len(pairs)}] {s.label()}")
+
+        if s.kind == "hf" and d.kind == "hf" and s.repo_id == d.repo_id \
+                and s.path == d.path:
+            sys.exit("error: source and destination are the same file")
+        if s.kind == "local" and d.kind == "local":
+            copy_local_to_local(s, d, force)
+        elif d.kind == "s3":
+            copy_to_s3(s, d, force)
+        elif d.kind == "local":
+            copy_to_local(s, d, force)
+        elif d.kind == "hf":
+            if s.kind == "hf":
+                copy_hf_to_hf(s, d, force)
+            else:
+                get_hf().upload(s, d, force)
+        else:
+            sys.exit(f"error: unsupported combination: "
+                     f"{s.kind} -> {d.kind}")
 
 
 def main() -> None:
@@ -1360,7 +1478,8 @@ def main() -> None:
                     "(streaming, resumable)")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p_cp = sub.add_parser("cp", help="copy a file (any pair of local/s3/hf)")
+    p_cp = sub.add_parser("cp", help="copy a file/directory/glob mask "
+                                     "(any pair of local/s3/hf)")
     p_cp.add_argument("src")
     p_cp.add_argument("dst")
     p_cp.add_argument("--force", action="store_true",
