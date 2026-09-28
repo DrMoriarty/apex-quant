@@ -129,6 +129,9 @@ ALWAYS_F32 = [
     re.compile(r"token_embd_norm\.weight$"),
     re.compile(r"blk\.\d+\.shortconv\.conv\.weight$"),
     re.compile(r"blk\.\d+\.exp_probs_b\.bias"),
+    # nemotron
+    re.compile(r"blk\.\d+\.ssm_conv1d\.bias$"),
+    re.compile(r"blk\.\d+\.ssm_d$"),
 ]
 
 GROUP_EXPERTS = re.compile(r"blk\.\d+\.ffn_(gate|up|down)_exps")
