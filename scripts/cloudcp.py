@@ -9,9 +9,12 @@ Usage:
 Paths are distinguished by scheme:
   s3://bucket/folder/file.gguf                  S3-compatible storage
   hf://account/repository/folder/file.gguf      HuggingFace model repo
+  hf://datasets/account/repo/folder/file.jsonl  HuggingFace dataset repo
+  hf://spaces/account/repo/...                  HuggingFace Space
   /local/path/file.gguf                         local filesystem
 
-Optional revision for HF: hf://account/repo@revision/path (default: main).
+Optional revision for HF: hf://[datasets/]account/repo@revision/path
+(default: main).
 `ls` supports a glob mask (* and ?) in the last path component.
 
 `cp` streams data in small chunks in both directions: the full file is never
@@ -160,6 +163,7 @@ class URI:
     bucket: str = ""     # s3
     repo_id: str = ""    # hf ("owner/name")
     revision: str = "main"
+    repo_type: str = "model"  # hf: "model" | "dataset" | "space"
     path: str = ""       # object key / path-in-repo / local path
     raw: str = ""
 
@@ -167,7 +171,8 @@ class URI:
         if self.kind == "s3":
             return f"s3://{self.bucket}/{self.path}"
         if self.kind == "hf":
-            return f"hf://{self.repo_id}/{self.path}"
+            prefix = "" if self.repo_type == "model" else self.repo_type + "s/"
+            return f"hf://{prefix}{self.repo_id}/{self.path}"
         return self.path
 
 
@@ -179,13 +184,22 @@ def parse_uri(raw: str) -> URI:
     if raw.startswith("hf://"):
         parts = raw[5:].split("/")
         if len(parts) < 2 or not parts[0] or not parts[1]:
-            sys.exit(f"error: HF path must be hf://account/repository[/path] "
+            sys.exit(f"error: HF path must be "
+                     f"hf://[datasets/]account/repository[/path] "
                      f"— got '{raw}'")
+        repo_type = "model"
+        if parts[0] in ("datasets", "spaces"):
+            repo_type = parts[0].rstrip("s")
+            parts = parts[1:]
+            if len(parts) < 2 or not parts[0] or not parts[1]:
+                sys.exit(f"error: HF path must be "
+                         f"hf://{repo_type}s/account/repository[/path] "
+                         f"— got '{raw}'")
         repo, revision = parts[1], "main"
         if "@" in repo:
             repo, _, revision = repo.partition("@")
         return URI("hf", repo_id=f"{parts[0]}/{repo}", revision=revision,
-                   path="/".join(parts[2:]), raw=raw)
+                   repo_type=repo_type, path="/".join(parts[2:]), raw=raw)
     return URI("local", path=raw, raw=raw)
 
 
@@ -639,9 +653,10 @@ class HFClient:
 
     def resolve_url(self, uri: URI) -> str:
         rev = urllib.parse.quote(uri.revision, safe="")
+        prefix = "" if uri.repo_type == "model" else uri.repo_type + "s/"
         if not uri.path:
-            return f"{self.endpoint}/{uri.repo_id}/resolve/{rev}"
-        return (f"{self.endpoint}/{uri.repo_id}/resolve/{rev}/"
+            return f"{self.endpoint}/{prefix}{uri.repo_id}/resolve/{rev}"
+        return (f"{self.endpoint}/{prefix}{uri.repo_id}/resolve/{rev}/"
                 f"{urllib.parse.quote(uri.path, safe='/')}")
 
     def stat(self, uri: URI) -> int | None:
@@ -699,7 +714,8 @@ class HFClient:
     def list(self, uri: URI):
         """Yield (kind, full_path, size) for one repo directory."""
         rev = urllib.parse.quote(uri.revision, safe="")
-        api_url = f"{self.endpoint}/api/models/{uri.repo_id}/tree/{rev}"
+        api_url = (f"{self.endpoint}/api/{uri.repo_type}s/"
+                   f"{uri.repo_id}/tree/{rev}")
         if uri.path:
             api_url += "/" + urllib.parse.quote(uri.path, safe="/")
         token = ""
@@ -737,7 +753,8 @@ class HFClient:
             from huggingface_hub.utils import RepositoryNotFoundError
         try:
             self.api.delete_file(path_in_repo=uri.path, repo_id=uri.repo_id,
-                                 repo_type="model", revision=uri.revision)
+                                 repo_type=uri.repo_type,
+                                 revision=uri.revision)
         except RepositoryNotFoundError:
             raise RuntimeError(
                 f"hf://{uri.repo_id}: repository does not exist — or the "
@@ -763,6 +780,7 @@ class HFClient:
         if not force:
             existing = self.stat(URI("hf", repo_id=dest.repo_id,
                                      revision=dest.revision,
+                                     repo_type=dest.repo_type,
                                      path=dest_path))
             if existing is not None:
                 if existing == src_size:
@@ -790,15 +808,16 @@ class HFClient:
             reader.bar = bar
         try:
             self.api.create_commit(
-                repo_id=dest.repo_id, repo_type="model",
+                repo_id=dest.repo_id, repo_type=dest.repo_type,
                 operations=[op],
                 commit_message=f"Upload {dest_path} via cloudcp")
         except RepositoryNotFoundError:
             print(f"repo {dest.repo_id} does not exist — creating it")
-            self.api.create_repo(repo_id=dest.repo_id, repo_type="model",
+            self.api.create_repo(repo_id=dest.repo_id, repo_type=dest.repo_type,
                                  exist_ok=True)
             self.api.create_commit(
-                repo_id=dest.repo_id, repo_type="model", operations=[op],
+                repo_id=dest.repo_id, repo_type=dest.repo_type,
+                operations=[op],
                 commit_message=f"Upload {dest_path} via cloudcp")
         finally:
             if bar is not None:
@@ -1150,9 +1169,9 @@ def copy_hf_to_hf(src: URI, dest: URI, force: bool) -> None:
     op = CommitOperationCopy(path_in_repo=dest_path,
                              src_path_in_repo=src.path,
                              src_repo_id=src.repo_id,
-                             source_repo_type="model")
+                             source_repo_type=src.repo_type)
     try:
-        hf.api.create_commit(repo_id=dest.repo_id, repo_type="model",
+        hf.api.create_commit(repo_id=dest.repo_id, repo_type=dest.repo_type,
                              operations=[op],
                              commit_message=f"Copy {src.path} via cloudcp")
     except RepositoryNotFoundError:
@@ -1254,7 +1273,7 @@ def cmd_ls(args) -> None:
 
     hf = get_hf()
     dir_uri = URI("hf", repo_id=uri.repo_id, revision=uri.revision,
-                  path=dir_part)
+                  repo_type=uri.repo_type, path=dir_part)
     dir_prefix = (dir_part + "/") if dir_part else ""
     found = False
     for kind, path, size in hf.list(dir_uri):
