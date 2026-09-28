@@ -1349,7 +1349,6 @@ def _s3_download_file(s3: dict, bucket: str, key: str, dest_dir: Path,
     if dest.exists():
         dest.unlink()
     part.rename(dest)
-    log(f"{label} complete: {dest.name}  ({actual / (1024**3):.2f} GB)")
     return dest
 
 
@@ -1726,7 +1725,6 @@ def _resumable_download(url: str, dest: Path, *, token: Optional[str] = None,
     if dest.exists():
         dest.unlink()
     part.rename(dest)
-    log(f"{label} complete: {dest.name}  ({actual / (1024**3):.2f} GB)")
     return dest
 
 
