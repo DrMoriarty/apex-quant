@@ -34,6 +34,7 @@ Environment:
 
 import argparse
 import json
+import math
 import os
 import re
 import shutil
@@ -241,6 +242,21 @@ def load_dataset(path: Path, levels: list[str] | None,
     return random.sample(items, limit)
 
 
+def humanize_eta(seconds: float) -> str:
+    units = [("w", 7 * 86400), ("d", 86400), ("h", 3600), ("m", 60), ("s", 1)]
+    value = int(seconds)
+    parts = []
+    for name, size in units:
+        if value >= size or parts:
+            q, value = divmod(value, size)
+            parts.append(f"{q}{name}")
+        if len(parts) == 2:
+            break
+    if not parts:
+        return "0s"
+    return " ".join(parts)
+
+
 def run_items(items, port, temperature, parallel):
     def work(idx_item):
         idx, item = idx_item
@@ -257,11 +273,22 @@ def run_items(items, port, temperature, parallel):
         for idx, item, out, pred, ok in pool.map(work, enumerate(items)):
             if done == 0:
                 eta = (time.time() - t0) * len(items)
-                print(f"ETA: {eta:.0f}s")
+                print(f"ETA: {humanize_eta(eta)}")
             results[idx] = (item, out, pred, ok)
             done += 1
             print(f"[{done}]{'+' if ok else '-'}", end="", flush=True)
     return results
+
+
+def wilson_ci(ok: int, n: int, z: float = 1.959963984540054):
+    """95% Wilson score interval for a binomial proportion."""
+    if n == 0:
+        return 0.0, 0.0
+    p = ok / n
+    denom = 1 + z * z / n
+    center = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, center - half), min(1.0, center + half)
 
 
 def report(results):
@@ -271,9 +298,9 @@ def report(results):
         by_level[item["level"]][0] += int(ok)
         by_level[item["level"]][1] += 1
 
-    print("\n" + "=" * 60)
-    print("rus_finance_benchmark results")
-    print("=" * 60)
+    print("\n" + "=" * 72)
+    print("rus_finance_benchmark results (95% CI, Wilson)")
+    print("=" * 72)
     total_ok = total_n = 0
     for level in LEVELS:
         if level not in by_level:
@@ -281,12 +308,16 @@ def report(results):
         ok, n = by_level[level]
         total_ok += ok
         total_n += n
-        print(f"{level:<14} {ok:>5}/{n:<5}  {100.0 * ok / n:6.2f}%")
+        lo, hi = wilson_ci(ok, n)
+        print(f"{level:<14} {ok:>5}/{n:<5}  {100.0 * ok / n:6.2f}%  "
+              f"[{100.0 * lo:5.2f}%, {100.0 * hi:5.2f}%]")
     if total_n:
-        print("-" * 60)
+        lo, hi = wilson_ci(total_ok, total_n)
+        print("-" * 72)
         print(f"{'Overall':<14} {total_ok:>5}/{total_n:<5}  "
-              f"{100.0 * total_ok / total_n:6.2f}%")
-    print("=" * 60)
+              f"{100.0 * total_ok / total_n:6.2f}%  "
+              f"[{100.0 * lo:5.2f}%, {100.0 * hi:5.2f}%]")
+    print("=" * 72)
 
 
 def main():
