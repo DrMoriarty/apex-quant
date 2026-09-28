@@ -59,6 +59,7 @@ import httpx
 # ---------------------------------------------------------------------------
 
 CHUNK_SIZE = 8 * 1024 * 1024          # 8 MB streaming buffer (constant memory)
+READ_CHUNK = 256 * 1024               # network read granularity (smooth progress)
 S3_PART_SIZE = 64 * 1024 * 1024       # 64 MB per multipart part
 READER_WINDOW = 32 * 1024 * 1024      # read-ahead window for seekable streams
 HTTP_TIMEOUT = httpx.Timeout(600, connect=30)
@@ -472,7 +473,7 @@ class S3Client:
                     "S3 range GET: server ignored Range (HTTP 200) — "
                     "resume is not possible")
             remaining = length
-            for chunk in resp.iter_bytes(CHUNK_SIZE):
+            for chunk in resp.iter_bytes(READ_CHUNK):
                 remaining -= len(chunk)
                 yield chunk
             if remaining > 0:
@@ -706,7 +707,7 @@ class HFClient:
                     "HF range GET: server ignored Range (HTTP 200) — "
                     "resume is not possible")
             remaining = length
-            for chunk in resp.iter_bytes(CHUNK_SIZE):
+            for chunk in resp.iter_bytes(READ_CHUNK):
                 remaining -= len(chunk)
                 yield chunk
             if remaining > 0:
