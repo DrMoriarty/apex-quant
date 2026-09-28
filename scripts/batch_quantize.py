@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """mAPEX Batch Quantization Pipeline.
 
-Downloads a source GGUF model (bf16/f16/f32) and an importance matrix from
-HuggingFace or S3-compatible storage, quantizes through mAPEX tiers using
-quantize.py, and uploads every resulting GGUF to HuggingFace.
+Downloads a source model and an importance matrix from HuggingFace or
+S3-compatible storage, quantizes through mAPEX tiers using quantize.py,
+and uploads every resulting GGUF to HuggingFace.
+
+The source model may be a GGUF (bf16/f16/f32) or a safetensors model.
+When the source repo contains safetensors instead of GGUF, the model is
+downloaded, converted to a single GGUF with convert_hf_to_gguf.py (the
+output precision BF16/F16/F32 is auto-detected from the tensor dtypes),
+and the normal workflow continues with the converted GGUF.
 
 --model and --imatrix accept universal URLs:
   hf://account/repo/folder/file.gguf   HuggingFace model repo
@@ -436,6 +442,7 @@ class _LiveContext:
         self.source_upload: Optional[dict] = None
         self.downloads: dict[str, dict] = {}
         self.merge: Optional[dict] = None
+        self.convert: Optional[dict] = None
         self.state: Optional["BatchState"] = None
         self.source_ok: bool = False
         self.imatrix_ok: bool = False
@@ -618,6 +625,29 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         table.add_column("Status", width=56)
         table.add_column("Info", ratio=1, style="dim", overflow="fold")
 
+        # Safetensors → GGUF conversion task
+        if _lc.convert:
+            cv = _lc.convert
+            cst = cv["status"]
+            if cst == "converting":
+                start = cv.get("start", time.time())
+                elapsed_str = _format_elapsed(time.time() - start)
+                frame = _SPINNER_FRAMES[int(time.time() * 4) % len(_SPINNER_FRAMES)]
+                table.add_row("CONVERT", "—",
+                              Text(f" {frame} converting safetensors → GGUF… {elapsed_str}",
+                                   style="yellow"), "")
+            elif cst == "error":
+                elapsed_str = _format_elapsed(cv.get("elapsed", 0))
+                table.add_row("CONVERT", "—",
+                              Text(f" ✗ conversion failed {elapsed_str}", style="bold red"), "")
+            else:
+                elapsed_str = _format_elapsed(cv.get("elapsed", 0))
+                note = " (cached)" if cst == "cached" else ""
+                outtype = cv.get("outtype", "")
+                info = outtype.upper() if outtype else ""
+                table.add_row("CONVERT", "—",
+                              Text(f" ✓ converted in {elapsed_str}{note}", style="green"), info)
+
         # Merge row (shard merge task)
         if _live_ctx.merge:
             mg = _live_ctx.merge
@@ -742,6 +772,14 @@ def display_status(state: BatchState, source_ok: bool, imatrix_ok: bool,
         table.add_column("Base", width=7)
         table.add_column("Status", width=56)
         table.add_column("Info", ratio=1, style="dim", overflow="fold")
+        convert_rec = state.data.get("convert")
+        if convert_rec:
+            cel = _format_elapsed(convert_rec.get("elapsed", 0))
+            cst = convert_rec.get("status", "done")
+            note = " (cached)" if cst == "cached" else ""
+            style = "green" if cst in ("done", "cached") else "bold red"
+            table.add_row("CONVERT", "—",
+                          Text(f" ✓ converted in {cel}{note}", style=style), "")
         merge_rec = state.data.get("merge")
         if merge_rec:
             mel = _format_elapsed(merge_rec.get("elapsed", 0))
@@ -1846,6 +1884,175 @@ def _delete_shards(shard_paths: list):
             f"freed {freed / (1024**3):.2f} GB")
 
 
+# ---------------------------------------------------------------------------
+# Safetensors → GGUF conversion
+# ---------------------------------------------------------------------------
+
+# Repo files skipped when downloading a safetensors model (non-config
+# weights in other formats are not needed by convert_hf_to_gguf.py).
+_ST_SKIP_SUFFIXES = {".gguf", ".bin", ".pt", ".pth", ".onnx", ".msgpack",
+                     ".h5", ".ckpt", ".tflite", ".zip"}
+
+
+def find_hf_to_gguf():
+    """Find convert_hf_to_gguf.py (llama.cpp HF→GGUF converter)."""
+    q = os.environ.get("LLAMA_CONVERT_HF_TO_GGUF", "")
+    if q and os.path.isfile(q):
+        return q
+
+    d = os.environ.get("LLAMA_CPP_DIR", "")
+    if d:
+        p = os.path.join(d, "convert_hf_to_gguf.py")
+        if os.path.isfile(p):
+            return p
+
+    candidates = [
+        str(SCRIPT_DIR.parent / "llama-scripts" / "convert_hf_to_gguf.py"),
+        "./llama-scripts/convert_hf_to_gguf.py",
+        "./llama.cpp/convert_hf_to_gguf.py",
+        str(PROJECT_ROOT / "llama.cpp" / "convert_hf_to_gguf.py"),
+        str(PROJECT_ROOT.parent / "llama.cpp" / "convert_hf_to_gguf.py"),
+    ]
+    for c in candidates:
+        if os.path.isfile(c):
+            return c
+
+    try:
+        subprocess.check_output(["command", "-v", "convert_hf_to_gguf.py"],
+                                shell=True)
+        return "convert_hf_to_gguf.py"
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    return None
+
+
+def _detect_safetensors_outtype(st_paths: list) -> str:
+    """Auto-detect GGUF --outtype from safetensors tensor dtypes.
+
+    Reads each file's JSON header (first 8 bytes = header length) and
+    sums tensor byte sizes per dtype; the dominant dtype decides:
+    BF16 → bf16, F16 → f16, F32/F64 → f32.  Anything else (int8/fp8/…)
+    falls back to 'auto'.
+    """
+    dtype_bytes: dict[str, int] = {}
+    for p in st_paths:
+        with open(p, "rb") as f:
+            raw = f.read(8)
+            if len(raw) < 8:
+                continue
+            n = int.from_bytes(raw, "little")
+            header = json.loads(f.read(n))
+        for name, info in header.items():
+            if name == "__metadata__":
+                continue
+            off = info.get("data_offsets", [0, 0])
+            dtype_bytes[info.get("dtype", "?")] = (
+                dtype_bytes.get(info.get("dtype", "?"), 0)
+                + off[1] - off[0])
+    if not dtype_bytes:
+        return "auto"
+    top = max(dtype_bytes, key=dtype_bytes.get)
+    return {"BF16": "bf16", "F16": "f16",
+            "F32": "f32", "F64": "f32"}.get(top, "auto")
+
+
+def _safetensors_base_name(spec: dict) -> str:
+    """Base name for the converted GGUF, derived from the source spec."""
+    if spec["kind"] == "hf":
+        base = spec["repo"].split("/")[-1]
+    else:
+        base = (spec["path"].split("/")[0] if spec["path"]
+                else spec["bucket"])
+    return base or "model"
+
+
+def convert_safetensors_to_gguf(model_dir: Path, base_name: str, *,
+                                state: Optional["BatchState"] = None) -> Path:
+    """Convert a downloaded safetensors model directory to a single GGUF.
+
+    The output precision is auto-detected from the safetensors tensor
+    dtypes (bf16/f16/f32).  The converted GGUF is written next to
+    *model_dir* as ``<base_name>-<FMT>.gguf`` (the FMT token in the name
+    lets the usual tier-name derivation work) and reused on re-runs.
+    Shown as its own "CONVERT" row in the live table; the elapsed time
+    is recorded into *state*.
+    """
+    def _mark(status: str, elapsed: float, outtype: str = ""):
+        if _lc is not None:
+            if status == "converting":
+                _lc.convert = {"status": "converting", "start": time.time()}
+            else:
+                if _lc.convert is None:
+                    _lc.convert = {}
+                _lc.convert["status"] = status
+                _lc.convert["elapsed"] = elapsed
+                if outtype:
+                    _lc.convert["outtype"] = outtype
+            if _lc.live:
+                _lc.live.update(_build_live_renderable())
+        if state is not None:
+            state.set("convert", {"status": status,
+                                  "elapsed": round(elapsed, 1),
+                                  "outtype": outtype})
+
+    st_files = sorted(model_dir.glob("*.safetensors"))
+    if not st_files:
+        log_err(f"No .safetensors files found in {model_dir}")
+        sys.exit(1)
+    outtype = _detect_safetensors_outtype(st_files)
+    fmt_token = {"bf16": "BF16", "f16": "F16", "f32": "F32"}.get(
+        outtype, outtype.upper())
+    outfile = model_dir.parent / f"{base_name}-{fmt_token}.gguf"
+
+    if outfile.exists() and outfile.stat().st_size > 0:
+        log(f"✓ Converted GGUF already exists: {outfile.name}  "
+            f"({outfile.stat().st_size / (1024**3):.2f} GB)")
+        _mark("cached", 0.0, outtype)
+        return outfile
+
+    conv = find_hf_to_gguf()
+    if not conv:
+        log_err("convert_hf_to_gguf.py not found. Set LLAMA_CONVERT_HF_TO_GGUF "
+                "or LLAMA_CPP_DIR, or place a llama.cpp checkout next to the "
+                "repo, then convert manually:\n"
+                f"  python3 convert_hf_to_gguf.py {model_dir} "
+                f"--outtype {outtype} --outfile {outfile}")
+        sys.exit(1)
+
+    log(f"Converting safetensors → GGUF (detected format: {fmt_token}) "
+        f"→ {outfile.name} …")
+    _mark("converting", 0.0, outtype)
+    t0 = time.time()
+    cmd = [sys.executable, conv, str(model_dir), "--outtype", outtype,
+           "--outfile", str(outfile)]
+    try:
+        subprocess.run(cmd, check=True)
+        elapsed = time.time() - t0
+    except BaseException:
+        _mark("error", time.time() - t0, outtype)
+        raise
+    if not outfile.exists() or outfile.stat().st_size == 0:
+        raise RuntimeError(f"Converted GGUF is missing or empty: {outfile}")
+    _mark("done", elapsed, outtype)
+    log(f"✓ Converted: {outfile.name}  "
+        f"({outfile.stat().st_size / (1024**3):.2f} GB)  "
+        f"in {_format_elapsed(elapsed)}")
+    return outfile
+
+
+def _delete_safetensors(model_dir: Path):
+    """Delete downloaded safetensors weights after a successful conversion."""
+    freed, n = 0, 0
+    for p in sorted(model_dir.rglob("*")):
+        if p.is_file() and p.suffix.lower() == ".safetensors":
+            freed += p.stat().st_size
+            n += 1
+            p.unlink()
+    if n:
+        log(f"🗑  Removed {n} safetensors file(s), freed {freed / (1024**3):.2f} GB")
+
+
 def run_quantize(
     tier: int,
     speed: bool,
@@ -2748,6 +2955,11 @@ def run_pipeline(args):
         if merge_rec:
             _lc.merge = {"status": merge_rec.get("status", "done"),
                          "elapsed": merge_rec.get("elapsed", 0.0)}
+        convert_rec = state.get("convert")
+        if convert_rec:
+            _lc.convert = {"status": convert_rec.get("status", "done"),
+                           "elapsed": convert_rec.get("elapsed", 0.0),
+                           "outtype": convert_rec.get("outtype", "")}
 
     _init_live()
 
@@ -2791,29 +3003,46 @@ def run_pipeline(args):
     # ── discover files + download both (main thread so Ctrl+C works) ──
     source_files = None
     imatrix_file = None
+    source_is_safetensors = False
 
     if not source_info:
         source_exact, source_listing = _resolve_spec_listing(
             model_spec, token, s3, what="source model")
         gguf_files = [f for f in source_listing if f.endswith(".gguf")]
-        if not gguf_files:
-            log_err(f"No .gguf files found in {model_spec['raw']}")
-            sys.exit(1)
+        safetensors_files = [f for f in source_listing
+                             if f.endswith(".safetensors")]
         if source_exact and source_exact.endswith(".gguf"):
             source_file = source_exact
             log(f"Using source file from URL: {source_file}")
+        elif not gguf_files and (safetensors_files or
+                                 (source_exact and
+                                  source_exact.endswith(".safetensors"))):
+            source_is_safetensors = True
+            source_file = None
+            log(f"No GGUF in {model_spec['raw']} — safetensors source "
+                f"detected ({len(safetensors_files)} file(s)), "
+                f"will convert to GGUF (BF16/F16/F32 auto-detected)")
         else:
             source_file = _pick_source_gguf(gguf_files)
-        if not source_file:
+        if not source_is_safetensors and not source_file:
             log_err(f"Could not determine source file in {model_spec['raw']}. "
                     f"Found: {gguf_files}")
             sys.exit(1)
-        if not source_exact and len(gguf_files) > 1:
-            log(f"Found {len(gguf_files)} .gguf files, selected: {source_file}")
-        source_files = _expand_shard_files(source_file, gguf_files)
-        if len(source_files) > 1:
-            log(f"Source model is split into {len(source_files)} shards: "
-                f"{source_files[0]} … {source_files[-1]}")
+        if source_is_safetensors:
+            source_files = [f for f in source_listing
+                            if Path(f).suffix.lower() not in _ST_SKIP_SUFFIXES]
+            if not source_files:
+                log_err(f"Could not assemble file list for safetensors "
+                        f"conversion from {model_spec['raw']}. "
+                        f"Found: {source_listing}")
+                sys.exit(1)
+        else:
+            if not source_exact and len(gguf_files) > 1:
+                log(f"Found {len(gguf_files)} .gguf files, selected: {source_file}")
+            source_files = _expand_shard_files(source_file, gguf_files)
+            if len(source_files) > 1:
+                log(f"Source model is split into {len(source_files)} shards: "
+                    f"{source_files[0]} … {source_files[-1]}")
 
     if not imatrix_info:
         imx_exact, imx_listing = _resolve_spec_listing(
@@ -2827,12 +3056,19 @@ def run_pipeline(args):
 
     if args.dry_run:
         if source_files is not None:
-            log(f"DRY RUN: would download source model {model_spec['raw']} "
-                f"({', '.join(source_files)})")
-            if len(source_files) > 1:
-                log("DRY RUN: shards would be merged into a single GGUF "
-                    "before quantization")
-            source_gguf = Path(f"/dry-run/{source_files[0]}")
+            if source_is_safetensors:
+                base = _safetensors_base_name(model_spec)
+                log(f"DRY RUN: would download safetensors model "
+                    f"{model_spec['raw']} ({len(source_files)} file(s)) and "
+                    f"convert it to GGUF (BF16/F16/F32 auto-detected)")
+                source_gguf = Path(f"/dry-run/{base}-BF16.gguf")
+            else:
+                log(f"DRY RUN: would download source model {model_spec['raw']} "
+                    f"({', '.join(source_files)})")
+                if len(source_files) > 1:
+                    log("DRY RUN: shards would be merged into a single GGUF "
+                        "before quantization")
+                source_gguf = Path(f"/dry-run/{source_files[0]}")
             state.mark_source(str(source_gguf), source_files[0])
         if imatrix_file is not None:
             log(f"DRY RUN: would download imatrix {imx_spec['raw']} "
@@ -2842,22 +3078,49 @@ def run_pipeline(args):
     else:
         with _allow_hard_interrupt():
             if source_files is not None:
-                try:
-                    result = _download_spec_files(
-                        model_spec, source_files, workspace, token, s3,
-                        "source_model", "source model")
-                except KeyboardInterrupt:
-                    log("\nDownload interrupted by user.")
-                    sys.exit(130)
-                except Exception as exc:
-                    log_err(f"Download failed (source model): {exc}")
-                    sys.exit(1)
-                if len(result) == 1:
-                    source_gguf = result[0]
+                if source_is_safetensors:
+                    try:
+                        _download_spec_files(
+                            model_spec, source_files, workspace, token, s3,
+                            "source_model", "source model")
+                    except KeyboardInterrupt:
+                        log("\nDownload interrupted by user.")
+                        sys.exit(130)
+                    except Exception as exc:
+                        log_err(f"Download failed (source model): {exc}")
+                        sys.exit(1)
+                    # config.json lives in the common parent of the
+                    # downloaded files
+                    common = Path(os.path.commonpath(source_files))
+                    model_dir = workspace / "source_model"
+                    if str(common) not in (".", ""):
+                        model_dir = model_dir / common
+                    source_gguf = convert_safetensors_to_gguf(
+                        model_dir, _safetensors_base_name(model_spec),
+                        state=state)
+                    if not args.keep_files:
+                        _delete_safetensors(model_dir)
+                    st_name = next((f for f in source_files
+                                    if f.endswith(".safetensors")),
+                                   source_files[0])
+                    state.mark_source(str(source_gguf), st_name)
                 else:
-                    source_gguf = merge_gguf_shards(
-                        result, keep_shards=args.keep_files, state=state)
-                state.mark_source(str(source_gguf), source_files[0])
+                    try:
+                        result = _download_spec_files(
+                            model_spec, source_files, workspace, token, s3,
+                            "source_model", "source model")
+                    except KeyboardInterrupt:
+                        log("\nDownload interrupted by user.")
+                        sys.exit(130)
+                    except Exception as exc:
+                        log_err(f"Download failed (source model): {exc}")
+                        sys.exit(1)
+                    if len(result) == 1:
+                        source_gguf = result[0]
+                    else:
+                        source_gguf = merge_gguf_shards(
+                            result, keep_shards=args.keep_files, state=state)
+                    state.mark_source(str(source_gguf), source_files[0])
             if imatrix_file is not None:
                 try:
                     imatrix_path = _download_spec_files(
@@ -3622,10 +3885,12 @@ def main():
         ),
     )
     parser.add_argument("--model", "-m", required=True,
-                        help="Source GGUF location: hf://account/repo[/folder"
+                        help="Source model location: hf://account/repo[/folder"
                              "[/file]], s3://bucket[/folder[/file]] or legacy "
-                             "account/repo. The file is auto-detected "
-                             "(bf16/f16/f32 GGUF) when omitted.")
+                             "account/repo. GGUF (bf16/f16/f32) is "
+                             "auto-detected when omitted; a safetensors model "
+                             "is converted to GGUF first (BF16/F16/F32 "
+                             "auto-detected).")
     parser.add_argument("--imatrix", "-i", required=True,
                         help="Imatrix location: hf://account/repo[/folder"
                              "[/file]], s3://bucket[/folder[/file]] or legacy "
