@@ -3216,7 +3216,6 @@ def run_pipeline(args):
                             log_err(f"{lbl} S3 upload failed: {err}")
                             failed_lbl = lbl
                             break
-                        log(f"✓ {lbl} uploaded to {source_dest_str}")
                     if _lc:
                         with _upload_queue_lock:
                             _lc.s3_upload_progress.pop("src", None)
