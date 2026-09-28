@@ -22,6 +22,12 @@ Each tier in the speed range (9-15) is produced in two variants:
   * normal   — default quantize.py parameters          (Tier9)
   * speed    — with the ``--speed`` flag passed on     (Tier9-s)
 
+With ``--tiers no`` (or ``none``) **no quants are produced at all**: the
+pipeline only prepares the source model (download, shard merge,
+safetensors→GGUF conversion, optional --source-backup upload) and then
+exits reporting that no quants were made.  In this mode README management
+is skipped entirely and --output may be omitted (it is ignored when given).
+
 Manages a README.md in the output repo: downloads an existing README or
 creates one with source info, mAPEX attribution, and a quantization table.
 After all tiers are uploaded the README is pushed to the same repo.
@@ -2747,10 +2753,9 @@ def _preflight_remote_targets(*, token, s3, model_spec, imx_spec,
     ]
     if imx_spec is not None:
         checks.append((f"imatrix {imx_spec['raw']}", _spec_check(imx_spec)))
-    checks += [
-        (f"output repo {output_base}",
-         lambda: _hf_check_repo_writable(output_base, token)),
-    ]
+    if output_base is not None:
+        checks.append((f"output repo {output_base}",
+                       lambda: _hf_check_repo_writable(output_base, token)))
     for argname, dest in (("--quant-backup", quant_backup),
                           ("--source-backup", source_backup)):
         if dest is None:
@@ -2824,6 +2829,8 @@ def _partition_s3_upload_files(s3: dict, dest: dict, candidates: list) -> tuple[
 def run_pipeline(args):
     _check_hf_import()
 
+    no_quants = bool(getattr(args, "no_quants", False))
+
     token = args.token or _get_hf_token()
     if not token:
         log_err("No HF token found. Set HF_TOKEN in .env or pass --token.")
@@ -2846,6 +2853,10 @@ def run_pipeline(args):
                     "(set them in .env).")
             sys.exit(1)
         source_backup = _parse_s3_backup_url(args.source_backup, "--source-backup")
+
+    if no_quants and quant_backup:
+        log("⚠ --quant-backup ignored: no quants are produced in no-quants mode")
+        quant_backup = None
 
     # Parse --model/--imatrix universal URLs (hf:// / s3:// / legacy repo id).
     model_spec = _parse_remote_spec(args.model)
@@ -2905,10 +2916,15 @@ def run_pipeline(args):
     state.set("args", _args_record(args))
 
     # Parse output base repo id (org/name)
-    output_base = args.output.rstrip("/")
-    if not output_base or "/" not in output_base:
-        log_err("--output must be in the form org/name  (e.g. MyOrg/Model-mAPEX)")
-        sys.exit(1)
+    if no_quants:
+        output_base = None
+        if args.output:
+            log("⚠ --output ignored: no-quants mode (--tiers no/none)")
+    else:
+        output_base = args.output.rstrip("/")
+        if not output_base or "/" not in output_base:
+            log_err("--output must be in the form org/name  (e.g. MyOrg/Model-mAPEX)")
+            sys.exit(1)
 
     tiers = args.tiers
     variants = expand_variants(tiers)
@@ -2923,8 +2939,8 @@ def run_pipeline(args):
     log("=" * 60)
     log(f"  Model:    {args.model}")
     log(f"  Imatrix:  {args.imatrix or '(none — quantizing without imatrix)'}")
-    log(f"  Output:   {output_base}")
-    log(f"  Tiers:    {', '.join(variant_label(t, sp) for t, sp in variants)}")
+    log(f"  Output:   {output_base or '(skipped — no-quants mode)'}")
+    log(f"  Tiers:    {', '.join(variant_label(t, sp) for t, sp in variants) or '(none — no quants)'}")
     log(f"  Workspace: {workspace}")
     if s3:
         auth_desc = ("static key" if s3["auth"]["mode"] == "sigv4" else "IAM token")
@@ -3237,9 +3253,27 @@ def run_pipeline(args):
             f"→ {source_dest_str}")
         source_upload_done.set()
 
+    # ── 1c. No-quants mode: source model only, no quantization ──
+    if no_quants:
+        if source_upload_future is not None:
+            log("Waiting for source model S3 upload to finish …")
+            source_upload_future.result()
+            source_executor.shutdown(wait=True)
+        _stop_live()
+        log("\n" + "=" * 60)
+        log("  ⚠ Кванты не были сделаны: режим без генерации квантов "
+            "(--tiers no/none).")
+        log("  Исходная модель обработана"
+            + (f" и загружена в {source_dest_str}" if upload_source else "")
+            + ".")
+        log("=" * 60)
+        return
+
     # ── 2. Initialize README.md ──
     readme_path = workspace / "README.md"
-    if not state.readme_initialized() or not readme_path.exists():
+    if no_quants:
+        log("No-quants mode: skipping README management entirely")
+    elif not state.readme_initialized() or not readme_path.exists():
         if _readme_in_repo(output_base, token):
             log(f"Found README.md in {output_base}, downloading …")
             downloaded = _download_readme(output_base, token, readme_path)
@@ -3818,6 +3852,7 @@ _ARG_DESTS = [
     "model", "imatrix", "output", "tiers", "workspace", "token",
     "s3_endpoint", "s3_token", "s3_key_id", "s3_secret",
     "quant_backup", "source_backup", "dry_run", "keep_files",
+    "no_quants",
 ]
 
 
@@ -3838,6 +3873,7 @@ def _args_record(args: argparse.Namespace) -> dict:
         "source_backup": args.source_backup,
         "dry_run": args.dry_run,
         "keep_files": args.keep_files,
+        "no_quants": bool(getattr(args, "no_quants", False)),
     }
 
 
@@ -3911,13 +3947,19 @@ def main():
                              "(imatrix*/.dat) when omitted. Without an imatrix "
                              "quantization runs without importance matrix "
                              "support.")
-    parser.add_argument("--output", "-o", required=True,
+    parser.add_argument("--output", "-o", default=None,
                         help="HF repo id for all output tiers (org/name), "
-                             "e.g. user/model-mAPEX")
+                             "e.g. user/model-mAPEX. Optional (and ignored) "
+                             "in no-quants mode (--tiers no/none).")
     parser.add_argument("--tiers", default="1-15",
                         help="Tier spec: '1-13', '1-10,13', '3-8', '1,5,7' "
                              "(default: 1-15; tiers 9-15 are each produced in "
-                             "two variants: normal and -s with --speed)")
+                             "two variants: normal and -s with --speed). "
+                             "'no' or 'none' disables quantization entirely: "
+                             "only the source model is prepared "
+                             "(download/merge/convert, optional S3 upload) "
+                             "and the script exits; --output and README "
+                             "handling are not needed in this mode.")
     parser.add_argument("--workspace", "-w",
                         default=str(Path.home() / "apex_batch"),
                         help="Workspace directory for state & intermediate files "
@@ -3971,17 +4013,27 @@ def main():
                         help="Resume the pipeline from the saved state file. "
                              "All parameters (model, imatrix, output, tiers, "
                              "S3 settings, …) are restored from the state — "
-                             "no other arguments are allowed with --continue.")
+                              "no other arguments are allowed with --continue.")
+    parser.set_defaults(no_quants=False)
 
     args = parser.parse_args()
 
     if args.continue_run:
         args = _restore_args_from_state(parser, args)
 
-    args.tiers = _parse_tiers(args.tiers) if isinstance(args.tiers, str) else args.tiers
+    if isinstance(args.tiers, str):
+        raw_tiers = args.tiers.strip()
+        if raw_tiers.lower() in ("no", "none"):
+            args.tiers = []
+            args.no_quants = True
+        else:
+            args.tiers = _parse_tiers(raw_tiers)
+            args.no_quants = False
+    else:
+        args.no_quants = not args.tiers
 
-    if not args.tiers or not all(1 <= t <= 15 for t in args.tiers):
-        log_err("--tiers must be in range 1-15")
+    if not args.no_quants and (not args.tiers or not all(1 <= t <= 15 for t in args.tiers)):
+        log_err("--tiers must be in range 1-15, or 'no'/'none' for no quantization")
         sys.exit(1)
 
     try:
