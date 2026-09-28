@@ -121,6 +121,7 @@ class Bar:
     def __init__(self, label: str, total: int, start: int = 0):
         self.label = label[-40:]
         self.total = total
+        self.start = start
         self.current = start
         self.t0 = time.monotonic()
         self._last_draw = 0.0
@@ -145,7 +146,8 @@ class Bar:
         width = shutil.get_terminal_size((100, 20)).columns
         if self.total > 0:
             frac = min(1.0, self.current / self.total)
-            speed = self.current / max(1e-6, time.monotonic() - self.t0)
+            done = max(0, self.current - self.start)
+            speed = done / max(1e-6, time.monotonic() - self.t0)
             eta = (self.total - self.current) / speed if speed > 0 else 0
             body = (f"{self.label}  {frac * 100:5.1f}% "
                     f"{human(self.current)}/{human(self.total)}  "
