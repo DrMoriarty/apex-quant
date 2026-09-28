@@ -2057,7 +2057,7 @@ def run_quantize(
     tier: int,
     speed: bool,
     source_gguf: Path,
-    imatrix_path: Path,
+    imatrix_path: Optional[Path],
     output_gguf: Path,
 ) -> None:
     """Run quantize.py for a single tier variant. Raises on failure."""
@@ -2069,7 +2069,9 @@ def run_quantize(
     ]
     if speed:
         cmd.append("--speed")
-    cmd += ["--imatrix", str(imatrix_path), str(source_gguf), str(output_gguf)]
+    if imatrix_path is not None:
+        cmd += ["--imatrix", str(imatrix_path)]
+    cmd += [str(source_gguf), str(output_gguf)]
 
     if _HAS_RICH and _lc is not None and _lc.live is not None:
         cap = _Capture(key)
@@ -2742,7 +2744,10 @@ def _preflight_remote_targets(*, token, s3, model_spec, imx_spec,
     checks: list = [
         ("HF token (whoami)", lambda: _hf_whoami(token)),
         (f"source model {model_spec['raw']}", _spec_check(model_spec)),
-        (f"imatrix {imx_spec['raw']}", _spec_check(imx_spec)),
+    ]
+    if imx_spec is not None:
+        checks.append((f"imatrix {imx_spec['raw']}", _spec_check(imx_spec)))
+    checks += [
         (f"output repo {output_base}",
          lambda: _hf_check_repo_writable(output_base, token)),
     ]
@@ -2844,17 +2849,18 @@ def run_pipeline(args):
 
     # Parse --model/--imatrix universal URLs (hf:// / s3:// / legacy repo id).
     model_spec = _parse_remote_spec(args.model)
-    imx_spec = _parse_remote_spec(args.imatrix)
+    imx_spec = _parse_remote_spec(args.imatrix) if args.imatrix else None
     source_model_label = _spec_repo_label(model_spec)
 
     # s3:// sources require S3 settings (endpoint + credentials).
-    if s3 is None and "s3" in (model_spec["kind"], imx_spec["kind"]):
+    if s3 is None and "s3" in [model_spec["kind"]] + (
+            [imx_spec["kind"]] if imx_spec else []):
         log_err("s3:// source URL requires S3_ENDPOINT and credentials "
                 "(set them in .env).")
         sys.exit(1)
 
     # Bucket fallbacks: endpoint bucket ↔ s3:// URL bucket.
-    for spc in (model_spec, imx_spec):
+    for spc in filter(None, (model_spec, imx_spec)):
         if spc["kind"] == "s3" and not spc["bucket"]:
             if s3 is None or not s3["bucket"]:
                 log_err(f"{spc['raw']}: s3:// path must include a bucket "
@@ -2862,14 +2868,15 @@ def run_pipeline(args):
                 sys.exit(1)
             spc["bucket"] = s3["bucket"]
     if s3 is not None and not s3["bucket"]:
-        for spc in (model_spec, imx_spec):
+        for spc in filter(None, (model_spec, imx_spec)):
             if spc["kind"] == "s3":
                 s3["bucket"] = spc["bucket"]
                 log(f"  S3 bucket inferred from source URL: {s3['bucket']}")
                 break
         # A bucketless endpoint is only fatal when an s3:// source needs
         # it for downloads; backup URLs carry their own buckets.
-        if not s3["bucket"] and "s3" in (model_spec["kind"], imx_spec["kind"]):
+        if not s3["bucket"] and "s3" in [model_spec["kind"]] + (
+                [imx_spec["kind"]] if imx_spec else []):
             log_err("Cannot determine S3 bucket: S3_ENDPOINT has no embedded "
                     "bucket and no s3:// source URL to infer it from. "
                     "Use https://storage.yandexcloud.net/<bucket>/ or "
@@ -2915,7 +2922,7 @@ def run_pipeline(args):
     log("  mAPEX Batch Quantization Pipeline")
     log("=" * 60)
     log(f"  Model:    {args.model}")
-    log(f"  Imatrix:  {args.imatrix}")
+    log(f"  Imatrix:  {args.imatrix or '(none — quantizing without imatrix)'}")
     log(f"  Output:   {output_base}")
     log(f"  Tiers:    {', '.join(variant_label(t, sp) for t, sp in variants)}")
     log(f"  Workspace: {workspace}")
@@ -3003,6 +3010,7 @@ def run_pipeline(args):
     # ── discover files + download both (main thread so Ctrl+C works) ──
     source_files = None
     imatrix_file = None
+    imatrix_path: Optional[Path] = None
     source_is_safetensors = False
 
     if not source_info:
@@ -3044,7 +3052,7 @@ def run_pipeline(args):
                 log(f"Source model is split into {len(source_files)} shards: "
                     f"{source_files[0]} … {source_files[-1]}")
 
-    if not imatrix_info:
+    if imx_spec is not None and not imatrix_info:
         imx_exact, imx_listing = _resolve_spec_listing(
             imx_spec, token, s3, what="imatrix")
         imatrix_file = imx_exact or _pick_imatrix_file(imx_listing)
@@ -3136,7 +3144,8 @@ def run_pipeline(args):
 
         if _lc:
             _lc.source_ok = True
-            _lc.imatrix_ok = True
+            _lc.imatrix_ok = (imx_spec is None
+                              or state.imatrix_info() is not None)
             if _lc.live:
                 _lc.live.update(_build_live_renderable())
 
@@ -3156,8 +3165,9 @@ def run_pipeline(args):
             # and skip the upload entirely.
             src_upload_files, already_in_s3 = _partition_s3_upload_files(
                 s3, source_backup,
-                [("source model", source_gguf, model_spec["kind"]),
-                 ("imatrix", imatrix_path, imx_spec["kind"])])
+                [("source model", source_gguf, model_spec["kind"])]
+                + ([("imatrix", imatrix_path, imx_spec["kind"])]
+                   if imatrix_path is not None else []))
             if already_in_s3 and not src_upload_files:
                 log(f"⚠ --source-backup: {' и '.join(already_in_s3)} уже "
                     f"есть в {source_dest_str} — аплоад выполнен не будет")
@@ -3219,7 +3229,10 @@ def run_pipeline(args):
                 source_upload_future = source_executor.submit(
                     _do_upload_source_s3)
     elif upload_source and args.dry_run:
-        names = ", ".join(p.name for p in (source_gguf, imatrix_path))
+        names = ", ".join(p.name for p in
+                          [source_gguf] + ([imatrix_path]
+                                           if imatrix_path is not None
+                                           else []))
         log(f"DRY RUN: would upload source files ({names}) "
             f"→ {source_dest_str}")
         source_upload_done.set()
@@ -3891,11 +3904,13 @@ def main():
                              "auto-detected when omitted; a safetensors model "
                              "is converted to GGUF first (BF16/F16/F32 "
                              "auto-detected).")
-    parser.add_argument("--imatrix", "-i", required=True,
-                        help="Imatrix location: hf://account/repo[/folder"
-                             "[/file]], s3://bucket[/folder[/file]] or legacy "
-                             "account/repo. The file is auto-detected "
-                             "(imatrix*/.dat) when omitted.")
+    parser.add_argument("--imatrix", "-i", default=None,
+                        help="Optional imatrix location: hf://account/repo"
+                             "[/folder[/file]], s3://bucket[/folder[/file]] or "
+                             "legacy account/repo. The file is auto-detected "
+                             "(imatrix*/.dat) when omitted. Without an imatrix "
+                             "quantization runs without importance matrix "
+                             "support.")
     parser.add_argument("--output", "-o", required=True,
                         help="HF repo id for all output tiers (org/name), "
                              "e.g. user/model-mAPEX")
