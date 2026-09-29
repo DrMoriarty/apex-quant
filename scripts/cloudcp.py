@@ -1323,9 +1323,11 @@ def cmd_rm(args) -> None:
 def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
     """Expand a cp source (file, directory or glob mask) into files.
 
-    Returns (pairs, plain) where pairs is a list of (file_uri, rel_name)
-    and plain is True when the source was a single literal file (rel_name
-    is then just its basename).
+    Returns (pairs, plain, is_dir) where pairs is a list of
+    (file_uri, rel_name), plain is True when the source was a single
+    literal file (rel_name is then just its basename) and is_dir is True
+    when the source was a directory copied recursively (rel_name keeps
+    the path relative to the source directory).
     """
     if src.kind == "local":
         import glob as _glob
@@ -1335,9 +1337,9 @@ def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
             if not matches:
                 sys.exit(f"error: no such file: {src.path}")
             return ([(URI("local", path=m, raw=m), os.path.basename(m))
-                     for m in matches], False)
+                     for m in matches], False, False)
         if os.path.isfile(src.path):
-            return [(src, os.path.basename(src.path))], True
+            return [(src, os.path.basename(src.path))], True, False
         if os.path.isdir(src.path):
             out = []
             for root, _dirs, files in os.walk(src.path):
@@ -1347,7 +1349,7 @@ def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
                                 os.path.relpath(p, src.path)))
             if not out:
                 sys.exit(f"error: directory is empty: {src.path}")
-            return out, False
+            return out, False, True
         sys.exit(f"error: no such file: {src.path}")
 
     dir_part, mask = split_glob(src.path)
@@ -1357,10 +1359,10 @@ def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
     def make(path: str) -> URI:
         return dc_replace(src, path=path)
 
-    def finish(out: list[tuple[URI, str]], what: str):
+    def finish(out: list[tuple[URI, str]], what: str, is_dir: bool = False):
         if not out:
             sys.exit(f"error: {what}: {src.label()}")
-        return out, False
+        return out, False, is_dir
 
     if src.kind == "hf":
         hf = get_hf()
@@ -1373,7 +1375,7 @@ def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
                     out.append((make(path), base))
             return finish(out, "nothing found under")
         if src.path and hf.stat(src) is not None:
-            return [(src, os.path.basename(src.path))], True
+            return [(src, os.path.basename(src.path))], True, False
         out = []
 
         def walk_hf(u: URI) -> None:
@@ -1384,7 +1386,7 @@ def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
                     out.append((make(path), path[len(prefix):]))
 
         walk_hf(dc_replace(src, path=dir_part))
-        return finish(out, "no such file or directory")
+        return finish(out, "no such file or directory", is_dir=True)
 
     s3 = get_s3()
     if mask:
@@ -1397,7 +1399,7 @@ def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
         return finish(out, "nothing found under")
     if src.path and not src.path.endswith("/") \
             and s3.stat(src.bucket, src.path) is not None:
-        return [(src, os.path.basename(src.path))], True
+        return [(src, os.path.basename(src.path))], True, False
     out = []
 
     def walk_s3(pfx: str) -> None:
@@ -1408,7 +1410,7 @@ def expand_cp_sources(src: URI) -> tuple[list[tuple[URI, str]], bool]:
                 out.append((make(key), key[len(prefix):]))
 
     walk_s3(prefix)
-    return finish(out, "no such file or directory")
+    return finish(out, "no such file or directory", is_dir=True)
 
 
 def cmd_cp(args) -> None:
@@ -1421,21 +1423,32 @@ def cmd_cp(args) -> None:
     resolve_s3(dest)
     force = args.force
 
-    pairs, plain = expand_cp_sources(src)
+    pairs, plain, src_is_dir = expand_cp_sources(src)
     multi = len(pairs) > 1
-    if multi and dest.kind == "local" and not dest.path.endswith("/") \
-            and not os.path.isdir(dest.path):
-        sys.exit("error: multiple sources need a directory destination — "
-                 f"add a trailing '/': {args.dst}")
-    if multi and dest.kind != "local" and not dest.raw.endswith("/"):
-        sys.exit("error: multiple sources need a directory destination — "
-                 f"add a trailing '/': {args.dst}")
     dest_is_dir = (dest.kind == "local"
                    and (dest.path.endswith("/") or os.path.isdir(dest.path))) \
         or (dest.kind != "local" and dest.raw.endswith("/"))
+    if src_is_dir and not dest_is_dir:
+        # directory source: the destination is always a directory, files
+        # keep their source-relative paths (nested structure preserved)
+        if dest.kind == "local":
+            os.makedirs(dest.path, exist_ok=True)
+        dest_is_dir = True
+    if multi and dest.kind == "local" and not dest_is_dir:
+        sys.exit("error: multiple sources need a directory destination — "
+                 f"add a trailing '/': {args.dst}")
+    if multi and dest.kind != "local" and not dest_is_dir:
+        sys.exit("error: multiple sources need a directory destination — "
+                 f"add a trailing '/': {args.dst}")
     if multi and dest.kind == "local":
         os.makedirs(dest.path, exist_ok=True)
-        dest_is_dir = True
+    if src_is_dir and dest.kind == "local" and src.kind == "local":
+        # mirror empty subdirectories (remote backends cannot hold them)
+        for root, subdirs, files in os.walk(src.path):
+            if not subdirs and not files:
+                empty = os.path.join(dest.path,
+                                     os.path.relpath(root, src.path))
+                os.makedirs(empty, exist_ok=True)
     if multi:
         print(f"{len(pairs)} file(s) to copy")
 
