@@ -42,6 +42,8 @@ Environment (loaded from .env, same variable names as batch_quantize.py):
 Dependencies: httpx, huggingface_hub (both already used by this repo).
 """
 
+from __future__ import annotations
+
 import io
 import os
 import re
@@ -779,7 +781,7 @@ class HFClient:
 
         src_size = src_size_of(src)
         dest_path = dest.path
-        if not dest_path or dest.raw.endswith("/"):
+        if not dest_path or dest_path.endswith("/"):
             dest_path = (dest_path.rstrip("/") + "/" if dest_path else "") + \
                 os.path.basename(src.path.rstrip("/"))
         if not force:
@@ -1012,9 +1014,17 @@ def _range_body(src: URI, offset: int, length: int, bar: Bar | None):
 def copy_to_s3(src: URI, dest: URI, force: bool) -> None:
     """Copy any source into s3:// via resumable multipart upload."""
     s3 = get_s3()
-    if not dest.path:
-        sys.exit("error: S3 destination must include a key "
-                 "(s3://bucket/path/file.gguf)")
+    # trailing '/' (or empty key) means the destination is a folder —
+    # keep the source file name, otherwise the object key would end with
+    # '/' and S3 would silently store a zero-byte folder marker
+    if not dest.path or dest.path.endswith("/"):
+        base = os.path.basename(src.path.rstrip("/"))
+        dest = dc_replace(dest, path=(
+            dest.path.rstrip("/") + "/" + base) if dest.path.rstrip("/") \
+            else base)
+        if not dest.path:
+            sys.exit("error: S3 destination must include a key "
+                     "(s3://bucket/path/file.gguf)")
     src_size = src_size_of(src)
     dest_size = s3.stat(dest.bucket, dest.path)
     if dest_size == src_size and not force:
@@ -1055,6 +1065,10 @@ def copy_to_s3(src: URI, dest: URI, force: bool) -> None:
         if upload_id is not None:
             s3.multipart_abort(dest.bucket, dest.path, upload_id)
         s3.put_stream(dest.bucket, dest.path, lambda: iter(()), 0)
+        if s3.stat(dest.bucket, dest.path) != 0:
+            raise RuntimeError(
+                f"upload failed: s3://{dest.bucket}/{dest.path} missing "
+                f"after upload — verify bucket name and credentials")
         print(f"uploaded (empty file): {dest.label()}")
         return
 
@@ -1067,6 +1081,12 @@ def copy_to_s3(src: URI, dest: URI, force: bool) -> None:
             s3.put_stream(dest.bucket, dest.path, body, src_size)
             bar.update(src_size)
             bar.finish()
+            final = s3.stat(dest.bucket, dest.path)
+            if final != src_size:
+                raise RuntimeError(
+                    f"upload failed: s3://{dest.bucket}/{dest.path} missing "
+                    f"or wrong size (expected {src_size}, got {final}) — "
+                    f"verify bucket name and credentials")
             print(f"copied: {src.label()} -> {dest.label()} "
                   f"({human(src_size)})")
             return
@@ -1167,7 +1187,7 @@ def copy_hf_to_hf(src: URI, dest: URI, force: bool) -> None:
         sys.exit("error: huggingface_hub is required for hf:// operations")
 
     dest_path = dest.path
-    if not dest_path or dest.raw.endswith("/"):
+    if not dest_path or dest_path.endswith("/"):
         base = os.path.basename(src.path.rstrip("/"))
         dest_path = (dest_path.rstrip("/") + "/" if dest_path else "") + base
     hf = get_hf()
@@ -1453,9 +1473,11 @@ def cmd_cp(args) -> None:
         print(f"{len(pairs)} file(s) to copy")
 
     for i, (s, rel) in enumerate(pairs, 1):
-        if plain or not dest_is_dir:
+        if not dest_is_dir:
             d = dest
         else:
+            # destination is a folder: keep the source-relative name
+            # (for a plain file rel is just its basename)
             rel_posix = rel.replace(os.sep, "/")
             if dest.kind == "local":
                 dpath = os.path.join(dest.path, rel_posix)
