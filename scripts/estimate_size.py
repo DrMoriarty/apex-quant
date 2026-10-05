@@ -133,6 +133,8 @@ ALWAYS_F32 = [
     # nemotron
     re.compile(r"blk\.\d+\.ssm_conv1d\.bias$"),
     re.compile(r"blk\.\d+\.ssm_d$"),
+    # MTP head norms (nextn)
+    re.compile(r"blk\.\d+\.nextn\.(enorm|hnorm|shared_head_norm)\.weight$"),
 ]
 
 GROUP_EXPERTS = re.compile(r"blk\.\d+\.ffn_(gate|up|down)_exps")
