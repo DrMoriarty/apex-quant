@@ -192,6 +192,8 @@ def main():
             cmd.extend(["--arch", args.arch])
         if args.quant_mode:
             cmd.append(f"--{args.quant_mode}")
+        if detected and detected.get("mtp_tensors"):
+            cmd.extend(["--f16-tensors", ",".join(detected["mtp_tensors"])])
         if args.output:
             cmd.extend(["-o", args.output])
         subprocess.run(cmd, check=True)
@@ -224,6 +226,8 @@ def main():
             cmd.extend(["--arch", args.arch])
         if args.quant_mode:
             cmd.append(f"--{args.quant_mode}")
+        if detected and detected.get("mtp_tensors"):
+            cmd.extend(["--f16-tensors", ",".join(detected["mtp_tensors"])])
         subprocess.run(cmd, check=True)
         print(f">>> Generated config for profile '{args.profile}' ({args.layers} layers)")
 

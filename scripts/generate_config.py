@@ -49,6 +49,7 @@ allocations is only interpretable if the arms are the same size.
 
 import argparse
 import math
+import re
 import sys
 
 # Quantization types sorted by quality descending (index = quality rank).
@@ -139,6 +140,8 @@ def parse_args(argv=None):
                    help="Leading dense (non-MoE) FFN layers (default: 0)")
     p.add_argument("--arch", default="moe", choices=["moe", "dense"],
                    help="Architecture: moe or dense (default: moe)")
+    p.add_argument("--f16-tensors", default="",
+                   help="Comma-separated tensor names to keep in float16 (e.g. MTP head tensors)")
     p.add_argument("--output", "-o",
                    help="Write config to file instead of stdout")
     quant_mode = p.add_mutually_exclusive_group()
@@ -450,6 +453,11 @@ def main(argv=None):
         lines = generate_dense(cfg)
     else:
         lines = generate_moe(cfg)
+
+    for name in args.f16_tensors.split(","):
+        name = name.strip()
+        if name:
+            lines.insert(0, f"^{re.escape(name)}$=f16")
 
     output = "\n".join(lines) + "\n"
     if args.output:

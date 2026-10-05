@@ -31,9 +31,13 @@ def main():
 
     # Reuse tensor reader from estimate_size.py
     sys.path.append(SCRIPT_DIR)
-    from estimate_size import read_gguf_tensor_list
+    from estimate_size import read_gguf_tensor_list, ALWAYS_F32
 
     tensors = read_gguf_tensor_list(args.gguf)
+
+    # Tensors already kept in F32 (norms/bias); exclude them from the MTP
+    # head list since they are handled elsewhere.
+    mtp_tensor_names = []
 
     if not tensors:
         print("Error: no tensors found in GGUF", file=sys.stderr)
@@ -55,12 +59,16 @@ def main():
         m = pattern_mtp.search(name)
         if m:
             mtp_layers.add(int(m.group(1)))
+            if not any(p.fullmatch(name) for p in ALWAYS_F32):
+                mtp_tensor_names.append(name)
             continue
 
         # DeepSeek-style: blk.{N}.moe.* at high indices = MTP head
         m = pattern_moe_mtp.search(name)
         if m:
             mtp_layers.add(int(m.group(1)))
+            if not any(p.fullmatch(name) for p in ALWAYS_F32):
+                mtp_tensor_names.append(name)
             continue
 
         m = pattern_ffn.search(name)
@@ -97,6 +105,7 @@ def main():
         "layers": layers,
         "mtp_depth": mtp_depth,
         "mtp_layers": sorted(mtp_layers),
+        "mtp_tensors": sorted(mtp_tensor_names),
     }
     print(json.dumps(result))
 
