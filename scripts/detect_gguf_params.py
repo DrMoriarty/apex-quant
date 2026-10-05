@@ -35,10 +35,6 @@ def main():
 
     tensors = read_gguf_tensor_list(args.gguf)
 
-    # Tensors already kept in F32 (norms/bias); exclude them from the MTP
-    # head list since they are handled elsewhere.
-    mtp_tensor_names = []
-
     if not tensors:
         print("Error: no tensors found in GGUF", file=sys.stderr)
         sys.exit(1)
@@ -54,33 +50,30 @@ def main():
     pattern_mtp = re.compile(r"blk\.(\d+)\.(nextn|mtl|mtp|future)\.")
     pattern_moe_mtp = re.compile(r"blk\.(\d+)\.moe\.")
 
+    # Pass 1: identify which layers belong to the MTP head.
     for name, _, _ in tensors:
-        # Detect MTP head layers
         m = pattern_mtp.search(name)
         if m:
             mtp_layers.add(int(m.group(1)))
-            if not any(p.fullmatch(name) for p in ALWAYS_F32):
-                mtp_tensor_names.append(name)
             continue
-
-        # DeepSeek-style: blk.{N}.moe.* at high indices = MTP head
         m = pattern_moe_mtp.search(name)
         if m:
             mtp_layers.add(int(m.group(1)))
-            if not any(p.fullmatch(name) for p in ALWAYS_F32):
-                mtp_tensor_names.append(name)
             continue
-
         m = pattern_ffn.search(name)
         if m:
-            layer = int(m.group(1))
-            all_layers.add(layer)
-
+            all_layers.add(int(m.group(1)))
         m = pattern_expert.search(name)
         if m:
-            layer = int(m.group(1))
-            expert_layers.add(layer)
+            expert_layers.add(int(m.group(1)))
             has_experts = True
+
+    # Pass 2: within MTP head layers, take every tensor except those pinned to F32.
+    mtp_tensor_names = []
+    for name, _, _ in tensors:
+        m = re.match(r"blk\.(\d+)\.", name)
+        if m and int(m.group(1)) in mtp_layers and not any(p.fullmatch(name) for p in ALWAYS_F32):
+            mtp_tensor_names.append(name)
 
     all_layers -= mtp_layers
     expert_layers -= mtp_layers
