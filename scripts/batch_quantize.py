@@ -1270,8 +1270,9 @@ def _s3_download_file(s3: dict, bucket: str, key: str, dest_dir: Path,
                       *, label: str = "file") -> Path:
     """Download an S3 object to *dest_dir*, preserving the key path.
 
-    Resumable: incomplete data is kept as ``{dest}.part`` and a Range
-    request continues from the stored offset on the next attempt.
+    Uses an unconditional full GET (no Range requests): this backend stalls
+    on large byte-range GETs, so any partial ``{dest}.part`` is discarded
+    and the object is restarted from zero.
     """
     dest = dest_dir / key
     if dest.exists() and dest.stat().st_size > 0:
@@ -1292,44 +1293,37 @@ def _s3_download_file(s3: dict, bucket: str, key: str, dest_dir: Path,
     part = dest.with_suffix(dest.suffix + ".part")
     existing = part.stat().st_size if part.exists() else 0
 
-    extra_headers: dict[str, str] = {"Accept-Encoding": "identity"}
-    if existing > 0 and existing < size:
-        log(f"Resuming {label} from {existing / (1024**2):.1f} MB  "
-            f"({existing / size * 100:.1f}%)")
-        extra_headers["Range"] = f"bytes={existing}-"
+    if existing > 0:
+        # Range resume stalls on this backend for large objects — restart.
+        log(f"Restarting {label} from 0  "
+            f"({existing / (1024**2):.1f} MB discarded)")
+        part.unlink()
+        existing = 0
     elif existing >= size and size > 0:
         if dest.exists():
             dest.unlink()
         part.rename(dest)
         return dest
-    else:
-        existing = 0
 
     if _lc:
         _lc.downloads[label] = {"label": label, "status": "downloading",
-                                "bytes": 0, "total": 0, "start": time.time()}
-        _lc.downloads[label]["resumed_from"] = existing
-        if _lc.live:
-            _lc.live.update(_build_live_renderable())
+                                 "bytes": 0, "total": 0, "start": time.time()}
 
     url = _s3_key_url(s3, bucket, key)
-    mode = "ab" if existing > 0 else "wb"
-    downloaded = existing
+    downloaded = 0
     last_live_update = time.time()
-
-    with open(part, mode) as f, \
+    with open(part, "wb") as f, \
          httpx.Client(follow_redirects=True,
                       timeout=httpx.Timeout(300, connect=30)) as client:
-        with client.stream("GET", url, headers=_s3_auth_headers(
-                s3, "GET", url, extra=extra_headers)) as response:
-            if existing > 0 and response.status_code == 200:
-                # Server ignored Range — restart from scratch
-                f.seek(0)
-                f.truncate()
-                downloaded = 0
-                if _lc and _lc.downloads.get(label):
-                    _lc.downloads[label]["resumed_from"] = 0
-            response.raise_for_status()
+        with client.stream("GET", url,
+                           headers=_s3_auth_headers(
+                               s3, "GET", url,
+                               extra={"Accept-Encoding": "identity"})) as response:
+            if response.status_code != 200:
+                response.read()
+                raise RuntimeError(
+                    f"unexpected status {response.status_code} fetching "
+                    f"{label} (expected 200 full GET)")
             for chunk in response.iter_bytes(chunk_size=1024 * 1024):
                 f.write(chunk)
                 downloaded += len(chunk)
@@ -1416,8 +1410,8 @@ def _download_spec_file(spec: dict, s3: Optional[dict], token: Optional[str],
 
 @_retry_on_network_error
 def _download_spec_files(spec: dict, files: list, workspace: Path,
-                         token: Optional[str], s3: Optional[dict],
-                         subdir: str, label_base: str) -> list:
+                          token: Optional[str], s3: Optional[dict],
+                          subdir: str, label_base: str) -> list:
     """Download the resolved file list for a spec, return local paths."""
     target_dir = workspace / subdir
     paths = []
@@ -1425,7 +1419,7 @@ def _download_spec_files(spec: dict, files: list, workspace: Path,
     for i, rel_path in enumerate(files):
         label = label_base if n == 1 else f"{label_base} {i + 1}/{n}"
         result = _download_spec_file(spec, s3, token, rel_path, target_dir,
-                                     label=label)
+                                      label=label)
         if not result.exists():
             raise FileNotFoundError(f"{label} not found after download: {result}")
         sz = result.stat().st_size
@@ -2489,6 +2483,7 @@ def _s3_auth_headers(s3: dict, method: str, url: str,
 
 
 _S3_PART_SIZE = 64 * 1024 * 1024   # 64 MB per multipart part
+DEFAULT_THREADS = 4           # concurrent S3 download/upload workers
 
 
 def _s3_progress(key: str, sent: int):
@@ -2549,6 +2544,7 @@ def upload_tier_s3(
     bucket: Optional[str] = None,
     prefix: str = "",
     label: Optional[str] = None,
+    threads: int = 1,
 ) -> None:
     """Upload a quantized GGUF to an S3-compatible storage.
 
@@ -2594,7 +2590,7 @@ def upload_tier_s3(
             resp = client.put(url, content=_gen(), headers=headers)
             _s3_check(resp, "upload")
     else:
-        _s3_multipart_upload(key, gguf_path, url, s3, size)
+        _s3_multipart_upload(key, gguf_path, url, s3, size, threads=threads)
 
     if not _live_active:
         log(f"✓ Uploaded {label} → {dest}")
@@ -2606,11 +2602,13 @@ def _s3_multipart_upload(
     url: str,
     s3: dict,
     size: int,
+    threads: int = 1,
 ):
-    """Multipart upload: initiate → sequential part PUTs → complete.
+    """Multipart upload: initiate → part PUTs → complete.
 
     Each part PUT is retried independently on network errors; on any
     unrecoverable failure the multipart upload is aborted server-side.
+    Parts are uploaded concurrently when *threads* > 1.
     """
     import re as _re
 
@@ -2632,25 +2630,44 @@ def _s3_multipart_upload(
         upload_id = m.group(1)
 
         # 2. parts
-        etags: list[tuple[int, str]] = []
+        etags: dict[int, str] = {}
         try:
-            for i in range(1, n_parts + 1):
-                offset = (i - 1) * part_size
-                length = min(part_size, size - offset)
-                part_url = (f"{url}?partNumber={i}&uploadId={upload_id}")
-                etag = _s3_put_part(client, part_url, s3,
-                                    gguf_path, offset, length)
-                if not etag:
-                    raise RuntimeError(
-                        f"S3 part {i}/{n_parts}: missing ETag in response")
-                etags.append((i, etag))
-                _s3_progress(key, offset + length)
+            if threads > 1:
+                def _put(i: int) -> tuple[int, str, int]:
+                    offset = (i - 1) * part_size
+                    length = min(part_size, size - offset)
+                    part_url = (f"{url}?partNumber={i}&uploadId={upload_id}")
+                    etag = _s3_put_part(client, part_url, s3,
+                                        gguf_path, offset, length)
+                    return i, etag, offset + length
+
+                with ThreadPoolExecutor(max_workers=threads) as pool:
+                    for i, etag, done in pool.map(
+                            _put, range(1, n_parts + 1)):
+                        if not etag:
+                            raise RuntimeError(
+                                f"S3 part {i}/{n_parts}: missing ETag in "
+                                f"response")
+                        etags[i] = etag
+                        _s3_progress(key, done)
+            else:
+                for i in range(1, n_parts + 1):
+                    offset = (i - 1) * part_size
+                    length = min(part_size, size - offset)
+                    part_url = (f"{url}?partNumber={i}&uploadId={upload_id}")
+                    etag = _s3_put_part(client, part_url, s3,
+                                        gguf_path, offset, length)
+                    if not etag:
+                        raise RuntimeError(
+                            f"S3 part {i}/{n_parts}: missing ETag in response")
+                    etags[i] = etag
+                    _s3_progress(key, offset + length)
 
             # 3. complete
             parts_xml = "".join(
                 f"<Part><PartNumber>{n}</PartNumber>"
                 f"<ETag>{_escape_xml(etag)}</ETag></Part>"
-                for n, etag in etags)
+                for n, etag in sorted(etags.items()))
             complete_xml = (
                 "<CompleteMultipartUpload>"
                 f"{parts_xml}</CompleteMultipartUpload>")
@@ -3145,9 +3162,9 @@ def run_pipeline(args):
                     state.mark_source(str(source_gguf), source_files[0])
             if imatrix_file is not None:
                 try:
-                    imatrix_path = _download_spec_files(
-                        imx_spec, [imatrix_file], workspace, token, s3,
-                        "imatrix", "imatrix")[0]
+                      imatrix_path = _download_spec_files(
+                          imx_spec, [imatrix_file], workspace, token, s3,
+                          "imatrix", "imatrix")[0]
                 except KeyboardInterrupt:
                     log("\nDownload interrupted by user.")
                     sys.exit(130)
@@ -3210,7 +3227,8 @@ def run_pipeline(args):
                         try:
                             upload_tier_s3("src", p, s3, label=lbl,
                                            bucket=source_backup["bucket"],
-                                           prefix=source_backup["prefix"])
+                                           prefix=source_backup["prefix"],
+                                           threads=args.threads)
                         except Exception as exc:
                             err = str(exc)[:300]
                             log_err(f"{lbl} S3 upload failed: {err}")
@@ -3404,7 +3422,7 @@ def run_pipeline(args):
             with _upload_queue_lock:
                 _lc.s3_upload_progress[key] = {"current": 0, "total": fsize, "start_ts": time.time()}
         upload_tier_s3(key, p, s3, bucket=quant_backup["bucket"],
-                       prefix=quant_backup["prefix"])
+                       prefix=quant_backup["prefix"], threads=args.threads)
         state.mark_upload_done(key, "s3")
         if _lc:
             with _upload_queue_lock:
@@ -3849,7 +3867,7 @@ _ARG_DESTS = [
     "model", "imatrix", "output", "tiers", "workspace", "token",
     "s3_endpoint", "s3_token", "s3_key_id", "s3_secret",
     "quant_backup", "source_backup", "dry_run", "keep_files",
-    "no_quants",
+    "no_quants", "threads",
 ]
 
 
@@ -3871,6 +3889,7 @@ def _args_record(args: argparse.Namespace) -> dict:
         "dry_run": args.dry_run,
         "keep_files": args.keep_files,
         "no_quants": bool(getattr(args, "no_quants", False)),
+        "threads": getattr(args, "threads", DEFAULT_THREADS),
     }
 
 
@@ -4010,7 +4029,10 @@ def main():
                         help="Resume the pipeline from the saved state file. "
                              "All parameters (model, imatrix, output, tiers, "
                              "S3 settings, …) are restored from the state — "
-                              "no other arguments are allowed with --continue.")
+                               "no other arguments are allowed with --continue.")
+    parser.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                        help="Concurrent S3 download/upload workers "
+                             f"(default: {DEFAULT_THREADS})")
     parser.set_defaults(no_quants=False)
 
     args = parser.parse_args()

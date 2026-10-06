@@ -44,6 +44,8 @@ Dependencies: httpx, huggingface_hub (both already used by this repo).
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 import io
 import os
 import re
@@ -66,6 +68,7 @@ S3_PART_SIZE = 64 * 1024 * 1024       # 64 MB per multipart part
 READER_WINDOW = 32 * 1024 * 1024      # read-ahead window for seekable streams
 HTTP_TIMEOUT = httpx.Timeout(600, connect=30)
 RETRY_ATTEMPTS = 5
+DEFAULT_THREADS = 4           # concurrent download/upload workers
 
 _HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 
@@ -483,6 +486,24 @@ class S3Client:
             if remaining > 0:
                 raise RuntimeError(
                     f"S3 range GET: got {length - remaining}/{length} bytes")
+
+    def get_full_iter(self, bucket: str, key: str):
+        """Yield the entire object with a single unconditional GET.
+
+        Large byte-range GETs stall on some S3 proxies (they hang instead
+        of returning partial data), so full-object downloads stream
+        unconditionally rather than via Range requests.
+        """
+        url = self._url(bucket, key)
+        headers = self._headers("GET", url,
+                                extra={"Accept-Encoding": "identity"})
+        with self.client.stream("GET", url, headers=headers) as resp:
+            if resp.status_code >= 500 or resp.status_code == 429:
+                raise _RetryableStatus(resp.status_code)
+            if resp.status_code >= 300:
+                raise RuntimeError(f"S3 GET: HTTP {resp.status_code}")
+            for chunk in resp.iter_bytes(READ_CHUNK):
+                yield chunk
 
     def put_stream(self, bucket: str, key: str, gen, size: int) -> None:
         url = self._url(bucket, key)
@@ -1011,7 +1032,31 @@ def _range_body(src: URI, offset: int, length: int, bar: Bar | None):
     return lambda: hf.get_range_iter(src, offset, length)
 
 
-def copy_to_s3(src: URI, dest: URI, force: bool) -> None:
+def _fetch_concurrent(tasks: list, threads: int) -> list[bytes]:
+    """Concurrently fetch [offset, offset+length) for each task.
+
+    tasks: list of (offset, length, body_factory); the result holds the
+    fetched bytes in the same order as *tasks*.  A factory (not a generator)
+    is required so each concurrent fetch starts a fresh HTTP body stream.
+    """
+    results: dict[int, bytes] = {}
+
+    def _run(task: tuple) -> tuple[int, bytes]:
+        offset, _length, factory = task
+        return offset, b"".join(factory())
+
+    if threads <= 1 or not tasks:
+        for offset, _length, factory in tasks:
+            results[offset] = factory()
+        return [results[offset] for offset, _length, _factory in tasks]
+
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for offset, data in pool.map(_run, tasks):
+            results[offset] = data
+    return [results[offset] for offset, _length, _factory in tasks]
+
+
+def copy_to_s3(src: URI, dest: URI, force: bool, threads: int = 1) -> None:
     """Copy any source into s3:// via resumable multipart upload."""
     s3 = get_s3()
     # trailing '/' (or empty key) means the destination is a folder —
@@ -1097,23 +1142,49 @@ def copy_to_s3(src: URI, dest: URI, force: bool) -> None:
               f"({human(offset)}/{human(src_size)}, part size "
               f"{human(part_size)})")
 
-    n_parts = (src_size + part_size - 1) // part_size
     next_num = len(parts_kept) + 1
     bar = Bar(dest.label(), src_size, start=offset)
-    while offset < src_size:
-        length = min(part_size, src_size - offset)
-        if src.kind == "s3":
-            etag = s3.copy_part(dest.bucket, dest.path, upload_id, next_num,
-                                src.bucket, src.path, offset, length)
-            bar.update(offset + length)
+
+    tasks: list[tuple[int, int, int, str, object]] = []
+    end = offset
+    num = next_num
+    while end < src_size:
+        length = min(part_size, src_size - end)
+        kind = "copy" if src.kind == "s3" else "put"
+        tasks.append((num, end, length, kind,
+                      None if kind == "copy"
+                      else _range_body(src, end, length, None)))
+        num += 1
+        end += length
+
+    etags: dict[int, str] = {}
+    completed = 0
+
+    def _run(task: tuple) -> tuple[int, str, int]:
+        n, offset_, length_, kind, body = task
+        if kind == "copy":
+            etag = s3.copy_part(dest.bucket, dest.path, upload_id, n,
+                                src.bucket, src.path, offset_, length_)
         else:
-            body = _range_body(src, offset, length, bar)
-            etag = s3.upload_part(dest.bucket, dest.path, upload_id,
-                                  next_num, body, length)
-        parts_kept.append((next_num, etag))
-        offset += length
-        next_num += 1
+            etag = s3.upload_part(dest.bucket, dest.path, upload_id, n,
+                                  body, length_)
+        return n, etag, offset_ + length_
+
+    if threads > 1:
+        with ThreadPoolExecutor(max_workers=threads) as pool:
+            for n, etag, done_off in pool.map(_run, tasks):
+                etags[n] = etag
+                completed = max(completed, done_off)
+                bar.update(completed)
+    else:
+        for n, offset_, length_, kind, body in tasks:
+            _, etag, done_off = _run((n, offset_, length_, kind, body))
+            etags[n] = etag
+            completed = max(completed, done_off)
+            bar.update(completed)
     bar.finish()
+
+    parts_kept.extend(sorted(etags.items()))
     s3.multipart_complete(dest.bucket, dest.path, upload_id, parts_kept)
 
     final = s3.stat(dest.bucket, dest.path)
@@ -1123,7 +1194,7 @@ def copy_to_s3(src: URI, dest: URI, force: bool) -> None:
     print(f"copied: {src.label()} -> {dest.label()} ({human(src_size)})")
 
 
-def copy_to_local(src: URI, dest: URI, force: bool) -> None:
+def copy_to_local(src: URI, dest: URI, force: bool, threads: int = 1) -> None:
     """Stream a remote file to a local path with append-based resume."""
     src_size = src_size_of(src)
     dest_path = dest.path
@@ -1140,18 +1211,20 @@ def copy_to_local(src: URI, dest: URI, force: bool) -> None:
         if local_size == src_size and not force:
             print(f"skipped (identical size): {dest_path}")
             return
-        if 0 < local_size < src_size:
+        if src.kind == "s3" and 0 < local_size < src_size:
+            # byte-range resume is unavailable on this backend — restart
+            print(f"note: cannot resume S3 download via range — "
+                   f"restarting from 0 ({human(local_size)} discarded)")
+        elif 0 < local_size < src_size:
             offset = local_size
             print(f"resuming at offset {offset} "
-                  f"({human(offset)}/{human(src_size)})")
+                   f"({human(offset)}/{human(src_size)})")
 
     bar = Bar(dest_path, src_size, start=offset)
     mode = "r+b" if offset else "wb"
     with open(dest_path, mode) as f:
         if offset:
             f.seek(offset)
-        it = (_range_body(src, offset, src_size - offset, None)()
-              if src.kind != "local" else None)
         if src.kind == "local":
             with open(src.path, "rb") as g:
                 g.seek(offset)
@@ -1162,8 +1235,27 @@ def copy_to_local(src: URI, dest: URI, force: bool) -> None:
                     f.write(chunk)
                     offset += len(chunk)
                     bar.update(offset)
+        elif src.kind == "s3":
+            # unconditional full GET — byte-range GETs stall on this backend
+            for chunk in get_s3().get_full_iter(src.bucket, src.path):
+                f.write(chunk)
+                offset += len(chunk)
+                bar.update(offset)
+        elif threads > 1:
+            # fetch remote ranges concurrently, then write in order
+            parts: list = []
+            end = offset
+            while end < src_size:
+                length = min(S3_PART_SIZE, src_size - end)
+                parts.append(
+                    (end, length, _range_body(src, end, length, None)))
+                end += length
+            for chunk in _fetch_concurrent(parts, threads):
+                f.write(chunk)
+                offset += len(chunk)
+                bar.update(offset)
         else:
-            for chunk in it:
+            for chunk in _range_body(src, offset, src_size - offset, None)():
                 f.write(chunk)
                 offset += len(chunk)
                 bar.update(offset)
@@ -1442,6 +1534,9 @@ def cmd_cp(args) -> None:
     resolve_s3(src)
     resolve_s3(dest)
     force = args.force
+    threads = args.threads
+    if threads < 1:
+        sys.exit("error: --threads must be a positive integer")
 
     pairs, plain, src_is_dir = expand_cp_sources(src)
     multi = len(pairs) > 1
@@ -1494,9 +1589,9 @@ def cmd_cp(args) -> None:
         if s.kind == "local" and d.kind == "local":
             copy_local_to_local(s, d, force)
         elif d.kind == "s3":
-            copy_to_s3(s, d, force)
+            copy_to_s3(s, d, force, threads)
         elif d.kind == "local":
-            copy_to_local(s, d, force)
+            copy_to_local(s, d, force, threads)
         elif d.kind == "hf":
             if s.kind == "hf":
                 copy_hf_to_hf(s, d, force)
@@ -1524,6 +1619,9 @@ def main() -> None:
                       help="re-copy even if destination size matches")
     p_cp.add_argument("--part-size-mb", type=int, default=None,
                       help="S3 multipart part size in MB (default: 64)")
+    p_cp.add_argument("--threads", type=int, default=DEFAULT_THREADS,
+                      help="concurrent download/upload workers "
+                           f"(default: {DEFAULT_THREADS})")
 
     p_ls = sub.add_parser("ls", help="list a path (mask with * and ? allowed)")
     p_ls.add_argument("path")
