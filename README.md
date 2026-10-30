@@ -96,6 +96,20 @@ APEX was built for MoE, where routed experts are most of the weights but only a 
 
 `scripts/generate_config.sh --arch dense` emits configs for dense and hybrid-attention models. `scripts/generate_sensitivity_configs.py` builds a perturbation sweep that measures how much KL divergence each tensor group costs per gigabyte saved, and `scripts/generate_opt_config.py` turns that curve into an allocation.
 
+**`scripts/generate_dense_config.py` is the primary dense path**: it reads the model's own imatrix and a tier (`tier1`–`tier15`), and allocates precision greedily — every tensor group starts at its floor and is promoted one step up the quant ladder in order of importance per gigabyte, until the tier's size budget is met. The static `dense-*` profiles remain as A/B controls.
+
+```bash
+# generate the allocation (source GGUF header + imatrix GGUF + tier)
+./scripts/generate_dense_config.py --model model.gguf --imatrix imatrix.gguf --tier tier13 -o configs/my_dense.txt
+# inspect the allocation table without writing a config (--inventory works too)
+./scripts/generate_dense_config.py --model model.gguf --imatrix imatrix.gguf --tier tier13 --dry-run
+# size-check the gate, then quantize (config is consumed unchanged)
+./scripts/estimate_size.py --config configs/my_dense.txt model.gguf
+./scripts/quantize.py --config configs/my_dense.txt --imatrix imatrix.gguf model.gguf out.gguf
+```
+
+The allocator encodes the two hard constraints the sensitivity sweep found: `token_embd` has zero imatrix coverage (it is a `get_rows` lookup), so it is floored at IQ2_S and only ever stepped along imatrix-free types — anything lower aborts at quantize time (rc=133). And because exchange rates do not extrapolate across precision, groups are ranked by imatrix importance but stepped along discrete ladders rather than priced with continuous bit moves; outside the near-full tiers the ladder caps at Q6_K, since measured allocations never buy Q8_0 away from full precision.
+
 Measured on Qwen3.8-27B (64 layers, dense FFN, 3 linear-attention layers per full-attention layer). Full write-up in [benchmark_results/qwen38_27b/SENSITIVITY.md](benchmark_results/qwen38_27b/SENSITIVITY.md).
 
 | band | size | KL vs BF16 | flat allocation, same size | difference |

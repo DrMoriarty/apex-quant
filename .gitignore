@@ -6,3 +6,8 @@ __pycache__/
 .venv/
 .env
 texts/
+.drcode/tasks/
+.drcode/settings.json
+.drcode/github_state.json
+.drcode/worktrees/
+.drcode/merge_reports/

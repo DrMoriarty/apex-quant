@@ -17,6 +17,7 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 | `scripts/estimate_size.py` | Predict GGUF size from a profile or config; `--compare` inspects tensor types × groups |
 | `scripts/detect_gguf_params.py` | Reads GGUF header to detect layers, arch, expert count (used by quantize.py) |
 | `scripts/grab_config.py` | Reverse direction: extracts a tensor-type config from an existing GGUF header; auto-detects MoE vs dense format |
+| `scripts/generate_dense_config.py` | Imatrix-importance-driven dense allocator: reads imatrix GGUF + source GGUF header (or tensor inventory JSON), groups tensors into role × zone, greedily promotes groups up the quant ladder under a tier1–15 size budget; emits anchored configs consumable by `quantize.py --config`. Primary dense path; static `dense-*` profiles stay as A/B controls |
 | `scripts/batch_quantize.py` | End-to-end batch runner: HF download → imatrix → `quantize.py` tiers → HF/S3 upload; resumable state, `--speed` variant |
 
 ### Shell scripts (legacy — named profiles: quality, balanced, compact, mini, nano, micro)
@@ -70,7 +71,7 @@ llama-quantize matches `--tensor-type-file` entries with `std::regex_search` —
 ## MoE vs dense/hybrid architecture
 
 - `--arch moe` (default): emits `ffn_gate_exps`, `ffn_gate_shexp`, etc. Standard MoE model path.
-- `--arch dense`: emits `ffn_gate.weight` (with `.weight` suffix), `token_embd.weight`, `output.weight`, full-attn vs linear-attn tensors. For models with no experts.
+- `--arch dense`: emits `ffn_gate.weight` (with `.weight` suffix), `token_embd.weight`, `output.weight`, full-attn vs linear-attn tensors. For models with no experts. For the primary dense path use `scripts/generate_dense_config.py` instead (imatrix-driven, tier1–15); the static `dense-*` profiles are A/B controls. The dense allocator enforces two measured constraints: `token_embd` has zero imatrix coverage → IQ2_S floor, imatrix-free ladder only (very-low-bit types abort, rc=133); ladder capped at Q6_K except near-full tiers (Q8_0 allocations away from full precision measured worse).
 - `--dense-layers N`: leading dense (non-MoE) FFN layers inside an MoE model (e.g., LFM2, Step-3.x). Incompatible with `--arch dense` — the test suite explicitly rejects this combination.
 
 ## Config naming convention
