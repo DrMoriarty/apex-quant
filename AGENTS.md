@@ -12,10 +12,11 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/generate_config.py` | Emits tensor-type file; supports `--profile`, `--edge-exp`, `--layers`, `--dense-layers`, `--arch` |
+| `scripts/generate_config.py` | Emits tensor-type file; supports `--profile`, `--edge-exp`, `--layers`, `--dense-layers`, `--arch`. Quant mode flags: `--speed` / `--size` / `--mixed` (default `mixed`: experts IQ-band, rest K-quants) |
 | `scripts/quantize.py` | Quantize GGUF; `--profile`, `--config`, `--imatrix`, `--dry-run`, `--generate-config` |
 | `scripts/estimate_size.py` | Predict GGUF size from a profile or config; `--compare` inspects tensor types × groups |
 | `scripts/detect_gguf_params.py` | Reads GGUF header to detect layers, arch, expert count (used by quantize.py) |
+| `scripts/grab_config.py` | Reverse direction: extracts a tensor-type config from an existing GGUF header; auto-detects MoE vs dense format |
 | `scripts/batch_quantize.py` | End-to-end batch runner: HF download → imatrix → `quantize.py` tiers → HF/S3 upload; resumable state, `--speed` variant |
 
 ### Shell scripts (legacy — named profiles: quality, balanced, compact, mini, nano, micro)
@@ -37,6 +38,9 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 | `scripts/apex_pipeline.sh` | Full pipeline: download → convert → quantize → imatrix → eval → publish (YAML-driven) |
 | `scripts/generate_sensitivity_configs.py` | Builds perturbation sweep configs for measuring tensor-group sensitivity |
 | `scripts/generate_opt_config.py` | Turns a measured sensitivity curve into an allocation config |
+| `scripts/generate_imatrix_calibration.py` | Builds imatrix calibration file from a text block + rendered tool conversations (needs `transformers` tokenizer, HF model id — not a .gguf) |
+| `scripts/apex_mtp_patch_configs.py` | Bumps the MTP draft layer (`blk.40.*`, nextn tensors) to F16 in `*_mtp` configs — spec-decode acceptance collapses if the draft head is quantized hard |
+| `scripts/s3_proxy.py` | Read-only S3 HTTP proxy; reads the same `S3_*` env vars as `batch_quantize.py` |
 | `scripts/push_to_hf.sh` | Uploads GGUFs to HuggingFace |
 
 ## Canonical workflow (Python interface)
@@ -95,7 +99,7 @@ Always use `scripts/estimate_size.py` (or `scripts/estimate_config_size.py` for 
 
 ## No package manager / no CI
 
-This repo has no package.json, Makefile, pyproject.toml, CI workflows, or linter config. Scripts are standalone bash/python with `set -euo pipefail`. Python dependencies: `matplotlib`, `numpy` (for plot scripts), `huggingface_hub`, `rich`, `transformers` (see `requirements.txt`). Testing is manual: run the two test scripts above.
+This repo has no package.json, Makefile, pyproject.toml, CI workflows, or linter config. Scripts are standalone bash/python with `set -euo pipefail`. Python dependencies (see `requirements.txt`): `huggingface_hub`, `httpx` (S3/HF downloads in `cloudcp.py` and batch scripts), `rich`, `numpy`, `transformers` (calibration generation), `torch`/`sentencepiece`/`safetensors` (HF→GGUF conversion). `matplotlib` is commented out — only needed for `scripts/plot_*.py`. The `gguf` package is NOT pip-installed: it is vendored in `llama-scripts/gguf-py` and used via `llama-scripts/convert_hf_to_gguf.py`. Testing is manual: run the two test scripts above.
 
 ## Secrets / git hygiene
 
