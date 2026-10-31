@@ -258,21 +258,61 @@ def check_status(resp: httpx.Response, what: str):
         raise RuntimeError(f"{what}: HTTP {resp.status_code}: {body}")
 
 
-def with_retries(what: str, fn, attempts: int = RETRY_ATTEMPTS):
-    """Run fn() with exponential backoff on transport errors / 5xx / 429."""
+def with_retries(what: str, fn, attempts: int = RETRY_ATTEMPTS,
+                 retryable=None, on_retry=None):
+    """Run fn() with exponential backoff on transport errors / 5xx / 429.
+
+    `retryable(exc)` overrides the default exception filter; `on_retry(exc)`
+    runs after the backoff message, before the sleep (e.g. to re-arm a
+    streaming source for the next attempt).
+    """
     delay = 1.0
     for attempt in range(1, attempts + 1):
         try:
             return fn()
-        except (httpx.TransportError, _RetryableStatus) as exc:
+        except Exception as exc:
+            if retryable is not None:
+                if not retryable(exc):
+                    raise
+            elif not isinstance(exc, (httpx.TransportError, _RetryableStatus)):
+                raise
             if attempt == attempts:
                 raise RuntimeError(
                     f"{what} failed after {attempts} attempts: {exc}") from exc
             sys.stderr.write(f"\n{what}: {exc} — retrying in {delay:.0f}s "
                              f"({attempt}/{attempts - 1})\n")
+            if on_retry is not None:
+                on_retry(exc)
             time.sleep(delay)
             delay = min(30, delay * 2)
     raise AssertionError("unreachable")
+
+
+def _hf_retryable(exc: BaseException) -> bool:
+    """Is an error escaping huggingface_hub / hf_xet transient?
+
+    The hub raises HfHubHTTPError for HTTP problems (its import path moved
+    between hub versions); the hf_xet Rust backend surfaces dropped
+    connections with the class name "ConnectionError" — sometimes not the
+    builtin type.  Everything else (auth/permission errors, missing repo,
+    other 4xx) is fatal and must propagate unchanged.
+    """
+    if isinstance(exc, (httpx.TransportError, _RetryableStatus)):
+        return True
+    try:
+        from huggingface_hub.errors import HfHubHTTPError
+    except ImportError:  # older hub
+        try:
+            from huggingface_hub.utils import HfHubHTTPError
+        except ImportError:
+            HfHubHTTPError = None
+    if HfHubHTTPError is not None and isinstance(exc, HfHubHTTPError):
+        status = getattr(getattr(exc, "response", None), "status_code", 0) or 0
+        return status >= 500 or status == 429
+    name = type(exc).__name__
+    module = type(exc).__module__ or ""
+    return (isinstance(exc, ConnectionError) or name == "ConnectionError"
+            or module.startswith("hf_xet"))
 
 
 # ---------------------------------------------------------------------------
@@ -820,6 +860,7 @@ class HFClient:
                       f"overwriting")
 
         bar = None
+        reader = None
         if src.kind == "local":
             # hub reads the local file directly (no temp copy); it shows
             # its own tqdm during the upload
@@ -834,19 +875,30 @@ class HFClient:
             reader.reset_progress()
             bar = Bar(f"hf:{dest_path}", src_size)
             reader.bar = bar
-        try:
+
+        def commit():
             self.api.create_commit(
                 repo_id=dest.repo_id, repo_type=dest.repo_type,
                 operations=[op],
                 commit_message=f"Upload {dest_path} via cloudcp")
+
+        def rearm(_exc):
+            # Re-arm the remote stream for the next attempt: xet dedups
+            # already-uploaded chunks by content hash, so a retry transfers
+            # far less than the full file.
+            if reader is not None:
+                reader.phase = "upload"
+                reader.reset_progress()
+
+        try:
+            with_retries(f"HF upload of {dest_path}", commit,
+                         retryable=_hf_retryable, on_retry=rearm)
         except RepositoryNotFoundError:
             print(f"repo {dest.repo_id} does not exist — creating it")
             self.api.create_repo(repo_id=dest.repo_id, repo_type=dest.repo_type,
                                  exist_ok=True)
-            self.api.create_commit(
-                repo_id=dest.repo_id, repo_type=dest.repo_type,
-                operations=[op],
-                commit_message=f"Upload {dest_path} via cloudcp")
+            with_retries(f"HF upload of {dest_path}", commit,
+                         retryable=_hf_retryable, on_retry=rearm)
         finally:
             if bar is not None:
                 bar.finish()
