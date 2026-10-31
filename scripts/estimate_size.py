@@ -13,6 +13,24 @@ Usage:
     ./scripts/estimate_size.py --compare model.gguf --config configs/my_config.txt
     ./scripts/estimate_size.py --profile tier5 --json model.gguf   # machine-readable JSON
 
+Dense models and tier profiles
+------------------------------
+generate_config.py rejects MoE tier profiles with --arch dense, so the profile
+path needs special routing for dense GGUFs (arch auto-detected or --arch dense):
+
+  * tier1–15 + --imatrix <imatrix.gguf>  →  the config is produced by the
+    imatrix-driven allocator generate_dense_config.py (--tier <profile>,
+    --base from the resolved base type) — this is the primary dense path and
+    tracks the tier budget properly. Any tier fallback chosen by the allocator
+    (deeper tiers can be infeasible for a model's floors) is relayed to stderr
+    and reported in JSON as "dense_tier"/"dense_tier_fallback".
+  * tier1–15 without --imatrix  →  falls back to the nearest static dense-*
+    profile by size band (tier1–5 → dense-hybrid-quality, tier6–9 →
+    dense-grad, tier10–15 → dense-flat) with a warning. Static dense-*
+    profiles go no deeper than the Q4 band, so for tier10–15 the estimate is
+    well above the tier's bpw target (~1.7x for tier15).
+  * dense-* profiles and arch=moe behave exactly as before.
+
 Layer count is explicitly set via --layers or auto-detected from the GGUF file.
 """
 
@@ -328,6 +346,19 @@ def detect_gguf_params(gguf_path):
         return None
 
 
+TIER_PROFILE_RE = re.compile(r"tier(?:[1-9]|1[0-5])$")
+
+# Static dense-* fallback for tier profiles without --imatrix: nearest dense-*
+# profile by target bpw band (TIER_BPW in generate_dense_config.py: tier1–5
+# ≥5.5 bpw, tier6–9 4.0–5.1 bpw, tier10–15 ≤3.7 bpw). Static dense-* profiles
+# bottom out in the Q4 band, so tier10–15 estimates overshoot the tier target.
+DENSE_TIER_FALLBACK = {
+    **{f"tier{n}": "dense-hybrid-quality" for n in range(1, 6)},
+    **{f"tier{n}": "dense-grad" for n in range(6, 10)},
+    **{f"tier{n}": "dense-flat" for n in range(10, 16)},
+}
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Estimate quantized GGUF size without quantizing",
@@ -344,6 +375,11 @@ def main():
                         help="Leading dense (non-MoE) FFN layers (default: auto-detect)")
     parser.add_argument("--arch", choices=["moe", "dense"], default=None,
                         help="Architecture: moe or dense (default: auto-detect)")
+    parser.add_argument("--imatrix", "-i", default=None,
+                        help="Imatrix GGUF for dense tier profiles: routes the config "
+                             "generation through generate_dense_config.py (imatrix-driven "
+                             "allocator, primary dense path). Ignored for arch=moe "
+                             "and dense-* profiles")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="Print size in GB only")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -396,7 +432,7 @@ def main():
         "tier12": "Q5_K", 
         "tier13": "Q4_K", 
         "tier14": "Q4_K", 
-        "tier14": "Q4_K", 
+        "tier15": "Q4_K", 
     }
     base = base_type_map.get(profile, args.base_type).upper()
 
@@ -404,8 +440,14 @@ def main():
         print(f"ERROR: Input file not found: {args.input}", file=sys.stderr)
         sys.exit(1)
 
+    if args.imatrix and not os.path.isfile(args.imatrix):
+        print(f"ERROR: Imatrix file not found: {args.imatrix}", file=sys.stderr)
+        sys.exit(1)
+
     config_file = args.config
     tmpfile = None
+    dense_tier = None
+    dense_tier_fallback = False
 
     if config_file:
         if not os.path.isfile(config_file):
@@ -418,22 +460,67 @@ def main():
         tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         tmpfile.close()
         config_file = tmpfile.name
-        cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
-               "--profile", profile, "--layers", str(args.layers),
-               "-o", config_file]
-        if args.dense_layers:
-            cmd.extend(["--dense-layers", str(args.dense_layers)])
-        if args.arch:
-            cmd.extend(["--arch", args.arch])
-        if args.quant_mode:
-            cmd.append(f"--{args.quant_mode}")
-        try:
-            subprocess.run(cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError as e:
-            print(f"ERROR generating config: {e.stderr.decode()}", file=sys.stderr)
-            if tmpfile:
+
+        is_tier_profile = TIER_PROFILE_RE.fullmatch(profile) is not None
+        # Dense + tier profile: generate_config.py rejects that combination, so
+        # route through generate_dense_config.py (imatrix allocator) when an
+        # imatrix is available, else fall back to a static dense-* profile.
+        use_dense_allocator = (args.arch == "dense" and is_tier_profile
+                               and bool(args.imatrix))
+
+        if args.imatrix and not use_dense_allocator:
+            print(f"warning: --imatrix ignored: the imatrix allocator is only "
+                  f"used for arch=dense + tier1–15 profiles", file=sys.stderr)
+
+        if use_dense_allocator:
+            cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_dense_config.py"),
+                   "--model", args.input, "--imatrix", args.imatrix,
+                   "--tier", profile, "--base", base, "-o", config_file]
+            if args.layers is not None:
+                cmd.extend(["--layers", str(args.layers)])
+            try:
+                proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as e:
+                print(f"ERROR generating config: {e.stderr}", file=sys.stderr)
                 os.unlink(tmpfile.name)
-            sys.exit(1)
+                sys.exit(1)
+            # Relay allocator diagnostics (imatrix coverage, tier fallback).
+            sys.stderr.write(proc.stderr)
+            m = re.search(r"falling back to (tier\d+)", proc.stderr)
+            if m:
+                dense_tier = m.group(1)
+                dense_tier_fallback = True
+            else:
+                dense_tier = profile
+        else:
+            gen_profile = profile
+            if args.arch == "dense" and is_tier_profile and not args.imatrix:
+                gen_profile = DENSE_TIER_FALLBACK[profile]
+                tier_num = int(profile[len("tier"):])
+                print(f"warning: dense model with tier profile '{profile}' but no "
+                      f"--imatrix: falling back to static dense profile "
+                      f"'{gen_profile}' (nearest by size band)", file=sys.stderr)
+                if tier_num >= 10:
+                    print(f"warning: static dense-* profiles go no deeper than the "
+                          f"Q4 band — the estimate will be well above the {profile} "
+                          f"target (~1.7x bpw for tier15)", file=sys.stderr)
+
+            cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
+                   "--profile", gen_profile, "--layers", str(args.layers),
+                   "-o", config_file]
+            if args.dense_layers:
+                cmd.extend(["--dense-layers", str(args.dense_layers)])
+            if args.arch:
+                cmd.extend(["--arch", args.arch])
+            if args.quant_mode:
+                cmd.append(f"--{args.quant_mode}")
+            try:
+                subprocess.run(cmd, check=True, capture_output=True)
+            except subprocess.CalledProcessError as e:
+                print(f"ERROR generating config: {e.stderr.decode()}", file=sys.stderr)
+                if tmpfile:
+                    os.unlink(tmpfile.name)
+                sys.exit(1)
 
     try:
         tensors = read_gguf_tensor_list(args.input)
@@ -479,6 +566,10 @@ def main():
                 "uncovered": uncovered,
                 "estimated_size_gb": size_gb,
             }
+            if dense_tier is not None:
+                result["dense_tier"] = dense_tier
+                result["dense_tier_fallback"] = dense_tier_fallback
+                result["imatrix"] = args.imatrix
             result.update(estimate_breakdown(by_type, group_params, group_bits,
                                              cat_type_bits, total_params))
             if args.verbose:
