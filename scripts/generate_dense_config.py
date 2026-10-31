@@ -17,14 +17,17 @@ Usage:
 
 Algorithm
 ---------
-1.  Read per-tensor importance from the imatrix GGUF (entries named
-    ``imatrix.<tensor>``; ``.counts`` companions are used to normalize,
-    ``.in_sum2`` companions are ignored). Score = mean (or --stat p95) of the
-    per-column values, aggregated numel-weighted per group.
+1.  Read per-tensor importance from the imatrix GGUF. Both llama.cpp formats
+    are supported: legacy ``imatrix.<tensor>`` values entries (``.counts``
+    companions normalize, ``.in_sum2`` companions ignored) and the newer
+    raw-sums format storing only ``<tensor>.in_sum2`` + ``<tensor>.counts``
+    (no prefix; importance reconstructed as RMS = sqrt(in_sum2/counts)).
+    Score = mean (or --stat p95) of the per-column values, aggregated
+    numel-weighted per group.
 2.  Group model tensors (source GGUF header or --inventory) into
     role x zone: ffn_gate/ffn_up/ffn_down x edge/near/mid (get_zone()
     convention, 10% per side edge, next 10% near), fullattn (q/k/output),
-    attn_v, linattn_qkv/attn_gate, linattn_out (ssm_out), ssm_small
+    attn_v, linattn_qkv/attn_gate, linattn_out (ssm_out), ssm_in, ssm_small
     (alpha/beta), token_embd, output.weight. MTP/NextN tensors are pinned F16
     (spec-decode acceptance collapses if the draft head is quantized hard —
     see scripts/apex_mtp_patch_configs.py).
@@ -124,6 +127,7 @@ ROLE_PATTERNS = [
     (re.compile(r"^blk\.(\d+)\.attn_qkv\.weight$"), "linattn_qkv", "layer"),
     (re.compile(r"^blk\.(\d+)\.attn_gate\.weight$"), "linattn_gate", "layer"),
     (re.compile(r"^blk\.(\d+)\.ssm_out\.weight$"), "linattn_out", "layer"),
+    (re.compile(r"^blk\.(\d+)\.ssm_in\.weight$"), "ssm_in", "layer"),
     (re.compile(r"^blk\.(\d+)\.ssm_(alpha|beta)\.weight$"), "ssm_small", "layer"),
     (re.compile(r"^blk\.(\d+)\.shortconv\.in_proj\.weight$"), "linattn_qkv", "layer"),
     (re.compile(r"^blk\.(\d+)\.shortconv\.out_proj\.weight$"), "linattn_out", "layer"),
@@ -221,11 +225,22 @@ def read_imatrix(path):
     """Read an imatrix GGUF (llama-imatrix -o output).
 
     Returns (entries, chunk_count) where entries maps tensor name ->
-    (values ndarray F32, counts ndarray F32 or None). Handles the
-    ``imatrix.<name>``, ``imatrix.<name>.counts`` and ``imatrix.<name>.in_sum2``
-    entry naming produced by llama-imatrix.
+    (values ndarray F32, counts ndarray F32 or None).
+
+    Handles two on-disk formats:
+
+    * legacy: ``imatrix.<name>`` F32 per-column values entry, with optional
+      ``imatrix.<name>.counts`` companion (the ``imatrix.<name>.in_sum2``
+      companion is ignored — the plain entry is already normalized).
+    * raw-sums (newer llama.cpp builds): per base tensor exactly two entries
+      with NO "imatrix." prefix — ``<name>.in_sum2`` (F32, one sum-of-squares
+      value per output column) and ``<name>.counts`` (call counter, scalar or
+      per-column). The legacy per-column statistic is reconstructed as
+      RMS = sqrt(in_sum2_col / counts).
     """
     entries = {}
+    sum2 = {}        # raw-sums format: base name -> per-column sum of squares
+    sum_counts = {}  # raw-sums format: base name -> call counter(s)
     chunk_count = None
     with open(path, "rb") as f:
         magic, version, n_tensors, n_kv = struct.unpack("<4sIQQ", f.read(24))
@@ -252,25 +267,59 @@ def read_imatrix(path):
             offset = struct.unpack("<Q", f.read(8))[0]
             infos.append((name, type_id, int(np.prod(dims)) if dims else 0, offset))
 
-        data_start = (f.tell() + alignment - 1) // alignment * alignment
-        for name, type_id, numel, offset in infos:
-            if not name.startswith("imatrix."):
-                continue
-            rest = name[len("imatrix."):]
-            if rest.endswith(".in_sum2"):
-                continue
+        def read_entry(name, type_id, numel, offset):
             if type_id != 0:  # expect F32
                 print(f"warning: imatrix entry {name!r} is not F32, skipped", file=sys.stderr)
-                continue
+                return None
             f.seek(data_start + offset)
-            vals = np.frombuffer(f.read(numel * 4), dtype="<f4").astype(np.float64)
-            if rest.endswith(".counts"):
-                base = rest[:-len(".counts")]
-                prev = entries.get(base, (None, None))
-                entries[base] = (prev[0], vals)
-            else:
-                prev = entries.get(rest, (None, None))
-                entries[rest] = (vals, prev[1])
+            return np.frombuffer(f.read(numel * 4), dtype="<f4").astype(np.float64)
+
+        data_start = (f.tell() + alignment - 1) // alignment * alignment
+        for name, type_id, numel, offset in infos:
+            if name.startswith("imatrix."):
+                rest = name[len("imatrix."):]
+                if rest.endswith(".in_sum2"):
+                    continue  # legacy companion; the plain entry is authoritative
+                vals = read_entry(name, type_id, numel, offset)
+                if vals is None:
+                    continue
+                if rest.endswith(".counts"):
+                    base = rest[:-len(".counts")]
+                    prev = entries.get(base, (None, None))
+                    entries[base] = (prev[0], vals)
+                else:
+                    prev = entries.get(rest, (None, None))
+                    entries[rest] = (vals, prev[1])
+            elif name.endswith(".in_sum2"):
+                vals = read_entry(name, type_id, numel, offset)
+                if vals is not None:
+                    sum2[name[:-len(".in_sum2")]] = vals
+            elif name.endswith(".counts"):
+                vals = read_entry(name, type_id, numel, offset)
+                if vals is not None:
+                    sum_counts[name[:-len(".counts")]] = vals
+            # anything else is not an imatrix entry — skip
+
+    # Reconstruct the legacy statistic for raw-sums format bases. A plain
+    # legacy entry, when present, wins over the reconstruction.
+    for base, s2 in sum2.items():
+        if entries.get(base, (None, None))[0] is not None:
+            continue
+        cnt = sum_counts.get(base)
+        if cnt is None:
+            print(f"warning: no counts entry for imatrix tensor {base!r}; "
+                  f"using unnormalized in_sum2", file=sys.stderr)
+            vals = s2
+        elif cnt.size == 1:
+            c = float(cnt[0])
+            vals = s2 / c if c > 0 else s2
+        elif cnt.size == s2.size:
+            vals = np.where(cnt > 0, s2 / np.maximum(cnt, 1), s2)
+        else:
+            print(f"warning: counts shape mismatch for imatrix tensor {base!r}; "
+                  f"using unnormalized in_sum2", file=sys.stderr)
+            vals = s2
+        entries[base] = (np.sqrt(vals), None)
     return entries, chunk_count
 
 
@@ -492,6 +541,7 @@ def emit_config(layers, levels, ladders, mtp_names):
         ("linattn_qkv", "attn_qkv.weight"),
         ("linattn_gate", "attn_gate.weight"),
         ("linattn_out", "ssm_out.weight"),
+        ("ssm_in", "ssm_in.weight"),
         ("ssm_small", "ssm_alpha.weight"),
         ("ssm_small", "ssm_beta.weight"),
     ]
