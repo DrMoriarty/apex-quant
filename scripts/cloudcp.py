@@ -51,6 +51,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -131,19 +132,22 @@ class Bar:
         self.t0 = time.monotonic()
         self._last_draw = 0.0
         self._done = False
+        self._lock = threading.Lock()
 
     def update(self, current: int):
-        self.current = current
         now = time.monotonic()
-        if not self._done and now - self._last_draw >= 0.2:
-            self._draw()
-            self._last_draw = now
+        with self._lock:
+            self.current = current
+            if not self._done and now - self._last_draw >= 0.2:
+                self._draw()
+                self._last_draw = now
 
     def finish(self):
-        if self._done:
-            return
-        self._done = True
-        self._draw()
+        with self._lock:
+            if self._done:
+                return
+            self._done = True
+            self._draw()
         sys.stderr.write("\n")
         sys.stderr.flush()
 
@@ -1056,11 +1060,13 @@ def get_hf() -> HFClient:
 # Copy engine
 # ---------------------------------------------------------------------------
 
-def _range_body(src: URI, offset: int, length: int, bar: Bar | None):
+def _range_body(src: URI, offset: int, length: int, bar: Bar | None,
+                progress=None):
     """Factory returning a generator over src[offset:offset+length].
 
     A factory (not a generator) is required so each HTTP retry gets a
-    fresh body stream.
+    fresh body stream.  `progress`, when given, is called with the length
+    of every chunk as it arrives from the network (s3/hf sources).
     """
     if src.kind == "local":
         def gen():
@@ -1079,9 +1085,22 @@ def _range_body(src: URI, offset: int, length: int, bar: Bar | None):
         return gen
     if src.kind == "s3":
         s3 = get_s3()
-        return lambda: s3.get_range_iter(src.bucket, src.path, offset, length)
+
+        def gen():
+            for chunk in s3.get_range_iter(src.bucket, src.path,
+                                           offset, length):
+                if progress:
+                    progress(len(chunk))
+                yield chunk
+        return gen
     hf = get_hf()
-    return lambda: hf.get_range_iter(src, offset, length)
+
+    def gen():
+        for chunk in hf.get_range_iter(src, offset, length):
+            if progress:
+                progress(len(chunk))
+            yield chunk
+    return gen
 
 
 def _fetch_concurrent(tasks: list, threads: int) -> list[bytes]:
@@ -1294,18 +1313,29 @@ def copy_to_local(src: URI, dest: URI, force: bool, threads: int = 1) -> None:
                 offset += len(chunk)
                 bar.update(offset)
         elif threads > 1:
-            # fetch remote ranges concurrently, then write in order
+            # fetch remote ranges concurrently, then write in order;
+            # workers report per-chunk progress so the bar stays live
+            start = offset
+            lock = threading.Lock()
+            received = 0
+
+            def progress(n: int):
+                nonlocal received
+                with lock:
+                    received += n
+                    bar.update(start + received)
+
             parts: list = []
             end = offset
             while end < src_size:
                 length = min(S3_PART_SIZE, src_size - end)
                 parts.append(
-                    (end, length, _range_body(src, end, length, None)))
+                    (end, length,
+                     _range_body(src, end, length, None, progress)))
                 end += length
             for chunk in _fetch_concurrent(parts, threads):
                 f.write(chunk)
                 offset += len(chunk)
-                bar.update(offset)
         else:
             for chunk in _range_body(src, offset, src_size - offset, None)():
                 f.write(chunk)
