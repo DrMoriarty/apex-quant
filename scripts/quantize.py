@@ -18,8 +18,19 @@ Usage:
   ./scripts/quantize.py --profile tier5 --dry-run input.gguf
 
 Profiles:
-  tier1–tier15   MoE tier profiles (tier1 = near-full precision, tier15 = IQ1/IQ2 band)
-  i-tierN        Same as tierN, for use with --imatrix
+  tier1–tier15   MoE tier profiles (tier1 = near-full precision, tier15 = IQ1/IQ2 band).
+                 On a dense model (arch auto-detected or --arch dense) they are
+                 routed like estimate_size.py:
+                   * with --imatrix → generate_dense_config.py, the imatrix-driven
+                     allocator (--tier <tier>, --base from the resolved base type).
+                     This is the primary dense path; --speed/--size/--mixed and
+                     --f16-tensors are not forwarded (the allocator pins MTP
+                     blocks to f16 itself).
+                   * without --imatrix → nearest static dense-* profile
+                     (DENSE_TIER_FALLBACK) with a warning; static dense-*
+                     profiles remain the A/B controls.
+  i-tierN        Same as tierN, for use with --imatrix (normalized to tierN for
+                 the dense allocator, which only accepts tier1..15)
   dense-*        Dense/hybrid profiles: dense-flat, dense-grad, dense-hybrid,
                  dense-hybrid-quality
 
@@ -34,12 +45,18 @@ Environment:
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.join(SCRIPT_DIR, "..")
+
+# Shared with estimate_size.py, which already solved the dense/tier routing
+# (TIER_PROFILE_RE for tier1–15 detection, DENSE_TIER_FALLBACK for the static
+# dense-* fallback when no --imatrix is available).
+from estimate_size import DENSE_TIER_FALLBACK, TIER_PROFILE_RE
 
 
 def load_dotenv(path=None):
@@ -110,13 +127,80 @@ def detect_gguf_params(gguf_path):
         return None
 
 
+def normalize_tier(profile):
+    """Map i-tierN → tierN (generate_dense_config.py --tier only accepts tier1..15)."""
+    m = re.fullmatch(r"i-(tier(?:[1-9]|1[0-5]))", profile)
+    return m.group(1) if m else profile
+
+
+def build_config_cmd(args, config_file, detected=None):
+    """Build the config-generation command for args.profile.
+
+    Mirrors estimate_size.py's dense routing: arch=dense + tier1–15 + --imatrix
+    goes through generate_dense_config.py (the imatrix-driven allocator — the
+    primary dense path); tier1–15 + arch=dense without --imatrix falls back to
+    the nearest static dense-* profile (DENSE_TIER_FALLBACK) with a warning.
+    MoE and dense-* profiles go through generate_config.py exactly as before.
+
+    Returns the full command list; the caller runs it.
+    """
+    tier = normalize_tier(args.profile)
+    is_tier_profile = TIER_PROFILE_RE.fullmatch(tier) is not None
+    use_dense_allocator = (args.arch == "dense" and is_tier_profile
+                           and bool(args.imatrix)
+                           and bool(args.input) and os.path.isfile(args.input))
+
+    if args.imatrix and not use_dense_allocator:
+        print("warning: --imatrix ignored: the imatrix allocator is only "
+              "used for arch=dense + tier1–15 profiles", file=sys.stderr)
+
+    if use_dense_allocator:
+        cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_dense_config.py"),
+               "--model", args.input, "--imatrix", args.imatrix,
+               "--tier", tier, "--base", args.base_type]
+        if config_file:
+            cmd.extend(["-o", config_file])
+        if args.layers is not None:
+            cmd.extend(["--layers", str(args.layers)])
+        return cmd
+
+    gen_profile = args.profile
+    if args.arch == "dense" and is_tier_profile:
+        gen_profile = DENSE_TIER_FALLBACK[tier]
+        tier_num = int(tier[len("tier"):])
+        print(f"warning: dense model with tier profile '{args.profile}' but no "
+              f"--imatrix: falling back to static dense profile "
+              f"'{gen_profile}' (nearest by size band)", file=sys.stderr)
+        if tier_num >= 10:
+            print(f"warning: static dense-* profiles go no deeper than the "
+                  f"Q4 band — the quantize will be well above the {tier} "
+                  f"target (~1.7x bpw for tier15)", file=sys.stderr)
+
+    cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
+           "--profile", gen_profile, "--layers", str(args.layers)]
+    if config_file:
+        cmd.extend(["-o", config_file])
+    if args.dense_layers:
+        cmd.extend(["--dense-layers", str(args.dense_layers)])
+    if args.arch:
+        cmd.extend(["--arch", args.arch])
+    if args.quant_mode:
+        cmd.append(f"--{args.quant_mode}")
+    if detected and detected.get("mtp_tensors"):
+        cmd.extend(["--f16-tensors", ",".join(detected["mtp_tensors"])])
+    return cmd
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="APEX quantization for llama.cpp",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--profile", "-p", default="tier1",
-                        help="Profile name (default: tier1)")
+                        help="Profile name (default: tier1). tier1–15 + --imatrix "
+                             "on a dense model routes through generate_dense_config.py "
+                             "(imatrix-driven allocator, primary dense path); "
+                             "static dense-* profiles remain A/B controls")
     parser.add_argument("--config", "-c",
                         help="Custom tensor-type file")
     parser.add_argument("--imatrix", "-i",
@@ -168,6 +252,7 @@ def main():
     args.base_type = base_type_map.get(args.profile, args.base_type)
 
     # Auto-detect parameters if not provided
+    detected = None
     if args.input and os.path.isfile(args.input):
         detected = detect_gguf_params(args.input)
         if detected:
@@ -184,19 +269,12 @@ def main():
 
     # Generate config only mode
     if args.generate_config:
-        cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
-               "--profile", args.profile, "--layers", str(args.layers)]
-        if args.dense_layers:
-            cmd.extend(["--dense-layers", str(args.dense_layers)])
-        if args.arch:
-            cmd.extend(["--arch", args.arch])
-        if args.quant_mode:
-            cmd.append(f"--{args.quant_mode}")
-        if detected and detected.get("mtp_tensors"):
-            cmd.extend(["--f16-tensors", ",".join(detected["mtp_tensors"])])
-        if args.output:
-            cmd.extend(["-o", args.output])
-        subprocess.run(cmd, check=True)
+        cmd = build_config_cmd(args, args.output, detected)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR generating config: {e}", file=sys.stderr)
+            sys.exit(1)
         sys.exit(0)
 
     # Need at least input for quantization / dry-run
@@ -217,18 +295,14 @@ def main():
         tmpfile = tempfile.NamedTemporaryFile(delete=False, suffix=".txt")
         tmpfile.close()
         config_file = tmpfile.name
-        cmd = [sys.executable, os.path.join(SCRIPT_DIR, "generate_config.py"),
-               "--profile", args.profile, "--layers", str(args.layers),
-               "-o", config_file]
-        if args.dense_layers:
-            cmd.extend(["--dense-layers", str(args.dense_layers)])
-        if args.arch:
-            cmd.extend(["--arch", args.arch])
-        if args.quant_mode:
-            cmd.append(f"--{args.quant_mode}")
-        if detected and detected.get("mtp_tensors"):
-            cmd.extend(["--f16-tensors", ",".join(detected["mtp_tensors"])])
-        subprocess.run(cmd, check=True)
+        cmd = build_config_cmd(args, config_file, detected)
+        try:
+            subprocess.run(cmd, check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR generating config: {e}", file=sys.stderr)
+            if tmpfile:
+                os.unlink(tmpfile.name)
+            sys.exit(1)
         print(f">>> Generated config for profile '{args.profile}' ({args.layers} layers)")
 
     if not os.path.isfile(args.input):
@@ -254,6 +328,10 @@ def main():
                    "--base-type", args.base_type, args.input]
         if config_file:
             est_cmd.extend(["--config", config_file])
+        if args.arch:
+            est_cmd.extend(["--arch", args.arch])
+        if args.imatrix:
+            est_cmd.extend(["--imatrix", args.imatrix])
         if args.quant_mode:
             est_cmd.append(f"--{args.quant_mode}")
         try:
