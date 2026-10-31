@@ -31,9 +31,16 @@ Algorithm
     (alpha/beta), token_embd, output.weight. MTP/NextN tensors are pinned F16
     (spec-decode acceptance collapses if the draft head is quantized hard —
     see scripts/apex_mtp_patch_configs.py).
-3.  Map tier1–tier15 to a target bits-per-weight budget, calibrated to the
-    MoE tier ladder (tier1 ≈ near-full precision … tier15 ≈ IQ2 band).
-    --target-bpw overrides the table.
+3.  Map tier1–tier15 to a target bits-per-weight budget. TIER_BPW is derived
+    from the MoE tier ladder (generate_config.PROFILES) translated through the
+    dense quant ladder and smoothed to a convex decreasing curve; it brackets
+    the MoE reference calibration (Mellum2-12B-A2.5B tier sizes) at every
+    tier. --target-bpw overrides the table.
+    If the requested tier's budget is below the model's floor allocation
+    (every group at its floor + base_type for unclassified tensors), the
+    script does not fail: it walks from the requested tier towards tier1 and
+    uses the nearest (deepest) feasible tier, printing a warning to stderr
+    (exit code stays 0).
 4.  Greedy knapsack: start every covered group at its floor, rank candidate
     promotions by importance per GB saved, and repeatedly promote the highest
     ranked group one step up the discrete quant ladder while the estimated
@@ -86,25 +93,41 @@ LADDER = ["IQ2_S", "IQ3_XXS", "Q3_K", "IQ4_XS", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
 # IQ3/IQ4 XS variants share the importance-dependent code path.
 SAFE_LADDER = ["IQ2_S", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
 
-# Target average bits-per-weight (over all params) per tier. Calibrated so the
-# dense ladder brackets the measured bands on Qwen3.8-27B: tier13 ≈ Mini
-# (~13.5 GB), tier10 ≈ Compact/Q4_K band, tier1 ≈ uniform Q8_0.
+# Target average bits-per-weight (over all params) per tier.
+#
+# Derived from the MoE tier structure (generate_config.PROFILES), not
+# hand-picked: each MoE role rank is translated through the dense LADDER
+# (mixed mode: expert ranks via QUANTS_RANKED_SIZE, other roles via
+# QUANTS_RANKED_SPEED; each quant snapped to its nearest dense-ladder rung by
+# estimate_size.BPW) and averaged over a typical dense param distribution —
+# FFN 70% (edge/near/mid zones 10/10/80), attention 26% (edge/mid 10/90),
+# token_embd + output.weight 4%; shared-expert slots have no dense counterpart
+# and get zero weight. The raw per-tier averages oscillate around their trend
+# (tier triplets differ by a single rank) and tiers 13–15 collapse (rank 6 =
+# IQ1_M clamps to the dense ladder's IQ2_S floor), so the points are smoothed
+# with a least-squares quadratic — a convex decreasing parabola whose steps
+# flatten with depth, matching the MoE reference calibration (Mellum2-12B-
+# A2.5B, generate_config.py tiers): converted to GB at 12 B params the curve
+# brackets the measured tier1..13 sizes 11.35 … 4.79 GB within ±7% at every
+# tier. Monotone tier1 > … > tier15, convex (bpw deltas 0.58 → 0.13 shrink
+# with depth — late ladder steps save fewer bits per weight, exactly the
+# flattening the MoE reference shows).
 TIER_BPW = {
-    "tier1": 8.5,
-    "tier2": 8.0,
-    "tier3": 7.5,
-    "tier4": 7.0,
-    "tier5": 6.6,
-    "tier6": 6.2,
-    "tier7": 5.9,
-    "tier8": 5.6,
-    "tier9": 5.3,
-    "tier10": 5.0,
-    "tier11": 4.6,
-    "tier12": 4.3,
-    "tier13": 4.0,
-    "tier14": 3.7,
-    "tier15": 3.4,
+    "tier1": 7.65,
+    "tier2": 7.07,
+    "tier3": 6.53,
+    "tier4": 6.02,
+    "tier5": 5.55,
+    "tier6": 5.11,
+    "tier7": 4.71,
+    "tier8": 4.34,
+    "tier9": 4.00,
+    "tier10": 3.70,
+    "tier11": 3.43,
+    "tier12": 3.20,
+    "tier13": 3.00,
+    "tier14": 2.84,
+    "tier15": 2.71,
 }
 
 # Groups whose first ladder step is above IQ2_S (output.weight is the dearest
@@ -399,6 +422,42 @@ def total_bits(tensors, assignment, base_type, mtp_blocks=frozenset()):
     return bits
 
 
+def build_ladders(groups, importance, cap_q="Q6_K"):
+    """Per-group ladder and floor index for a ladder capped at *cap_q*.
+
+    Returns (ladders, floors): ladders maps group key -> quant list
+    (LADDER for imatrix-covered groups, SAFE_LADDER otherwise, both
+    truncated at the cap), floors maps group key -> floor ladder index.
+    """
+    cap_idx = LADDER.index(cap_q) if cap_q in LADDER else len(LADDER) - 1
+    ladders = {}
+    floors = {}
+    for key in groups:
+        role = key[0]
+        covered = key in importance
+        ladders[key] = (LADDER if covered else SAFE_LADDER)[:cap_idx + 1]
+        floor_q = GROUP_FLOORS.get(role, "IQ2_S")
+        if floor_q not in ladders[key]:
+            floor_q = ladders[key][0]
+        floors[key] = ladders[key].index(floor_q)
+    return ladders, floors
+
+
+def floor_bits(groups, importance, tensors, base_type, cap_q="Q6_K",
+               mtp_blocks=frozenset()):
+    """Estimated bits with every group parked at its floor (no greedy walk).
+
+    This is the feasibility pre-pass: if it exceeds the budget, no allocation
+    under that budget (and that ladder cap) exists.
+    """
+    ladders, floors = build_ladders(groups, importance, cap_q)
+    assignment = {}
+    for key, members in groups.items():
+        for name, _ in members:
+            assignment[name] = ladders[key][floors[key]]
+    return total_bits(tensors, assignment, base_type, mtp_blocks)
+
+
 def allocate(groups, importance, tensors, base_type, budget_bits, cap_q="Q6_K",
              mtp_blocks=frozenset()):
     """Greedy ladder allocation under a bit budget.
@@ -413,18 +472,12 @@ def allocate(groups, importance, tensors, base_type, budget_bits, cap_q="Q6_K",
     the near-full tiers — output at Q8_0 funded by cutting an already-Q3 FFN
     lost by 6.1σ (SENSITIVITY.md, mini-v2). Only tiers with target >= 7.5 bpw
     get the full ladder; everyone else caps at Q6_K.
+
+    Raises ValueError when the budget is below the floor allocation — the
+    caller (main) runs the tier-fallback walk; this function no longer
+    exits on infeasible tiers.
     """
-    cap_idx = LADDER.index(cap_q) if cap_q in LADDER else len(LADDER) - 1
-    ladders = {}
-    floors = {}
-    for key in groups:
-        role = key[0]
-        covered = key in importance
-        ladders[key] = (LADDER if covered else SAFE_LADDER)[:cap_idx + 1]
-        floor_q = GROUP_FLOORS.get(role, "IQ2_S")
-        if floor_q not in ladders[key]:
-            floor_q = ladders[key][0]
-        floors[key] = ladders[key].index(floor_q)
+    ladders, floors = build_ladders(groups, importance, cap_q)
 
     levels = dict(floors)
     assignment = {}
@@ -433,12 +486,12 @@ def allocate(groups, importance, tensors, base_type, budget_bits, cap_q="Q6_K",
             assignment[name] = ladders[key][levels[key]]
 
     cur_bits = total_bits(tensors, assignment, base_type, mtp_blocks)
-    floor_bits = cur_bits
-    if floor_bits > budget_bits:
-        print(f"error: floor allocation needs {floor_bits / 8 / 1e9:.2f} GB, "
-              f"budget is {budget_bits / 8 / 1e9:.2f} GB — tier too deep for "
-              f"this model's floors", file=sys.stderr)
-        sys.exit(1)
+    floor_bits_ = cur_bits
+    if floor_bits_ > budget_bits:
+        raise ValueError(
+            f"floor allocation needs {floor_bits_ / 8 / 1e9:.2f} GB, "
+            f"budget is {budget_bits / 8 / 1e9:.2f} GB — tier too deep for "
+            f"this model's floors")
 
     def group_numel(key):
         return sum(n for _, n in groups[key])
@@ -513,7 +566,7 @@ def allocate(groups, importance, tensors, base_type, budget_bits, cap_q="Q6_K",
                         assignment[name] = ladder[levels[dkey]]
                     cur_bits += delta
 
-    return levels, ladders, assignment, cur_bits, floor_bits
+    return levels, ladders, assignment, cur_bits, floor_bits_
 
 
 # ── Emission ─────────────────────────────────────────────────────────────────
@@ -636,20 +689,66 @@ def main(argv=None):
             print(f"  … and {len(unclassified) - 10} more", file=sys.stderr)
 
     total_params = sum(n for _, n, _ in tensors)
-    target_bpw = args.target_bpw if args.target_bpw else TIER_BPW[args.tier]
-    budget_bits = target_bpw * total_params
 
+    # Feasibility walk: cap_q (Q8_0 vs Q6_K ladder) depends on the tier's
+    # target bpw, so the floor pre-pass must run per candidate tier rather
+    # than comparing raw budgets. Walk from the requested tier towards tier1
+    # and take the first (deepest) tier whose budget fits the floors.
+    tier_num = int(args.tier[len("tier"):])
+    selected_tier = None
+    req_target_bpw = args.target_bpw if args.target_bpw else TIER_BPW[args.tier]
+    req_floor_bits = None
+    last_fb = last_bpw = None
+    for cand in range(tier_num, 0, -1):
+        cand_tier = f"tier{cand}"
+        # --target-bpw overrides the requested tier's budget; once the walk
+        # falls back, shallower candidates use their own table budget (the
+        # warning reports a tier, not a custom target).
+        cand_bpw = (args.target_bpw if cand == tier_num and args.target_bpw
+                    else TIER_BPW[cand_tier])
+        budget_bits = cand_bpw * total_params
+        cap_q = "Q8_0" if cand_bpw >= 7.5 else "Q6_K"
+        fb = floor_bits(groups, importance, tensors, base_type, cap_q=cap_q,
+                        mtp_blocks=mtp_blocks)
+        if req_floor_bits is None:
+            req_floor_bits = fb
+        last_fb, last_bpw = fb, cand_bpw
+        if fb <= budget_bits:
+            selected_tier = cand_tier
+            target_bpw = cand_bpw
+            break
+
+    if selected_tier is None:
+        # Even tier1 cannot host the floors — nothing shallower exists.
+        print(f"error: floor allocation needs {last_fb / 8 / 1e9:.2f} GB, "
+              f"budget is {last_bpw * total_params / 8 / 1e9:.2f} GB — tier "
+              "too deep for this model's floors even at tier1", file=sys.stderr)
+        sys.exit(1)
+
+    if selected_tier != args.tier:
+        req_budget = req_target_bpw * total_params
+        fbw_bpw = TIER_BPW[selected_tier]
+        print(f"warning: {args.tier} infeasible for this model "
+              f"(floor {req_floor_bits / 8 / 1e9:.2f} GB > budget "
+              f"{req_budget / 8 / 1e9:.2f} GB), falling back to "
+              f"{selected_tier} ({fbw_bpw} bpw ≈ "
+              f"{fbw_bpw * total_params / 8 / 1e9:.2f} GB)", file=sys.stderr)
+
+    budget_bits = target_bpw * total_params
     cap_q = "Q8_0" if target_bpw >= 7.5 else "Q6_K"
-    levels, ladders, assignment, cur_bits, floor_bits = allocate(
+    levels, ladders, assignment, cur_bits, alloc_floor_bits = allocate(
         groups, importance, tensors, base_type, budget_bits, cap_q=cap_q,
         mtp_blocks=mtp_blocks)
 
     est_gb = cur_bits / 8 / 1e9
     target_gb = budget_bits / 8 / 1e9
-    print(f"tier:      {args.tier} (target {target_bpw} bpw ≈ {target_gb:.2f} GB)",
+    fallback_note = (f" (fallback from {args.tier})"
+                     if selected_tier != args.tier else "")
+    print(f"tier:      {selected_tier}{fallback_note} "
+          f"(target {target_bpw} bpw ≈ {target_gb:.2f} GB)",
           file=sys.stderr)
-    print(f"estimated: {est_gb:.3f} GB  (floor {floor_bits / 8 / 1e9:.3f} GB, "
-          f"headroom used {(cur_bits - floor_bits) / 8 / 1e9:.3f} GB)", file=sys.stderr)
+    print(f"estimated: {est_gb:.3f} GB  (floor {alloc_floor_bits / 8 / 1e9:.3f} GB, "
+          f"headroom used {(cur_bits - alloc_floor_bits) / 8 / 1e9:.3f} GB)", file=sys.stderr)
 
     if args.dry_run:
         rows = []
