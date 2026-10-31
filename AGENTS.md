@@ -17,7 +17,7 @@ Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based
 | `scripts/estimate_size.py` | Predict GGUF size from a profile or config; `--compare` inspects tensor types × groups |
 | `scripts/detect_gguf_params.py` | Reads GGUF header to detect layers, arch, expert count (used by quantize.py) |
 | `scripts/grab_config.py` | Reverse direction: extracts a tensor-type config from an existing GGUF header; auto-detects MoE vs dense format |
-| `scripts/generate_dense_config.py` | Imatrix-importance-driven dense allocator: reads imatrix GGUF + source GGUF header (or tensor inventory JSON), groups tensors into role × zone, greedily promotes groups up the quant ladder under a tier1–15 size budget; emits anchored configs consumable by `quantize.py --config`. Primary dense path; static `dense-*` profiles stay as A/B controls |
+| `scripts/generate_dense_config.py` | Imatrix-importance-driven dense allocator: reads imatrix GGUF + source GGUF header (or tensor inventory JSON), groups tensors into role × zone, ranks them by importance and maps rank → quality continuum → quant ladder (rank-scale-bin); the tier sets the continuum's lower bound, not a size budget; emits anchored configs consumable by `quantize.py --config`. Primary dense path; static `dense-*` profiles stay as A/B controls |
 | `scripts/batch_quantize.py` | End-to-end batch runner: HF download → imatrix → `quantize.py` tiers → HF/S3 upload; resumable state, `--speed` variant |
 
 ### Shell scripts (legacy — named profiles: quality, balanced, compact, mini, nano, micro)

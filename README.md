@@ -96,7 +96,7 @@ APEX was built for MoE, where routed experts are most of the weights but only a 
 
 `scripts/generate_config.sh --arch dense` emits configs for dense and hybrid-attention models. `scripts/generate_sensitivity_configs.py` builds a perturbation sweep that measures how much KL divergence each tensor group costs per gigabyte saved, and `scripts/generate_opt_config.py` turns that curve into an allocation.
 
-**`scripts/generate_dense_config.py` is the primary dense path**: it reads the model's own imatrix and a tier (`tier1`–`tier15`), and allocates precision greedily — every tensor group starts at its floor and is promoted one step up the quant ladder in order of importance per gigabyte, until the tier's size budget is met. The static `dense-*` profiles remain as A/B controls.
+**`scripts/generate_dense_config.py` is the primary dense path**: it reads the model's own imatrix and a tier (`tier1`–`tier15`), and allocates precision by **rank-scale-bin** — tensor groups are ranked by imatrix importance from most- to least-quantizable, stretched linearly onto a quality continuum `[tier floor .. 100]` (the tier sets the floor, not a size budget: tier15 spans the full range, tier1 collapses it to the top), and the continuum is binned into equal bands over the quant ladder (`IQ1_S`…cap). The mapping is monotone in rank, so adjacent-by-importance groups can never jump apart the way budget knapsacks make them. Size in GB is no longer an input — it is the honest output of `estimate_size.py`. The static `dense-*` profiles remain as A/B controls.
 
 ```bash
 # generate the allocation (source GGUF header + imatrix GGUF + tier)
@@ -108,7 +108,7 @@ APEX was built for MoE, where routed experts are most of the weights but only a 
 ./scripts/quantize.py --config configs/my_dense.txt --imatrix imatrix.gguf model.gguf out.gguf
 ```
 
-The allocator encodes the two hard constraints the sensitivity sweep found: `token_embd` has zero imatrix coverage (it is a `get_rows` lookup), so it is floored at IQ2_S and only ever stepped along imatrix-free types — anything lower aborts at quantize time (rc=133). And because exchange rates do not extrapolate across precision, groups are ranked by imatrix importance but stepped along discrete ladders rather than priced with continuous bit moves; outside the near-full tiers the ladder caps at Q6_K, since measured allocations never buy Q8_0 away from full precision.
+The allocator encodes the two hard constraints the sensitivity sweep found: `token_embd` has zero imatrix coverage (it is a `get_rows` lookup), so it is floored at IQ2_S and stays on imatrix-free types — anything lower aborts at quantize time (rc=133); groups without an imatrix entry have no position on the continuum and stay parked at their floors. And the ladder's top anchor is tier-dependent: near-full tiers (tier1–2) anchor at Q8_0, every deeper tier at Q6_K, since measured allocations never buy Q8_0 away from full precision (6.1σ, mini-v2 arm). The tier floor slides the bottom of the continuum into the sub-IQ2_S deep rungs (`IQ1_S`…`IQ2_XS`) as the tier deepens — covered groups only.
 
 Measured on Qwen3.8-27B (64 layers, dense FFN, 3 linear-attention layers per full-attention layer). Full write-up in [benchmark_results/qwen38_27b/SENSITIVITY.md](benchmark_results/qwen38_27b/SENSITIVITY.md).
 

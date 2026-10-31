@@ -20,10 +20,11 @@ path needs special routing for dense GGUFs (arch auto-detected or --arch dense):
 
   * tier1–15 + --imatrix <imatrix.gguf>  →  the config is produced by the
     imatrix-driven allocator generate_dense_config.py (--tier <profile>,
-    --base from the resolved base type) — this is the primary dense path and
-    tracks the tier budget properly. Any tier fallback chosen by the allocator
-    (deeper tiers can be infeasible for a model's floors) is relayed to stderr
-    and reported in JSON as "dense_tier"/"dense_tier_fallback".
+    --base from the resolved base type) — this is the primary dense path.
+    The tier sets a quality floor, not a size budget, so the allocator can
+    no longer fail on an infeasible tier and never falls back; the resolved
+    tier is reported in JSON as "dense_tier" ("dense_tier_fallback" stays
+    in the schema for compatibility and is always false).
   * tier1–15 without --imatrix  →  falls back to the nearest static dense-*
     profile by size band (tier1–5 → dense-hybrid-quality, tier6–9 →
     dense-grad, tier10–15 → dense-flat) with a warning. Static dense-*
@@ -349,9 +350,10 @@ def detect_gguf_params(gguf_path):
 TIER_PROFILE_RE = re.compile(r"tier(?:[1-9]|1[0-5])$")
 
 # Static dense-* fallback for tier profiles without --imatrix: nearest dense-*
-# profile by target bpw band (TIER_BPW in generate_dense_config.py: tier1–5
-# ≥5.5 bpw, tier6–9 4.0–5.1 bpw, tier10–15 ≤3.7 bpw). Static dense-* profiles
-# bottom out in the Q4 band, so tier10–15 estimates overshoot the tier target.
+# profile by size band (legacy bands of the removed TIER_BPW budget table:
+# tier1–5 were ≥5.5 bpw, tier6–9 4.0–5.1, tier10–15 ≤3.7). Static dense-*
+# profiles bottom out in the Q4 band, so tier10–15 estimates overshoot what
+# the imatrix allocator would produce at those depths.
 DENSE_TIER_FALLBACK = {
     **{f"tier{n}": "dense-hybrid-quality" for n in range(1, 6)},
     **{f"tier{n}": "dense-grad" for n in range(6, 10)},
@@ -484,14 +486,13 @@ def main():
                 print(f"ERROR generating config: {e.stderr}", file=sys.stderr)
                 os.unlink(tmpfile.name)
                 sys.exit(1)
-            # Relay allocator diagnostics (imatrix coverage, tier fallback).
+            # Relay allocator diagnostics (imatrix coverage, quality band).
             sys.stderr.write(proc.stderr)
-            m = re.search(r"falling back to (tier\d+)", proc.stderr)
-            if m:
-                dense_tier = m.group(1)
-                dense_tier_fallback = True
-            else:
-                dense_tier = profile
+            # The rank-scale-bin allocator never falls back (a tier is a
+            # quality floor, not a budget), so the resolved tier is always
+            # the requested one; dense_tier_fallback stays false for the
+            # JSON schema.
+            dense_tier = profile
         else:
             gen_profile = profile
             if args.arch == "dense" and is_tier_profile and not args.imatrix:

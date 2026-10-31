@@ -31,29 +31,33 @@ Algorithm
     (alpha/beta), token_embd, output.weight. MTP/NextN tensors are pinned F16
     (spec-decode acceptance collapses if the draft head is quantized hard —
     see scripts/apex_mtp_patch_configs.py).
-3.  Map tier1–tier15 to a target bits-per-weight budget. TIER_BPW is derived
-    from the MoE tier ladder (generate_config.PROFILES) translated through the
-    dense quant ladder and smoothed to a convex decreasing curve; it brackets
-    the MoE reference calibration (Mellum2-12B-A2.5B tier sizes) at every
-    tier. --target-bpw overrides the table.
-    If the requested tier's budget is below the model's floor allocation
-    (every group at its floor + base_type for unclassified tensors), the
-    script does not fail: it walks from the requested tier towards tier1 and
-    uses the nearest (deepest) feasible tier, printing a warning to stderr
-    (exit code stays 0).
-4.  Greedy knapsack: start every covered group at its floor, rank candidate
-    promotions by importance per GB saved, and repeatedly promote the highest
-    ranked group one step up the discrete quant ladder while the estimated
-    size stays under budget. Stepping the ladder (rather than pricing
-    arbitrary bit moves) respects measured convexity: exchange rates do not
-    extrapolate across precision (benchmark_results/qwen38_27b/SENSITIVITY.md,
-    "Two limits found the hard way").
-    Then an exchange pass makes the bpw spread endogenous in tier depth:
-    while a valuable promotion is blocked by the budget, the least valuable
-    covered groups are demoted down the deep rungs (IQ1_S … IQ2_XS, covered
-    groups only) to fund it — one ladder step at a time, cheapest
-    importance-per-GB first. Deep tiers therefore demote more (bottom drops,
-    top climbs); shallow tiers see no blocked promotions and are unchanged.
+3.  Rank the imatrix-covered groups by importance (mu) in ascending order —
+    from the most quantizable (lowest mu) to the least quantizable (highest).
+    The tier no longer maps to a size budget: it sets the LOWER BOUND of a
+    quality continuum [0..100], linear in the tier number
+    (tier t → 100*(15-t)/14: tier15 spans the full range with floor 0,
+    tier7 starts at 50, tier1 collapses the range to the single top point).
+4.  Rank-scale-bin: the ordered groups are stretched linearly onto
+    [tier_floor .. 100] — the most quantizable group lands exactly on the
+    tier floor, the least quantizable one on 100 (the ladder cap), the rest
+    spread evenly between by rank. Ranking is ordinal (group ranks, not raw
+    mu values), so imatrix outliers do not distort the spread, and groups
+    are never clamped: the whole ordered set scales. The continuum is then
+    binned into equal-width bands over the discrete quant ladder
+    (IQ1_S … cap); a group takes the rung its position falls into. The
+    mapping is monotone in rank, so adjacent-by-importance groups cannot
+    jump apart — the budget knapsack produced non-physical jumps (Nemotron-3
+    Nano-4B tier15: blk.9 attn Q5_K → blk.10 attn IQ1_M → blk.32 attn
+    Q5_K); rank-scale-bin excludes them by construction.
+    The TOP anchor is tier-dependent: near-full tiers (reference budget
+    >= 7.5 bpw — tier1, tier2) anchor at Q8_0, every deeper tier at Q6_K
+    (Q8_0 away from near-full tiers measured worse, 6.1σ —
+    benchmark_results/qwen38_27b/SENSITIVITY.md, mini-v2 arm). The bottom
+    of the continuum slides into the deep rungs (IQ1_S … IQ2_XS) as the
+    tier deepens — the tier-depth demotion of the removed exchange pass
+    falls out of the scaling for free.
+    Size in GB is no longer an input at any point: it is the honest output
+    of estimate_size.py, not an echo of a budget.
 5.  Emit anchored ``^blk\\.N\\.<tensor>$=<quant>`` lines — llama-quantize
     matches with std::regex_search, unanchored first-match-wins
     (llama-quant.cpp:694; a bare ``output.weight`` would also capture
@@ -65,12 +69,14 @@ Hard constraints (measured, SENSITIVITY.md):
     IQ2_S; it is never assigned IQ2_XXS or below, and no-coverage groups are
     only ever stepped along a K-quant-only "safe ladder".
   * The deep rungs (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS) exist only on the covered
-    ladder: no-coverage groups are never demoted into them and never promoted
-    through them (rc=133 touches only tensors without an imatrix entry).
+    ladder: no-coverage groups are never binned into them (rc=133 touches
+    only tensors without an imatrix entry).
   * output keeps its Q3_K floor on every tier (dearest group on the measured
-    curve — never parked below it, never demoted).
-  * no-coverage groups are promoted last (undefined importance), so
-    token_embd bottoms out at IQ2_S in the bands where allocation matters.
+    curve — never parked below it). The floor clamp can locally override the
+    continuum for floored groups; everywhere else rank monotonicity holds.
+  * no-coverage groups have no position on the continuum (undefined
+    importance) and stay parked at their SAFE_LADDER floors, so token_embd
+    bottoms out at IQ2_S on every tier.
 
 Output is directly consumable by:
     ./scripts/quantize.py --config <out.txt> model.gguf out.gguf
@@ -114,42 +120,24 @@ SAFE_LADDER = ["IQ2_S", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
 DEEP_RUNGS = ["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS"]
 COVERED_LADDER = DEEP_RUNGS + LADDER
 
-# Target average bits-per-weight (over all params) per tier.
-#
-# Derived from the MoE tier structure (generate_config.PROFILES), not
-# hand-picked: each MoE role rank is translated through the dense LADDER
-# (mixed mode: expert ranks via QUANTS_RANKED_SIZE, other roles via
-# QUANTS_RANKED_SPEED; each quant snapped to its nearest dense-ladder rung by
-# estimate_size.BPW) and averaged over a typical dense param distribution —
-# FFN 70% (edge/near/mid zones 10/10/80), attention 26% (edge/mid 10/90),
-# token_embd + output.weight 4%; shared-expert slots have no dense counterpart
-# and get zero weight. The raw per-tier averages oscillate around their trend
-# (tier triplets differ by a single rank) and tiers 13–15 collapse (rank 6 =
-# IQ1_M clamps to the dense ladder's IQ2_S floor), so the points are smoothed
-# with a least-squares quadratic — a convex decreasing parabola whose steps
-# flatten with depth, matching the MoE reference calibration (Mellum2-12B-
-# A2.5B, generate_config.py tiers): converted to GB at 12 B params the curve
-# brackets the measured tier1..13 sizes 11.35 … 4.79 GB within ±7% at every
-# tier. Monotone tier1 > … > tier15, convex (bpw deltas 0.58 → 0.13 shrink
-# with depth — late ladder steps save fewer bits per weight, exactly the
-# flattening the MoE reference shows).
-TIER_BPW = {
-    "tier1": 7.65,
-    "tier2": 7.07,
-    "tier3": 6.53,
-    "tier4": 6.02,
-    "tier5": 5.55,
-    "tier6": 5.11,
-    "tier7": 4.71,
-    "tier8": 4.34,
-    "tier9": 4.00,
-    "tier10": 3.70,
-    "tier11": 3.43,
-    "tier12": 3.20,
-    "tier13": 3.00,
-    "tier14": 2.84,
-    "tier15": 2.71,
-}
+# Tier → quality-continuum lower bound. A tier no longer encodes a size
+# budget (the old TIER_BPW table is gone — see allocate()): it sets how far
+# down the quality scale the most quantizable group may be pushed. Linear in
+# the tier number: tier t → 100*(15-t)/14 (tier15 → 0 = full continuum,
+# tier1 → 100 = everything at the cap).
+
+def tier_quality_floor(tier):
+    """Lower bound of the quality continuum for a tier1–tier15 profile."""
+    return 100.0 * (15 - int(tier[len("tier"):])) / 14
+
+
+# Top anchor of the continuum per tier. From the old measured budget
+# calibration (TIER_BPW: tier1 7.65, tier2 7.07, tier3+ <= 6.53 bpw) only
+# the anchor fork survives: tiers whose reference budget was >= 7.5 bpw
+# anchor at Q8_0, every deeper tier at Q6_K — Q8_0 away from near-full
+# tiers measured worse by 6.1σ (benchmark_results/qwen38_27b/SENSITIVITY.md,
+# mini-v2 arm: output at Q8_0 funded by cutting an already-Q3 FFN lost).
+TIER_CAP = {f"tier{t}": ("Q8_0" if t <= 2 else "Q6_K") for t in range(1, 16)}
 
 # Groups whose first ladder step is above IQ2_S (output.weight is the dearest
 # group on the measured curve — 15.3x token_embd — never park it at the very
@@ -449,8 +437,9 @@ def build_ladders(groups, importance, cap_q="Q6_K"):
     Returns (ladders, floors): ladders maps group key -> quant list
     (COVERED_LADDER — incl. the sub-IQ2_S deep rungs — for imatrix-covered
     groups, SAFE_LADDER otherwise, both truncated at the cap), floors maps
-    group key -> floor ladder index. Floors are tier-independent: the deep
-    rungs are reachable only through demotion (allocate), never by parking.
+    group key -> floor ladder index. Floors are tier-independent; on deep
+    tiers the continuum itself positions covered groups onto the deep rungs,
+    while no-coverage groups are never binned below their IQ2_S floor.
     """
     cap_idx_cov = (COVERED_LADDER.index(cap_q) if cap_q in COVERED_LADDER
                    else len(COVERED_LADDER) - 1)
@@ -470,251 +459,81 @@ def build_ladders(groups, importance, cap_q="Q6_K"):
     return ladders, floors
 
 
-def floor_bits(groups, importance, tensors, base_type, cap_q="Q6_K",
-               mtp_blocks=frozenset()):
-    """Estimated bits with every group parked at its floor (no greedy walk).
+def allocate(groups, importance, cap_q, tier_floor):
+    """Rank-scale-bin allocation: importance rank → quality continuum → ladder.
 
-    This is the feasibility pre-pass: if it exceeds the budget, no allocation
-    under that budget (and that ladder cap) exists.
-    """
-    ladders, floors = build_ladders(groups, importance, cap_q)
-    assignment = {}
-    for key, members in groups.items():
-        for name, _ in members:
-            assignment[name] = ladders[key][floors[key]]
-    return total_bits(tensors, assignment, base_type, mtp_blocks)
+    Covered groups (with an imatrix entry) are ranked by importance mu in
+    ascending order — most quantizable first — and stretched linearly onto
+    the quality continuum [tier_floor .. 100]: the lowest-mu group lands
+    exactly on the tier floor, the highest-mu one on 100 (the ladder cap),
+    the rest spread evenly in between by rank. Ranking is ordinal (group
+    ranks, not raw mu values), so imatrix outliers do not distort the spread,
+    and groups are never clamped to the bounds — the whole ordered set
+    scales. The continuum is binned into equal-width bands over the group's
+    ladder; a group takes the rung its position falls into. Binning is
+    monotone in position, so adjacent-by-importance groups never land more
+    than adjacent rungs apart — the non-physical quant jumps of the removed
+    budget knapsack (importance determined by budget remainder, not mu) are
+    excluded by construction.
 
+    No-coverage groups have no position on the continuum (undefined
+    importance) and stay parked at their SAFE_LADDER floors. Explicit
+    GROUP_FLOORS entries (output → Q3_K) are enforced as a lower clamp after
+    binning — a measured constraint that may locally override the continuum
+    for floored groups. The MoE -1 convention (ffn_down never below
+    ffn_gate/ffn_up of the same zone) is enforced last, by raising ffn_down;
+    with no size budget to defend, the convention always wins.
 
-def allocate(groups, importance, tensors, base_type, budget_bits, cap_q="Q6_K",
-             mtp_blocks=frozenset(), demote_depth=0):
-    """Greedy ladder allocation under a bit budget.
+    *cap_q* truncates the ladder from the top: measured allocations never buy
+    Q8_0 away from the near-full tiers (TIER_CAP). There is no size budget
+    anywhere in this function — the tier only positions the continuum, and
+    the resulting size is whatever estimate_size.py reports afterwards.
 
-    Returns {(group_key): ladder_index} plus diagnostics. Every group starts
-    at its floor; promotions are ranked by importance per GB saved and applied
-    one ladder step at a time while the budget holds. The MoE -1 convention
-    (ffn_down never below ffn_gate/ffn_up of the same zone) is enforced
-    throughout.
-
-    A second, exchange-shaped pass makes the bpw spread endogenous in tier
-    depth. Parking everything at its floor leaves the least important groups
-    at IQ2_S even when the budget is far too tight to lift the important ones
-    out of the floor band (tier15 on a 4B dense model: ~0.05 GB of headroom
-    over the floors → a ~1.4x bpw spread, vs ~3.7x on the MoE ladder). While
-    a valuable promotion is blocked by the budget, the least valuable covered
-    groups are demoted down COVERED_LADDER's deep rungs (IQ1_S … IQ2_XS) to
-    fund it. Each exchange moves bits from a lower importance-per-GB group to
-    a higher one — a strict improvement of the importance-weighted objective —
-    so the deeper the tier, the more exchanges pay off: the bottom drops
-    towards IQ1_M/IQ2_XXS while the top climbs to Q5_K/Q6_K, and shallow
-    tiers (no blocked promotions) are left untouched. How far below IQ2_S a
-    group may fall is itself tier-dependent (*demote_depth*, derived from the
-    tier number in main): deep tiers may demote into the IQ1_M band, shallow
-    tiers keep the sub-IQ2_S rungs out of reach entirely, so the bpw spread
-    grows monotonically with tier depth. Groups with an explicit
-    GROUP_FLOORS entry (output) and all no-coverage groups are never demoted:
-    sub-IQ2_S types need the importance matrix at quantize time (rc=133
-    otherwise), which only covered tensors can legally use.
-
-    *cap_q* caps the ladder: measured allocations never buy Q8_0 away from
-    the near-full tiers — output at Q8_0 funded by cutting an already-Q3 FFN
-    lost by 6.1σ (SENSITIVITY.md, mini-v2). Only tiers with target >= 7.5 bpw
-    get the full ladder; everyone else caps at Q6_K.
-
-    Raises ValueError when the budget is below the floor allocation — the
-    caller (main) runs the tier-fallback walk; this function no longer
-    exits on infeasible tiers.
+    Returns (levels, ladders, assignment, positions) where positions maps
+    every group key to its continuum position in [tier_floor..100] (None for
+    no-coverage groups, which have none).
     """
     ladders, floors = build_ladders(groups, importance, cap_q)
 
-    levels = dict(floors)
+    covered = sorted((k for k in groups if k in importance),
+                     key=lambda k: importance[k])
+    n = len(covered)
+    positions = {k: None for k in groups}
+    levels = {}
+    for i, key in enumerate(covered):
+        # Even spread: lowest mu → tier floor, highest mu → 100. A single
+        # covered group is both ends of the scale; it takes the top.
+        pos = (100.0 if n == 1
+               else tier_floor + (100.0 - tier_floor) * i / (n - 1))
+        positions[key] = pos
+        ladder = ladders[key]
+        rung = min(int(pos * len(ladder) / 100.0), len(ladder) - 1)
+        # Only explicit GROUP_FLOORS entries (output) clamp the continuum;
+        # the IQ2_S default floor in `floors` is a no-coverage constraint —
+        # covered groups may bin into the sub-I2_S deep rungs (they are the
+        # successors of the removed demote_depth mechanism).
+        if key[0] in GROUP_FLOORS:
+            rung = max(rung, floors[key])
+        levels[key] = rung
+
+    # No-coverage tail: no importance, no continuum position — parked.
+    for key in groups:
+        if key not in importance:
+            levels[key] = floors[key]
+
+    # MoE -1 convention: ffn_down at/above ffn_gate/ffn_up of its zone.
+    for key in list(levels):
+        if key[0] != "ffn_down" or len(key) < 2:
+            continue
+        peers = [levels.get((p, key[1])) for p in ("ffn_gate", "ffn_up")]
+        need = max((p for p in peers if p is not None), default=0)
+        levels[key] = min(max(levels[key], need), len(ladders[key]) - 1)
+
     assignment = {}
     for key, members in groups.items():
         for name, _ in members:
             assignment[name] = ladders[key][levels[key]]
-
-    cur_bits = total_bits(tensors, assignment, base_type, mtp_blocks)
-    floor_bits_ = cur_bits
-    if floor_bits_ > budget_bits:
-        raise ValueError(
-            f"floor allocation needs {floor_bits_ / 8 / 1e9:.2f} GB, "
-            f"budget is {budget_bits / 8 / 1e9:.2f} GB — tier too deep for "
-            f"this model's floors")
-
-    def group_numel(key):
-        return sum(n for _, n in groups[key])
-
-    def step_bits(key, from_idx, to_idx):
-        """Bits ADDED by moving key from ladder index from_idx to to_idx."""
-        ladder = ladders[key]
-        return (BPW[ladder[to_idx]] - BPW[ladder[from_idx]]) * group_numel(key)
-
-    def set_level(key, idx):
-        levels[key] = idx
-        for name, _ in groups[key]:
-            assignment[name] = ladders[key][idx]
-
-    def follow_convention(key):
-        """Keep ffn_down at/above a promoted ffn_gate/ffn_up (MoE -1 convention)."""
-        nonlocal cur_bits
-        if key[0] not in ("ffn_gate", "ffn_up"):
-            return
-        dkey = ("ffn_down", key[1])
-        if dkey not in groups:
-            return
-        ladder = ladders[dkey]
-        while levels[dkey] < levels[key] and levels[dkey] + 1 < len(ladder):
-            delta = step_bits(dkey, levels[dkey], levels[dkey] + 1)
-            if cur_bits + delta > budget_bits:
-                break  # size gate wins over the soft -1 convention
-            set_level(dkey, levels[dkey] + 1)
-            cur_bits += delta
-
-    def promote_pass(covered, skip=frozenset()):
-        """Greedy one-step-up walk ranked by importance per GB saved.
-
-        *covered* selects the class: imatrix-covered groups (importance-
-        ranked) or the no-coverage tail (undefined importance, promoted
-        only once the covered class can no longer absorb budget).
-        """
-        nonlocal cur_bits
-        while True:
-            best = None  # (ratio, is_down, numel, key, delta_bits)
-            for key in groups:
-                if covered:
-                    if key not in importance or key in skip:
-                        continue
-                elif key in importance:
-                    continue
-                i = levels[key]
-                ladder = ladders[key]
-                if i + 1 >= len(ladder):
-                    continue
-                delta_bits = step_bits(key, i, i + 1)
-                if delta_bits <= 0:
-                    continue
-                if cur_bits + delta_bits > budget_bits:
-                    continue
-                if covered:
-                    # Rank by importance mass per GB: (mu * numel) / delta_gb.
-                    # numel cancels, so this is mu / delta_bpw —
-                    # size-independent, matching the measured per-GB exchange
-                    # rates (SENSITIVITY.md). Ranking raw mu per GB instead
-                    # would flood tiny groups (attn_v, ssm_small) with bits.
-                    ratio = importance[key] * group_numel(key) / (delta_bits / 8e9)
-                else:
-                    ratio = 0.0
-                cand = (ratio, 1 if key[0] == "ffn_down" else 0,
-                        group_numel(key), key, delta_bits)
-                if best is None or cand[:3] > best[:3]:
-                    best = cand
-            if best is None:
-                break
-            _, _, _, key, _ = best
-            set_level(key, levels[key] + 1)
-            cur_bits += best[4]
-            follow_convention(key)
-
-    promote_pass(covered=True)
-
-    # ── Exchange pass: tier-depth demotions ─────────────────────────────────
-    # Rung moves are ranked here by raw importance per weight (mu), not by
-    # the mass-per-GB of the promotion passes: the value/cost ratio of ANY
-    # single-rung move of a group is mu (both objective delta and bit cost
-    # scale with Δbpw × numel), so mu is the honest exchange rate between a
-    # sacrifice and a climb. Mass-per-GB would veto demoting the large
-    # low-mu mid-zone groups — their importance *mass* is huge even though
-    # their importance *per weight* is the lowest — which is exactly the
-    # deep-tier transfer the spread needs (demote big mid groups a few rungs
-    # to fund multi-step climbs of small high-mu edge groups).
-    #
-    # Sacrificed groups are frozen below their floor: they never climb back
-    # during the exchange (that would undo the transfer) nor in the final
-    # absorb pass (the budget that funded their demotion is spent on better
-    # groups).
-    demoted = set()
-
-    def demote_floor_idx(key):
-        # Explicit GROUP_FLOORS entries (output) keep their floor even under
-        # demotion; every other covered group may slide down to IQ1_S.
-        return (floors[key] if key[0] in GROUP_FLOORS
-                else max(0, floors[key] - demote_depth))
-
-    def can_demote(key):
-        i = levels[key]
-        if i <= demote_floor_idx(key):
-            return False
-        if key[0] == "ffn_down":
-            for peer in ("ffn_gate", "ffn_up"):
-                p = levels.get((peer, key[1]))
-                if p is not None and i - 1 < p:
-                    return False
-        return True
-
-    def freeable_bits(exclude):
-        """Bits freed by demoting every legal candidate to its demote floor."""
-        total = 0.0
-        for key in groups:
-            if (key not in importance or key[0] in GROUP_FLOORS
-                    or key == exclude):
-                continue
-            i = levels[key]
-            while i - 1 >= demote_floor_idx(key):
-                if key[0] == "ffn_down" and not can_demote(key):
-                    break
-                total += step_bits(key, i - 1, i)
-                i -= 1
-        return total
-
-    while True:
-        # Every promotion the budget currently blocks, highest mu first.
-        proms = []
-        for key in groups:
-            if key not in importance or key in demoted:
-                continue
-            i = levels[key]
-            ladder = ladders[key]
-            if i + 1 >= len(ladder):
-                continue
-            delta_bits = step_bits(key, i, i + 1)
-            if delta_bits <= 0 or cur_bits + delta_bits <= budget_bits:
-                continue
-            proms.append((importance[key], key, delta_bits))
-        proms.sort(reverse=True)
-        if not proms:
-            break  # nothing blocked: floors + headroom already spread it
-
-        # Fund the best blocked promotion that cheaper sacrifices (lower mu)
-        # can cover; an unfundable one (step larger than everything cheaper
-        # can free) must not trigger sacrifice for nothing.
-        chosen = None
-        for mu, pkey, pdelta in proms:
-            dems = sorted(
-                (importance[key], key) for key in groups
-                if key in importance and key[0] not in GROUP_FLOORS
-                and key != pkey and can_demote(key)
-                and importance[key] < mu)
-            if dems and pdelta <= freeable_bits(exclude=pkey):
-                chosen = (pkey, pdelta, dems[0][1])
-                break
-        if chosen is None:
-            break
-
-        pkey, pdelta, dkey = chosen
-        freed = step_bits(dkey, levels[dkey] - 1, levels[dkey])
-        set_level(dkey, levels[dkey] - 1)
-        cur_bits -= freed
-        demoted.add(dkey)
-        if cur_bits + pdelta <= budget_bits:
-            set_level(pkey, levels[pkey] + 1)
-            cur_bits += pdelta
-            follow_convention(pkey)
-
-    # Absorb the leftover headroom: covered groups that were not sacrificed
-    # first, then the no-coverage tail (undefined importance).
-    promote_pass(covered=True, skip=demoted)
-    promote_pass(covered=False)
-
-    return levels, ladders, assignment, cur_bits, floor_bits_
+    return levels, ladders, assignment, positions
 
 
 # ── Emission ─────────────────────────────────────────────────────────────────
@@ -773,10 +592,10 @@ def parse_args(argv=None):
                      help="Tensor inventory JSON (name -> [numel, stays_f32])")
     p.add_argument("--imatrix", "-i", required=True,
                    help="Imatrix GGUF produced by llama-imatrix -o")
-    p.add_argument("--tier", "-t", required=True, choices=sorted(TIER_BPW),
-                   help="Tier profile (tier1 = near-full precision … tier15 = IQ2 band)")
-    p.add_argument("--target-bpw", type=float, default=None,
-                   help="Override the tier's target bits-per-weight budget")
+    p.add_argument("--tier", "-t", required=True, choices=sorted(TIER_CAP),
+                   help="Tier profile (tier1 = near-full precision … "
+                        "tier15 = full IQ1_S–cap continuum; sets the quality "
+                        "floor, not a size budget)")
     p.add_argument("--stat", choices=["mean", "p95"], default="mean",
                    help="Importance statistic: mean or 95th percentile of imatrix values")
     p.add_argument("--base", default="Q8_0",
@@ -836,96 +655,45 @@ def main(argv=None):
         if len(unclassified) > 10:
             print(f"  … and {len(unclassified) - 10} more", file=sys.stderr)
 
-    total_params = sum(n for _, n, _ in tensors)
-
-    # Feasibility walk: cap_q (Q8_0 vs Q6_K ladder) depends on the tier's
-    # target bpw, so the floor pre-pass must run per candidate tier rather
-    # than comparing raw budgets. Walk from the requested tier towards tier1
-    # and take the first (deepest) tier whose budget fits the floors.
-    tier_num = int(args.tier[len("tier"):])
-    selected_tier = None
-    req_target_bpw = args.target_bpw if args.target_bpw else TIER_BPW[args.tier]
-    req_floor_bits = None
-    last_fb = last_bpw = None
-    for cand in range(tier_num, 0, -1):
-        cand_tier = f"tier{cand}"
-        # --target-bpw overrides the requested tier's budget; once the walk
-        # falls back, shallower candidates use their own table budget (the
-        # warning reports a tier, not a custom target).
-        cand_bpw = (args.target_bpw if cand == tier_num and args.target_bpw
-                    else TIER_BPW[cand_tier])
-        budget_bits = cand_bpw * total_params
-        cap_q = "Q8_0" if cand_bpw >= 7.5 else "Q6_K"
-        fb = floor_bits(groups, importance, tensors, base_type, cap_q=cap_q,
-                        mtp_blocks=mtp_blocks)
-        if req_floor_bits is None:
-            req_floor_bits = fb
-        last_fb, last_bpw = fb, cand_bpw
-        if fb <= budget_bits:
-            selected_tier = cand_tier
-            target_bpw = cand_bpw
-            break
-
-    if selected_tier is None:
-        # Even tier1 cannot host the floors — nothing shallower exists.
-        print(f"error: floor allocation needs {last_fb / 8 / 1e9:.2f} GB, "
-              f"budget is {last_bpw * total_params / 8 / 1e9:.2f} GB — tier "
-              "too deep for this model's floors even at tier1", file=sys.stderr)
-        sys.exit(1)
-
-    if selected_tier != args.tier:
-        req_budget = req_target_bpw * total_params
-        fbw_bpw = TIER_BPW[selected_tier]
-        print(f"warning: {args.tier} infeasible for this model "
-              f"(floor {req_floor_bits / 8 / 1e9:.2f} GB > budget "
-              f"{req_budget / 8 / 1e9:.2f} GB), falling back to "
-              f"{selected_tier} ({fbw_bpw} bpw ≈ "
-              f"{fbw_bpw * total_params / 8 / 1e9:.2f} GB)", file=sys.stderr)
-
-    budget_bits = target_bpw * total_params
-    cap_q = "Q8_0" if target_bpw >= 7.5 else "Q6_K"
-    # Tier-dependent demotion depth: how many rungs below the IQ2_S floor a
-    # covered group may be demoted into (DEEP_RUNGS: IQ2_XS, IQ2_XXS, IQ1_M,
-    # IQ1_S). Spread between the most and least compressed groups must grow
-    # with tier depth — deep tiers slide low-importance groups into the
-    # IQ1_M/IQ2_XXS band to fund climbs to the Q5_K/Q6_K ceiling, shallow
-    # tiers never leave the floor band. Linear in the tier number: tier1 → 0
-    # (no demotion), tier5 → 0, tier10 → IQ2_XS, tier15 → IQ1_M.
-    demote_depth = (int(selected_tier[len("tier"):]) - 1) * 3 // 14
-    levels, ladders, assignment, cur_bits, alloc_floor_bits = allocate(
-        groups, importance, tensors, base_type, budget_bits, cap_q=cap_q,
-        mtp_blocks=mtp_blocks, demote_depth=demote_depth)
+    # Rank-scale-bin: the tier positions the quality continuum and picks the
+    # ladder cap; no size budget exists anywhere in the pipeline. Size is a
+    # post-hoc estimate, not a target.
+    cap_q = TIER_CAP[args.tier]
+    q_floor = tier_quality_floor(args.tier)
+    levels, ladders, assignment, positions = allocate(
+        groups, importance, cap_q, q_floor)
+    cur_bits = total_bits(tensors, assignment, base_type, mtp_blocks)
 
     est_gb = cur_bits / 8 / 1e9
-    target_gb = budget_bits / 8 / 1e9
-    fallback_note = (f" (fallback from {args.tier})"
-                     if selected_tier != args.tier else "")
-    print(f"tier:      {selected_tier}{fallback_note} "
-          f"(target {target_bpw} bpw ≈ {target_gb:.2f} GB)",
+    print(f"tier:      {args.tier} (quality band {q_floor:.0f}–100, "
+          f"ladder cap {cap_q})", file=sys.stderr)
+    print(f"estimated: {est_gb:.3f} GB  (not budget-constrained: the tier "
+          "sets a quality floor, estimate_size reports the size)",
           file=sys.stderr)
-    print(f"estimated: {est_gb:.3f} GB  (floor {alloc_floor_bits / 8 / 1e9:.3f} GB, "
-          f"headroom used {(cur_bits - alloc_floor_bits) / 8 / 1e9:.3f} GB)", file=sys.stderr)
 
     if args.dry_run:
         rows = []
         for key in sorted(groups, key=lambda k: (k[0], k[1] if len(k) > 1 else "")):
             numel = sum(n for _, n in groups[key])
             imp = importance.get(key)
+            pos = positions.get(key)
             rows.append((
                 key[0],
                 key[1] if len(key) > 1 else "-",
                 f"{imp:.5g}" if imp is not None else "no-cov",
+                f"{pos:.1f}" if pos is not None else "-",
                 ladders[key][levels[key]],
                 numel,
                 numel * BPW[ladders[key][levels[key]]] / 8 / 1e9,
             ))
-        print(f"\n{'group':<14}{'zone':<6}{'importance':>12}{'quant':>9}"
-              f"{'params':>14}{'est GB':>10}")
-        print("-" * 66)
+        print(f"\n{'group':<14}{'zone':<6}{'importance':>12}{'pos':>6}"
+              f"{'quant':>9}{'params':>14}{'est GB':>10}")
+        print("-" * 72)
         for r in rows:
-            print(f"{r[0]:<14}{r[1]:<6}{r[2]:>12}{r[3]:>9}{r[4] / 1e6:>13.1f}M{r[5]:>10.3f}")
-        print("-" * 66)
-        print(f"{'TOTAL':<41}{sum(r[4] for r in rows) / 1e9:>13.2f} B{est_gb:>10.3f}")
+            print(f"{r[0]:<14}{r[1]:<6}{r[2]:>12}{r[3]:>6}{r[4]:>9}"
+                  f"{r[5] / 1e6:>13.1f}M{r[6]:>10.3f}")
+        print("-" * 72)
+        print(f"{'TOTAL':<47}{sum(r[5] for r in rows) / 1e9:>13.2f} B{est_gb:>10.3f}")
         return
 
     lines = emit_config(layers, levels, ladders, mtp_names)
