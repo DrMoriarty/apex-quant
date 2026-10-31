@@ -46,6 +46,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
+import contextlib
 import io
 import os
 import re
@@ -292,6 +293,55 @@ def with_retries(what: str, fn, attempts: int = RETRY_ATTEMPTS,
     raise AssertionError("unreachable")
 
 
+def stream_with_retries(what: str, open_stream, skip_resume: bool = False,
+                        finish=None, attempts: int = RETRY_ATTEMPTS):
+    """Yield an HTTP response body with resume-on-drop retries.
+
+    with_retries wraps only the request open — a connection drop in the
+    middle of the body (httpx.RemoteProtocolError etc.) used to escape and
+    kill the whole transfer.  This helper owns the body iteration instead:
+    `open_stream(done)` is called per attempt with the number of bytes
+    already delivered and must return an iterable of chunks.  With
+    `skip_resume` (unconditional full GET that cannot seek to an offset)
+    the body restarts at 0 and the first `done` bytes are discarded;
+    otherwise `open_stream` must request the body from byte offset `done`
+    itself (Range GET), so already-received megabytes are never re-read.
+    `finish(done)` runs after the body ends (e.g. a short-body check);
+    anything it raises is fatal.  Transport errors and _RetryableStatus
+    (5xx/429, also at open time) restart the read with the same backoff as
+    with_retries; every other exception propagates immediately.
+    """
+    done = 0
+    delay = 1.0
+    for attempt in range(1, attempts + 1):
+        try:
+            skip = done if skip_resume else 0
+            with contextlib.closing(open_stream(done)) as chunks:
+                for chunk in chunks:
+                    if skip:
+                        take = min(len(chunk), skip)
+                        skip -= take
+                        chunk = chunk[take:]
+                        if not chunk:
+                            continue
+                    done += len(chunk)
+                    yield chunk
+            if finish is not None:
+                finish(done)
+            return
+        except Exception as exc:
+            if not isinstance(exc, (httpx.TransportError, _RetryableStatus)):
+                raise
+            if attempt == attempts:
+                raise RuntimeError(
+                    f"{what} failed after {attempts} attempts: {exc}") from exc
+            sys.stderr.write(f"\n{what}: {exc} — retrying in {delay:.0f}s "
+                             f"({attempt}/{attempts - 1})\n")
+            time.sleep(delay)
+            delay = min(30, delay * 2)
+    raise AssertionError("unreachable")
+
+
 def _hf_retryable(exc: BaseException) -> bool:
     """Is an error escaping huggingface_hub / hf_xet transient?
 
@@ -509,45 +559,65 @@ class S3Client:
             raise RuntimeError(f"not found: s3://{bucket}/{key}")
 
     def get_range_iter(self, bucket: str, key: str, offset: int, length: int):
-        """Yield chunks of bytes [offset, offset+length) of an object."""
+        """Yield chunks of bytes [offset, offset+length) of an object.
+
+        A mid-body drop resumes from the received offset with a fresh
+        Range request; a server that ignores Range (HTTP 200) or a short
+        body stays fatal.
+        """
         url = self._url(bucket, key)
-        headers = self._headers("GET", url, extra={
-            "Range": f"bytes={offset}-{offset + length - 1}",
-            "Accept-Encoding": "identity"})
-        with self.client.stream("GET", url, headers=headers) as resp:
-            if resp.status_code >= 500 or resp.status_code == 429:
-                raise _RetryableStatus(resp.status_code)
-            if resp.status_code >= 300:
-                raise RuntimeError(f"S3 range GET: HTTP {resp.status_code}")
-            if offset > 0 and resp.status_code != 206:
+
+        def open_stream(done: int):
+            start = offset + done
+            headers = self._headers("GET", url, extra={
+                "Range": f"bytes={start}-{offset + length - 1}",
+                "Accept-Encoding": "identity"})
+            with self.client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    raise _RetryableStatus(resp.status_code)
+                if resp.status_code >= 300:
+                    raise RuntimeError(
+                        f"S3 range GET: HTTP {resp.status_code}")
+                if start > 0 and resp.status_code != 206:
+                    raise RuntimeError(
+                        "S3 range GET: server ignored Range (HTTP 200) — "
+                        "resume is not possible")
+                for chunk in resp.iter_bytes(READ_CHUNK):
+                    yield chunk
+
+        def finish(done: int):
+            if done < length:
                 raise RuntimeError(
-                    "S3 range GET: server ignored Range (HTTP 200) — "
-                    "resume is not possible")
-            remaining = length
-            for chunk in resp.iter_bytes(READ_CHUNK):
-                remaining -= len(chunk)
-                yield chunk
-            if remaining > 0:
-                raise RuntimeError(
-                    f"S3 range GET: got {length - remaining}/{length} bytes")
+                    f"S3 range GET: got {done}/{length} bytes")
+
+        yield from stream_with_retries("S3 range GET", open_stream,
+                                       finish=finish)
 
     def get_full_iter(self, bucket: str, key: str):
         """Yield the entire object with a single unconditional GET.
 
         Large byte-range GETs stall on some S3 proxies (they hang instead
         of returning partial data), so full-object downloads stream
-        unconditionally rather than via Range requests.
+        unconditionally rather than via Range requests.  On a mid-body
+        drop the full GET is re-issued and the already-delivered prefix
+        is discarded client-side (there is no way to seek into a
+        non-Range body).
         """
         url = self._url(bucket, key)
-        headers = self._headers("GET", url,
-                                extra={"Accept-Encoding": "identity"})
-        with self.client.stream("GET", url, headers=headers) as resp:
-            if resp.status_code >= 500 or resp.status_code == 429:
-                raise _RetryableStatus(resp.status_code)
-            if resp.status_code >= 300:
-                raise RuntimeError(f"S3 GET: HTTP {resp.status_code}")
-            for chunk in resp.iter_bytes(READ_CHUNK):
-                yield chunk
+
+        def open_stream(_done: int):
+            headers = self._headers("GET", url,
+                                    extra={"Accept-Encoding": "identity"})
+            with self.client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    raise _RetryableStatus(resp.status_code)
+                if resp.status_code >= 300:
+                    raise RuntimeError(f"S3 GET: HTTP {resp.status_code}")
+                for chunk in resp.iter_bytes(READ_CHUNK):
+                    yield chunk
+
+        yield from stream_with_retries("S3 GET", open_stream,
+                                       skip_resume=True)
 
     def put_stream(self, bucket: str, key: str, gen, size: int) -> None:
         url = self._url(bucket, key)
@@ -762,26 +832,39 @@ class HFClient:
         return int(size)
 
     def get_range_iter(self, uri: URI, offset: int, length: int):
+        """Yield bytes [offset, offset+length) of a repo file.
+
+        A mid-body drop (httpx.RemoteProtocolError etc.), a 5xx/429 at
+        open time or mid-stream resumes from the received offset with a
+        fresh Range request; a server that ignores Range (HTTP 200) or a
+        short body stays fatal.
+        """
         url = self.resolve_url(uri)
-        headers = self._headers({
-            "Range": f"bytes={offset}-{offset + length - 1}",
-            "Accept-Encoding": "identity"})
-        with self.client.stream("GET", url, headers=headers) as resp:
-            if resp.status_code >= 500 or resp.status_code == 429:
-                raise _RetryableStatus(resp.status_code)
-            if resp.status_code >= 300:
-                raise RuntimeError(f"HF range GET: HTTP {resp.status_code}")
-            if offset > 0 and resp.status_code != 206:
-                raise RuntimeError(
-                    "HF range GET: server ignored Range (HTTP 200) — "
-                    "resume is not possible")
-            remaining = length
-            for chunk in resp.iter_bytes(READ_CHUNK):
-                remaining -= len(chunk)
-                yield chunk
-            if remaining > 0:
-                raise RuntimeError(
-                    f"HF range GET: got {length - remaining}/{length} bytes")
+
+        def open_stream(done: int):
+            start = offset + done
+            headers = self._headers({
+                "Range": f"bytes={start}-{offset + length - 1}",
+                "Accept-Encoding": "identity"})
+            with self.client.stream("GET", url, headers=headers) as resp:
+                if resp.status_code >= 500 or resp.status_code == 429:
+                    raise _RetryableStatus(resp.status_code)
+                if resp.status_code >= 300:
+                    raise RuntimeError(
+                        f"HF range GET: HTTP {resp.status_code}")
+                if start > 0 and resp.status_code != 206:
+                    raise RuntimeError(
+                        "HF range GET: server ignored Range (HTTP 200) — "
+                        "resume is not possible")
+                for chunk in resp.iter_bytes(READ_CHUNK):
+                    yield chunk
+
+        def finish(done: int):
+            if done < length:
+                raise RuntimeError(f"HF range GET: got {done}/{length} bytes")
+
+        yield from stream_with_retries("HF range GET", open_stream,
+                                       finish=finish)
 
     def list(self, uri: URI):
         """Yield (kind, full_path, size) for one repo directory."""
