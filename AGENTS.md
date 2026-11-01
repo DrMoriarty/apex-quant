@@ -4,104 +4,84 @@
 
 APEX quantizes MoE (and dense/hybrid) GGUF models via per-layer, per-tensor-type precision assignments using llama.cpp's `--tensor-type-file`. No C patches — everything is config-driven.
 
-## Key scripts and their roles
+## Directory layout: `scripts/` vs `old_scripts/`
 
-Two parallel interfaces exist — shell (legacy profiles) and Python (tier-based profiles). The Python scripts are the current primary interface shown in README.
+- `scripts/` — the active Python interface (tier profiles, dense allocator, batch runner, cloud copy). Nothing here is a shell script.
+- `old_scripts/` — the legacy shell interface (`generate_config.sh`, `quantize.sh`, `apex_pipeline.sh`, `eval.sh`, `benchmark.sh`, `estimate_config_size.py`, sensitivity/MTP/plot scripts, `push_to_hf.sh`). NOT dead code: `tests/test_generate_config.sh` still runs against `old_scripts/generate_config.sh` and `old_scripts/estimate_config_size.py`, and these scripts produced the published APEX quants. Don't delete or "modernize" them without checking the tests.
 
-### Python scripts (primary — tier profiles: tier1–tier15, dense-*)
-
-| Script | Purpose |
-|--------|---------|
-| `scripts/generate_config.py` | Emits tensor-type file; supports `--profile`, `--edge-exp`, `--layers`, `--dense-layers`, `--arch`. Quant mode flags: `--speed` / `--size` / `--mixed` (default `mixed`: experts IQ-band, rest K-quants) |
-| `scripts/quantize.py` | Quantize GGUF; `--profile`, `--config`, `--imatrix`, `--dry-run`, `--generate-config` |
-| `scripts/estimate_size.py` | Predict GGUF size from a profile or config; `--compare` inspects tensor types × groups |
-| `scripts/detect_gguf_params.py` | Reads GGUF header to detect layers, arch, expert count (used by quantize.py) |
-| `scripts/grab_config.py` | Reverse direction: extracts a tensor-type config from an existing GGUF header; auto-detects MoE vs dense format |
-| `scripts/generate_dense_config.py` | Imatrix-importance-driven dense allocator: reads imatrix GGUF + source GGUF header (or tensor inventory JSON), groups tensors into role × zone, ranks them by importance and maps rank → quality continuum → quant ladder (rank-scale-bin); the tier sets the continuum's lower bound, not a size budget; emits anchored configs consumable by `quantize.py --config`. Primary dense path; static `dense-*` profiles stay as A/B controls |
-| `scripts/batch_quantize.py` | End-to-end batch runner: HF download → imatrix → `quantize.py` tiers → HF/S3 upload; resumable state, `--speed` variant |
-
-### Shell scripts (legacy — named profiles: quality, balanced, compact, mini, nano, micro)
+## Active scripts (`scripts/`)
 
 | Script | Purpose |
 |--------|---------|
-| `scripts/generate_config.sh` | Emits a tensor-type file for `llama-quantize --tensor-type-file` |
-| `scripts/quantize.sh` | Wraps generate + llama-quantize; selects profile, finds binary |
+| `generate_config.py` | Emits tensor-type file; `--profile` (tier1–tier15, i-tierN, dense-*), `--layers`, `--dense-layers`, `--arch moe\|dense`. Quant modes: `--speed`/`--size`/`--mixed` (default `mixed`: experts IQ-band table, rest K-quant speed table). Extra role-shift modifiers (`--edge-exp`, `--mid-attn`, `--embd-type`, …) and dense overrides (`--linattn`, `--fullattn`, `--embd`, `--output-type`, `--f16-tensors`) |
+| `quantize.py` | Quantize GGUF; `--profile` (default tier1), `--config`, `--imatrix`, `--dry-run`, `--generate-config`, `--base-type` (default Q8_0). Auto-loads `.env`, auto-detects layers/arch/experts via `detect_gguf_params.py` |
+| `estimate_size.py` | Predict GGUF size from a profile or config; `--compare` shows tensor types × groups; also accepts `--imatrix`, `--dense-layers`, quant mode flags |
+| `detect_gguf_params.py` | Reads GGUF header: layers, arch, expert count (used by quantize.py) |
+| `grab_config.py` | Reverse direction: extracts a tensor-type config from an existing GGUF header; auto-detects MoE vs dense format |
+| `generate_dense_config.py` | Primary dense path. Imatrix-importance-driven allocator: reads imatrix GGUF + source GGUF header (or `--inventory` tensor JSON), ranks tensor groups by importance, maps rank → quality continuum → quant ladder. `--tier` (tier1–15) sets the continuum's lower bound, NOT a size budget. Emits anchored configs for `quantize.py --config` |
+| `batch_quantize.py` | End-to-end runner: HF download → imatrix → quantize tiers (default `--tiers 1-15`) → HF/S3 upload. Resumable state in `--workspace` (default `~/apex_batch`) |
+| `cloudcp.py` | s3cmd-like `cp`/`ls`/`rm` across `s3://`, `hf://` and local paths; streaming, resumable (Range / S3 multipart ListParts) |
+| `batch_perplexity.py` | Batch perplexity/KLD eval of quants from S3 or HF; saves `<model>-perplexity-report.txt` and uploads it back |
+| `generate_imatrix_calibration.py` | Builds imatrix calibration file from a text block + rendered tool conversations (needs `transformers` tokenizer, HF model id — not a .gguf) |
+| `reduce_calibration.py` | Shrinks a calibration text file, preserving text diversity (`-light`/`-ultralight` variants) |
+| `s3_proxy.py` | Read-only S3 HTTP proxy; reads the same `S3_*` env vars as `batch_quantize.py` |
 
-### Shared scripts
+## Canonical workflow
 
-| Script | Purpose |
-|--------|---------|
-| `scripts/cloudcp.py` | s3cmd-like `cp`/`ls`/`rm` across `s3://`, `hf://` and local paths; streaming, resumable (Range / S3 multipart ListParts) |
-| `scripts/estimate_config_size.py` | Predicts GGUF size from a config + tensor inventory |
-| `scripts/eval.sh` | Runs PPL, KL, HellaSwag, Winogrande, MMLU, ARC, TruthfulQA, speed; outputs JSON |
-| `scripts/benchmark.sh` | Batch benchmarking with TSV output and optional plots |
-| `scripts/batch_perplexity.py` | Batch perplexity/KLD eval of quants from S3 or HF; saves `<model>-perplexity-report.txt` and uploads it back |
-| `scripts/apex_pipeline.sh` | Full pipeline: download → convert → quantize → imatrix → eval → publish (YAML-driven) |
-| `scripts/generate_sensitivity_configs.py` | Builds perturbation sweep configs for measuring tensor-group sensitivity |
-| `scripts/generate_opt_config.py` | Turns a measured sensitivity curve into an allocation config |
-| `scripts/generate_imatrix_calibration.py` | Builds imatrix calibration file from a text block + rendered tool conversations (needs `transformers` tokenizer, HF model id — not a .gguf) |
-| `scripts/apex_mtp_patch_configs.py` | Bumps the MTP draft layer (`blk.40.*`, nextn tensors) to F16 in `*_mtp` configs — spec-decode acceptance collapses if the draft head is quantized hard |
-| `scripts/s3_proxy.py` | Read-only S3 HTTP proxy; reads the same `S3_*` env vars as `batch_quantize.py` |
-| `scripts/push_to_hf.sh` | Uploads GGUFs to HuggingFace |
-
-## Canonical workflow (Python interface)
-
-Operational order — always size-check before the 6-hour quantize:
+Operational order — always size-check before the multi-hour quantize:
 
 1. `scripts/estimate_size.py --profile <p> --layers N <model>.gguf` → predict target size from a profile.
 2. `scripts/generate_config.py --profile <p> --layers N [--dense-layers N] [--arch moe|dense]` → emit the tensor-type file.
-3. Re-verify the config lands in the target band with `estimate_size.py` (or `estimate_config_size.py` for a raw config). This is the gate before quantizing.
-4. `scripts/quantize.py --profile <p> --config <cfg> <input>.gguf <out>.gguf` → run the quantize (`--dry-run` skips the write; `--generate-config` re-emits).
+3. Re-verify the config lands in the target band (`estimate_size.py --config <cfg>`). This is the gate before quantizing.
+4. `scripts/quantize.py --profile <p> --config <cfg> <input>.gguf <out>.gguf` (`--dry-run` skips the write).
 
-Shell equivalents: `scripts/generate_config.sh` + `scripts/quantize.sh` (selects profile, finds the `llama-quantize` binary, wraps generate → quantize).
+For dense models skip step 2's profile and use `generate_dense_config.py` instead (see below).
 
 ## Running tests
 
 ```bash
-./tests/test_generate_config.sh   # bash; tests generate_config.sh (regression guards + dense mode)
-./tests/test_config_collisions.py  # python3; checks for regex pattern conflicts across all configs
+./tests/test_generate_config.sh     # bash; regression guards + dense mode, runs old_scripts/generate_config.sh
+python3 tests/test_config_collisions.py
+python3 tests/test_cloudcp_stream_retry.py
 ```
 
-Both must pass. The bash test asserts committed configs reproduce byte-for-byte from the generator. The Python test replays regex matching against real tensor name fixtures (`tests/fixtures/`) to catch silent first-match-wins collisions.
+All three must pass. `test_generate_config.sh` asserts committed configs reproduce byte-for-byte from the legacy generator and enforces the dense experiment arms are size-matched (≤0.20 GB spread — an A/B between allocations is uninterpretable otherwise). `test_config_collisions.py` replays llama-quantize's regex matching against real tensor-name fixtures (`tests/fixtures/`, header dumps of published GGUFs) to catch silent first-match-wins collisions.
 
 ## Critical implementation detail: regex anchoring
 
-llama-quantize matches `--tensor-type-file` entries with `std::regex_search` — **unanchored, first match wins**. An unanchored `output.weight` pattern captures `blk.N.attn_output.weight` and silently mis-quantizes all attention output projections. The dense emitter (`generate_config.sh`) uses `^...$` anchored patterns for this reason. The MoE emitter uses unanchored patterns but relies on tensor name structure (e.g., `ffn_gate_exps` differs from `ffn_gate`). Test `test_config_collisions.py` guards against these collisions.
+llama-quantize matches `--tensor-type-file` entries with `std::regex_search` — **unanchored, first match wins** (`src/llama-quant.cpp`). An unanchored `output.weight` pattern captures `blk.N.attn_output.weight` and silently mis-quantizes all attention output projections. Dense configs use `^...$` anchored patterns for this reason (`generate_config.py` dense path and `old_scripts/generate_config.sh`); the MoE emitter uses unanchored patterns but relies on tensor-name structure (`ffn_gate_exps` ≠ `ffn_gate`). Known-benign ambiguity (guarded by `test_config_collisions.py`): unanchored `blk.N.attn_q` also matches `attn_qkv.weight`, but every MoE profile assigns both the same type — one edit away from a real bug.
 
 ## MoE vs dense/hybrid architecture
 
-- `--arch moe` (default): emits `ffn_gate_exps`, `ffn_gate_shexp`, etc. Standard MoE model path.
-- `--arch dense`: emits `ffn_gate.weight` (with `.weight` suffix), `token_embd.weight`, `output.weight`, full-attn vs linear-attn tensors. For models with no experts. For the primary dense path use `scripts/generate_dense_config.py` instead (imatrix-driven, tier1–15); the static `dense-*` profiles are A/B controls. The dense allocator enforces two measured constraints: `token_embd` has zero imatrix coverage → IQ2_S floor, imatrix-free ladder only (very-low-bit types abort, rc=133); ladder capped at Q6_K except near-full tiers (Q8_0 allocations away from full precision measured worse).
-- `--dense-layers N`: leading dense (non-MoE) FFN layers inside an MoE model (e.g., LFM2, Step-3.x). Incompatible with `--arch dense` — the test suite explicitly rejects this combination.
+- `--arch moe` (default): emits `ffn_gate_exps`, `ffn_gate_shexp`, etc. Standard MoE path.
+- `--arch dense`: for models with no experts. Emits `ffn_gate.weight` (with `.weight` suffix), `token_embd.weight`, `output.weight`, and splits attention into full-attn vs linear-attn tensors (`--linattn`/`--fullattn`).
+- `--dense-layers N`: leading dense (non-MoE) FFN layers inside an MoE model (e.g., LFM2). Incompatible with `--arch dense`.
+- Dense allocation (`generate_dense_config.py`) enforces measured constraints, don't "fix" them: `token_embd` has zero imatrix coverage → floor IQ2_S and imatrix-free ladder only (types needing imatrix, e.g. IQ2_XXS, abort at quantize time with rc=133); ladder capped at Q6_K except tiers 1–2 (Q8_0 away from near-full precision measured worse); `output.weight` keeps a Q3_K floor (dearest group on the measured curve). Static `dense-*` profiles (`dense-flat`, `dense-grad`, `dense-hybrid`, `dense-hybrid-quality`) are size-matched A/B controls, not the primary path.
 
 ## Config naming convention
 
-`configs/{prefix}_{profile}.txt` where prefix identifies the model (e.g., `qwen35a3b`, `laguna_xs21`) and profile is one of:
-- **Legacy**: `quality`, `balanced`, `compact`, `mini`, plus I-variants and experimental tiers (`nano`, `micro`)
-- **Tier-based** (Python scripts): `tier1`–`tier15`
-- **Dense/hybrid**: `dense-flat`, `dense-grad`, `dense-hybrid`, `dense-hybrid-quality`
-
-Committed configs are the ground truth — `test_generate_config.sh` asserts the generator reproduces them byte-for-byte.
+`configs/{prefix}_{profile}.txt` where prefix identifies the model (e.g., `lfm25_8b`, `laguna_xs21`) and profile is a legacy name (`quality`, `balanced`, `compact`, `mini`, plus `nano`/`micro`), an I-variant, a dense profile (`dense_flat`, `dense_grad`, …, `opt_*` for the Qwen3.8 experiment). 200+ committed configs are the ground truth — `test_generate_config.sh` asserts the generator reproduces them byte-for-byte. Tier-profile configs are generated on the fly, not committed.
 
 ## Model definitions
 
-`models/*.yaml` drive `apex_pipeline.sh`. Fields: `model_id`, `layers`, `arch` (moe|dense), `config_prefix`, `hf_repo`, `source_gguf`, `calibration`, `eval_suite`, `baselines`.
-
-## Size estimation before quantizing
-
-Always use `scripts/estimate_size.py` (or `scripts/estimate_config_size.py` for raw config files) to verify a config hits the target size band before running a 6-hour quantize. The dense experiment arms must be size-matched (≤0.20 GB spread) or the A/B is uninterpretable — the bash test enforces this.
+`models/*.yaml` drive the pipeline. Single model currently: `qwen38_27b.yaml` — a dense-FFN/hybrid-attention pilot (64 layers, 3× linear-attn + 1× full-attn interleave, vision tower, real MTP/NextN head). Fields: `model_id`, `layers`, `arch` (moe|dense), `config_prefix`, `hf_repo`, `source_gguf`, `calibration`, `eval_suite`, `baselines`. `models/qwen38_27b_tensors.json` is the tensor inventory for `generate_dense_config.py --inventory`.
 
 ## Environment variables
 
-- `LLAMA_CPP_DIR` or `LLAMA_QUANTIZE` — path to llama.cpp build/bin or specific binary
-- `NUM_LAYERS` — override transformer layer count (default: 40)
-- `WORK_DIR` — pipeline working directory (default: `/workspace/data/apex`)
-- `NGL` — GPU layers for eval (default: 99)
+`quantize.py` and `batch_quantize.py` auto-load `.env` (see `.env.example`; git-ignored) without overwriting existing vars:
+
+- `LLAMA_QUANTIZE` — path to the `llama-quantize` binary; or `LLAMA_CPP_DIR` — llama.cpp build/bin dir
+- `LLAMA_GGUF_SPLIT`, `LLAMA_CONVERT_HF_TO_GGUF` — specific binaries for `batch_quantize.py` (converter is the vendored `llama-scripts/convert_hf_to_gguf.py`)
+- `HF_TOKEN` (or `HUGGING_FACE_HUB_TOKEN`) — HF download/upload
+- `S3_ENDPOINT`, `S3_TOKEN` or `S3_KEY_ID`/`S3_SECRET`, `S3_REGION` — S3 upload for batch runs
+- `NGL` — GPU layers for `batch_perplexity.py` (default 99)
+
+`NUM_LAYERS`/`WORK_DIR` only exist in `old_scripts/apex_pipeline.sh` and friends.
 
 ## No package manager / no CI
 
-This repo has no package.json, Makefile, pyproject.toml, CI workflows, or linter config. Scripts are standalone bash/python with `set -euo pipefail`. Python dependencies (see `requirements.txt`): `huggingface_hub`, `httpx` (S3/HF downloads in `cloudcp.py` and batch scripts), `rich`, `numpy`, `transformers` (calibration generation), `torch`/`sentencepiece`/`safetensors` (HF→GGUF conversion). `matplotlib` is commented out — only needed for `scripts/plot_*.py`. The `gguf` package is NOT pip-installed: it is vendored in `llama-scripts/gguf-py` and used via `llama-scripts/convert_hf_to_gguf.py`. Testing is manual: run the two test scripts above.
+No package.json, Makefile, pyproject.toml, CI workflows, or linter config. Scripts are standalone Python/bash. Python deps (`requirements.txt`): `huggingface_hub`, `httpx`, `rich`, `numpy`, `transformers` (calibration), `torch`/`sentencepiece`/`safetensors` (conversion); `matplotlib` commented out (only for plotting). The `gguf` package is NOT pip-installed: it is vendored in `llama-scripts/gguf-py` and used via `llama-scripts/convert_hf_to_gguf.py`. Testing is manual: run the three test scripts above.
 
 ## Secrets / git hygiene
 
-`.env` (git-ignored) holds `HF_TOKEN` and S3 upload keys (`S3_KEY_ID`/`S3_SECRET`/`S3_TOKEN`/`S3_ENDPOINT`/`S3_REGION`) — **never commit these**. `.gitignore` excludes `.env`, `*.gguf`, `*.bin`, `*.log`, `.venv/`; keep raw models and GGUFs out of git.
+`.env` holds `HF_TOKEN` and S3 keys — **never commit it**. `.gitignore` excludes `.env`, `*.gguf`, `*.bin`, `*.log`, `.venv/`; keep raw models and GGUFs out of git.
