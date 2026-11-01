@@ -130,9 +130,31 @@ def test_hf_range_iter_resumes():
     print("ok: HF get_range_iter resumes from offset after ReadTimeout")
 
 
+def test_hf_retryable_xet_internal_error():
+    # hf_xet surfaces server-side CAS failures as a PLAIN builtin Exception
+    # (pyo3 maps generic Rust errors to builtin Exception) — must retry.
+    exc = Exception("Internal error: invalid shard failed to verify "
+                    "cas info for xorb 0198f3aabb..; xorb not found")
+    assert cloudcp._hf_retryable(exc) is True, "xet Internal error not retried"
+    # Auth errors stay fatal: XetAuthenticationError subclasses
+    # PermissionError (when hf_xet is importable, use the real class).
+    auth = None
+    try:
+        from hf_xet import XetAuthenticationError
+        auth = XetAuthenticationError("denied")
+    except ImportError:
+        auth = PermissionError("401 Unauthorized")
+    assert cloudcp._hf_retryable(auth) is False, "auth error retried!"
+    # Unrelated plain exceptions stay fatal.
+    assert cloudcp._hf_retryable(Exception("something else")) is False
+    print("ok: _hf_retryable treats xet 'Internal error:' as transient, "
+          "auth errors fatal")
+
+
 if __name__ == "__main__":
     test_range_iter_resumes_from_offset()
     test_full_iter_discards_prefix_and_redownloads()
     test_fetch_concurrent_survives_part_drop()
     test_hf_range_iter_resumes()
+    test_hf_retryable_xet_internal_error()
     print("ALL PASS")

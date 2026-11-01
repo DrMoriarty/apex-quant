@@ -350,6 +350,19 @@ def _hf_retryable(exc: BaseException) -> bool:
     connections with the class name "ConnectionError" — sometimes not the
     builtin type.  Everything else (auth/permission errors, missing repo,
     other 4xx) is fatal and must propagate unchanged.
+
+    hf_xet also surfaces server-side CAS failures as a PLAIN builtin
+    Exception (pyo3 maps generic Rust errors to builtin Exception, no
+    type marker), e.g. "Internal error: invalid shard failed to verify
+    cas info for xorb <hash>; xorb not found".  Those are transient
+    server-side faults, so any "Internal error:" message from the xet
+    path is treated as retryable (retry cost is bounded by
+    RETRY_ATTEMPTS backoff; xet dedups chunks by content hash, so the
+    retry re-transfers little).  The message check runs AFTER all type
+    checks below, so typed fatal errors keep their verdicts: in
+    particular XetAuthenticationError subclasses PermissionError and its
+    str() never starts with "internal error:", so auth failures are
+    never swallowed by this branch.
     """
     if isinstance(exc, (httpx.TransportError, _RetryableStatus)):
         return True
@@ -365,8 +378,16 @@ def _hf_retryable(exc: BaseException) -> bool:
         return status >= 500 or status == 429
     name = type(exc).__name__
     module = type(exc).__module__ or ""
-    return (isinstance(exc, ConnectionError) or name == "ConnectionError"
-            or module.startswith("hf_xet"))
+    if isinstance(exc, PermissionError):
+        # XetAuthenticationError subclasses PermissionError — auth failures
+        # are fatal even though its module is "hf_xet".
+        return False
+    if (isinstance(exc, ConnectionError) or name == "ConnectionError"
+            or module.startswith("hf_xet")):
+        return True
+    # Plain-Exception CAS failures from the hf_xet Rust backend: match by
+    # message only, after the type checks above (see docstring).
+    return str(exc).lower().startswith("internal error:")
 
 
 # ---------------------------------------------------------------------------
