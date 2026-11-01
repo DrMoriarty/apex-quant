@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Tests for scripts/generate_config.sh
+# Tests for old_scripts/generate_config.sh
 #
 # Two kinds of test live here:
 #   * REGRESSION GUARDS  — assert the MoE path still reproduces the configs that
@@ -14,8 +14,8 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-GEN="${REPO_ROOT}/scripts/generate_config.sh"
-EST="${REPO_ROOT}/scripts/estimate_config_size.py"
+GEN="${REPO_ROOT}/old_scripts/generate_config.sh"
+EST="${REPO_ROOT}/old_scripts/estimate_config_size.py"
 INVENTORY="${REPO_ROOT}/models/qwen38_27b_tensors.json"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
