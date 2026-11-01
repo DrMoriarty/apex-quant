@@ -7,7 +7,7 @@ APEX quantizes MoE (and dense/hybrid) GGUF models via per-layer, per-tensor-type
 ## Directory layout: `scripts/` vs `old_scripts/`
 
 - `scripts/` — the active Python interface (tier profiles, dense allocator, batch runner, cloud copy). Nothing here is a shell script.
-- `old_scripts/` — the legacy shell interface (`generate_config.sh`, `quantize.sh`, `apex_pipeline.sh`, `eval.sh`, `benchmark.sh`, `estimate_config_size.py`, sensitivity/MTP/plot scripts, `push_to_hf.sh`). NOT dead code: `tests/test_generate_config.sh` still runs against `old_scripts/generate_config.sh` and `old_scripts/estimate_config_size.py`, and these scripts produced the published APEX quants. Don't delete or "modernize" them without checking the tests.
+- `old_scripts/` — the legacy shell interface (`generate_config.sh`, `quantize.sh`, `apex_pipeline.sh`, `eval.sh`, `benchmark.sh`, `estimate_config_size.py`, sensitivity/MTP/plot scripts, `push_to_hf.sh`). Reference only: these scripts produced the published APEX quants, but nothing runs them (the test suite covers `scripts/` exclusively). Don't delete or "modernize" them.
 
 ## Active scripts (`scripts/`)
 
@@ -40,12 +40,21 @@ For dense models skip step 2's profile and use `generate_dense_config.py` instea
 ## Running tests
 
 ```bash
-./tests/test_generate_config.sh     # bash; regression guards + dense mode, runs old_scripts/generate_config.sh
-python3 tests/test_config_collisions.py
-python3 tests/test_cloudcp_stream_retry.py
+python3 tests/run_all.py
 ```
 
-All three must pass. `test_generate_config.sh` asserts committed configs reproduce byte-for-byte from the legacy generator and enforces the dense experiment arms are size-matched (≤0.20 GB spread — an A/B between allocations is uninterpretable otherwise). `test_config_collisions.py` replays llama-quantize's regex matching against real tensor-name fixtures (`tests/fixtures/`, header dumps of published GGUFs) to catch silent first-match-wins collisions.
+Single stdlib-unittest entry point (no package manager, no CI, no test dependencies). It discovers the unittest modules in `tests/` and additionally runs the two script-style tests as subprocesses; it returns a non-zero exit code if anything fails.
+
+| Module | Covers |
+|--------|--------|
+| `tests/test_generate_config.py` | `scripts/generate_config.py` behaviour: dense experiment arms (flat control / FFN gradient / full-vs-linear attention split), anchored-pattern regression (`attn_output` ≠ output head), `--arch dense` validation, tier1–15 profiles against `PROFILES` × quant modes (`--speed`/`--size`/`--mixed`), role-shift modifiers, edge/near/mid zoning, `--f16-tensors` |
+| `tests/test_generate_dense_config.py` | `scripts/generate_dense_config.py` imatrix allocator via `--inventory` + a synthetic imatrix GGUF (no model files): anchored patterns, full inventory coverage, `token_embd` IQ2_S floor on the imatrix-free ladder, Q6_K ladder cap (except tier1–2), `output.weight` Q3_K floor, importance-monotone allocation |
+| `tests/test_estimate_size.py` | `scripts/estimate_size.py` internals (`load_config`, `match_type`, `estimate`, `estimate_breakdown`) on synthetic tensors, plus the CLI `--json` schema and per-profile base types on a synthetic GGUF header |
+| `tests/test_reduce_calibration.py` | `scripts/reduce_calibration.py`: `-light`/`-ultralight` targets, even-stride diversity, sentence-boundary chunk splitting |
+| `tests/test_config_collisions.py` | Replays llama-quantize's regex matching against real tensor-name fixtures (`tests/fixtures/`, header dumps of published GGUFs) to catch silent first-match-wins collisions. Also runnable standalone: `python3 tests/test_config_collisions.py` |
+| `tests/test_cloudcp_stream_retry.py` | `scripts/cloudcp.py` stream-resume paths (Range GET, full GET, concurrent parts, HF). Also runnable standalone: `python3 tests/test_cloudcp_stream_retry.py` |
+
+The tests exercise `scripts/` only. Committed configs in `configs/` are frozen artifacts of the legacy generator (byte-for-byte reproduction is no longer asserted); regex-collision safety for them is guarded by `test_config_collisions.py`.
 
 ## Critical implementation detail: regex anchoring
 
