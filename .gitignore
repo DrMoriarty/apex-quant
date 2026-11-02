@@ -11,3 +11,4 @@ texts/
 .drcode/github_state.json
 .drcode/worktrees/
 .drcode/merge_reports/
+.drcode/stats.json

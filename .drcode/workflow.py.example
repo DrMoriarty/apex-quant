@@ -1,0 +1,302 @@
+"""drcode workflow hooks (template).
+
+ACTIVATION: rename this file to `workflow.py` (keep it in the project's
+`.drcode/` directory) and uncomment the hooks you need. drcode scaffolds
+this template on every start, but NEVER overwrites it — edit it in place.
+
+Each defined hook runs in an isolated subprocess (cwd = project root, or
+the task's worktree when per-task worktree isolation is on) and receives
+one JSON payload:
+
+    {"hook": "<name>",
+     "task": {"id", "title", "kind", "github_issue"},
+     "git":  {"branch": "<current branch or null>", "dirty": <bool>},
+     "worktree": {"path", "branch"}        <- only with task isolation on,
+     "project": {"path", "base_branch"}}   <- only on_research_accepted}
+
+Every hook is optional — an absent function simply skips its step. A hook
+failure (non-zero exit, timeout, malformed output) is NEVER fatal: it is
+written into the task's service-event log and the pipeline moves on — with
+one exception: on_review fails CLOSED (the task waits, the review is
+retried with backoff), because an unreachable reviewer must not wave a
+change through.
+
+============================================================================
+WHICH HOOKS TO UNCOMMENT (the three common setups)
+============================================================================
+
+1.  TASK ISOLATION + AUTOMATIC MERGE — the out-of-the-box degenerate
+    accept. You turned `task_isolation: worktree` on (project settings)
+    and want a working loop with no external review: every task develops
+    inside its own worktree on branch `drcode/<task-id>`, and when the
+    tester passes it the finished work is merged into your checkout
+    automatically. Uncomment exactly THREE hooks below: on_review (the
+    degenerate reviewer — accepts everything), on_accepted and
+    on_research_accepted (the mergers). on_review MUST be defined for the
+    merges to happen at all: the pipeline reaches on_accepted only
+    through an accepted review, so the always-accept reviewer unlocks
+    them. The helper functions between this docstring and the hooks are
+    already active — no other edits are needed. Afterwards: task done and
+    tester-passed means its commits are in your checkout's branch; each
+    merge is recorded in the task's service-event log ("accepted: merged
+    drcode/<id> into <branch>"). A CONFLICTED merge never touches your
+    checkout: it is reversed into the task's worktree (see
+    _merge_task_branch below) with a triage report in
+    .drcode/merge_reports/<task-id>.json — resolve there, then
+    `git merge --ff-only drcode/<id>`.
+
+2.  TASK ISOLATION, MANUAL MERGE. Tasks work in worktrees, but you merge
+    `drcode/<task-id>` into your branch by hand when you are ready.
+    Uncomment NOTHING: without hooks the pipeline simply reminds you
+    about every unmerged task branch.
+
+3.  EXTERNAL REVIEW (CI, a human, a PR gate) instead of the degenerate
+    one. Uncomment on_review and replace its body with real checks
+    ({"verdict": "pending"} while checks run, {"verdict": "reject",
+    "comment": "..."} sends the task back to development); keep
+    on_accepted / on_research_accepted uncommented too if the merge
+    itself should stay automatic — the real verdict then only decides
+    WHEN it happens.
+
+Optional extras (rarely needed):
+    on_task_start — check out a branch / inject instructions into the
+                    first prompt; only meaningful WITHOUT worktree
+                    isolation (with isolation the task already works on
+                    its own branch `drcode/<task-id>` in its own tree).
+    on_development_done — push / open a PR before testing starts.
+    on_tester_passed — install / deploy after every PASSED finalization
+                    (on a review-mode task after the on_accepted merge);
+                    build it from the pinned git.commit / worktree.branch,
+                    never from the mutating main checkout — the pipeline
+                    skips the hook over a half-done merge and re-runs it
+                    once the conflict is resolved (task.install_pending).
+
+SECURITY: workflow.py is arbitrary code executed with your full
+permissions. Only activate a workflow file you have read and trust.
+"""
+
+import subprocess
+from pathlib import Path
+
+
+def _git(*args, cwd=None):
+    """Shared helper: run git, return (returncode, combined output).
+    Never raises."""
+    proc = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=120
+    )
+    return proc.returncode, (proc.stdout + proc.stderr).strip()
+
+
+def _main_checkout(task):
+    """Shared helper: the user's main checkout — the tree whose
+    checked-out branch the task's work must finally land on.
+    on_research_accepted carries it in the payload ("project"."path");
+    for every other hook it is derived from git itself: the first entry
+    of `git worktree list` is always the main working tree, and the
+    hook's cwd (the task's worktree) belongs to the same repository."""
+    path = (task.get("project") or {}).get("path")
+    if path:
+        return Path(path)
+    code, out = _git("worktree", "list", "--porcelain")
+    if code == 0 and out:
+        return Path(out.splitlines()[0].removeprefix("worktree "))
+    return Path.cwd()
+
+
+def _merge_task_branch(task, what):
+    """Shared helper: THE DEGENERATE ACCEPT. Merge the finished task's
+    branch `drcode/<task-id>` into whatever branch the main checkout has
+    checked out right now (a fast-forward when possible, a merge commit
+    otherwise). A checkout with modified tracked files is left alone —
+    the branch is reported for a manual merge instead of fighting the
+    user's uncommitted work (untracked files, e.g. this very script, do
+    not block the merge). With isolation off the work already IS in the
+    shared tree: nothing to merge, returns None.
+
+    CONFLICTS never touch the user's checkout. When the task's worktree
+    exists and `drcode.merge_engine` is importable, the merge is REVERSED:
+    the engine merges the base branch INTO the task's worktree instead
+    (`drcode.merge_engine.merge_base_into_worktree`). A clean reversal is
+    fast-forwarded into the checkout (`--ff-only`); a conflict stays
+    half-done in the ISOLATED worktree — with a structured triage report
+    in `.drcode/merge_reports/<task-id>.json` — where it is resolved by
+    hand or by an agent, never in the shared tree (the old behaviour
+    aborted a conflicted merge in the user's checkout and told them to
+    "sort it out by hand" with zero context)."""
+    worktree = task.get("worktree")
+    if not worktree:
+        return None
+    branch = worktree["branch"]
+    main = _main_checkout(task)
+    code, head = _git("-C", str(main), "rev-parse", "--abbrev-ref", "HEAD")
+    base = head if code == 0 and head else "(detached HEAD)"
+    code, status = _git("-C", str(main), "status", "--porcelain", "-uno")
+    if code != 0:
+        return {
+            "text": f"{what}: branch {branch} NOT merged — {main} is not a "
+            f"usable git checkout; merge by hand: git merge {branch}"
+        }
+    if status:
+        return {
+            "text": f"{what}: branch {branch} NOT merged into {base} — the "
+            f"checkout has uncommitted changes; merge by hand when ready: "
+            f"git merge {branch}"
+        }
+    wt_path = worktree.get("path")
+    if wt_path and Path(wt_path).is_dir():
+        result = _merge_via_worktree(task, what, branch, base, main, Path(wt_path))
+        if result is not None:
+            return result
+    return _merge_in_checkout(what, branch, base, main)
+
+
+def _merge_via_worktree(task, what, branch, base, main, wt_path):
+    """The reversed merge through `drcode.merge_engine`, or None when the
+    engine is unavailable (very old drcode, a frozen bundle without the
+    module) — the caller then falls back to `_merge_in_checkout`."""
+    try:
+        from drcode import merge_engine
+    except ImportError:
+        return None
+    task_id = task["task"]["id"]
+    report = merge_engine.merge_base_into_worktree(
+        main, task_id, wt_path, base, branch=branch, save=True
+    )
+    if not report.ok:
+        return {
+            "text": f"{what}: branch {branch} NOT merged into {base} — "
+            f"{report.message}. Resolve by hand: git merge {branch}"
+        }
+    if report.conflicted:
+        remaining = ", ".join(f.path for f in report.remaining[:20])
+        report_path = merge_engine.report_path(main, task_id)
+        return {
+            "text": f"{what}: merge of {base} into {branch} FAILED — "
+            f"CONFLICT: the conflicted merge is parked in the task's "
+            f"worktree {wt_path} (the checkout is untouched); resolve the "
+            f"conflicts there ({remaining}), commit, then run "
+            f"`git merge --ff-only {branch}` from {main}. Triage report: "
+            f"{report_path}\n{report.summary()}"
+        }
+    code, out = _git("-C", str(main), "merge", "--ff-only", "--no-edit", branch)
+    if code != 0:
+        # The checkout moved on between the clean check and here (or the
+        # worktree merge was already merged): never force it.
+        return {
+            "text": f"{what}: fast-forward merge of {branch} into {base} "
+            f"FAILED ({main} is clean again — nothing was written); "
+            f"merge by hand: git merge {branch}:\n{out}"
+        }
+    return {"text": f"{what}: merged {branch} into {base}:\n{out}"}
+
+
+def _merge_in_checkout(what, branch, base, main):
+    """The direct merge into the user's checkout (the fallback when the
+    task's worktree is gone or the engine is unavailable). A conflicted
+    merge must not stay half-done in the shared checkout: every later
+    hook-merge would cascade ("the checkout has uncommitted changes").
+    Abort it — the tree returns to the pre-merge state and the branch is
+    reported for a manual merge instead. The abort is best-effort: when
+    the merge failed without starting (e.g. an unknown branch) it is a
+    harmless no-op, and its failure must not mask the original one."""
+    code, out = _git("-C", str(main), "merge", "--no-edit", branch)
+    if code != 0:
+        _git("-C", str(main), "merge", "--abort")
+        return {
+            "text": f"{what}: merge of {branch} into {base} FAILED — the "
+            f"conflicted merge was aborted ({main} is clean on {base} "
+            f"again); sort it out by hand (git merge {branch}):\n{out}"
+        }
+    return {"text": f"{what}: merged {branch} into {base}:\n{out}"}
+
+
+# def on_review(task):
+#     """Degenerate accept, part 1 of 3: the always-yes reviewer. Needed
+#     whenever you want the automatic merge (below) but have no external
+#     review to gate it — the pipeline runs on_accepted only after an
+#     accepted review, so this hook simply waves everything through.
+#     Replace the body later with real checks (setup 3 in the module
+#     docstring above)."""
+#     return {"verdict": "accept"}
+
+
+# def on_accepted(task):
+#     """Degenerate accept, part 2 of 3: auto-merge for development tasks.
+#     Runs right after the review accepted the tester-passed task (the
+#     pipeline's only path to on_accepted), BEFORE on_tester_passed — the
+#     install step sees the merged checkout. Merges `drcode/<task-id>`
+#     into the main checkout's current branch. Return {"text": "..."} for
+#     the task's service-event log."""
+#     return _merge_task_branch(task, "accepted")
+
+
+# def on_research_accepted(task):
+#     """Degenerate accept, part 3 of 3: auto-merge for RESEARCH tasks
+#     (they skip testing entirely and never reach on_accepted). Merges
+#     the docs branch `drcode/<task-id>` the same way; the payload also
+#     carries "project": {"path", "base_branch"} — _merge_task_branch
+#     prefers it when present. Return {"text": "..."} for the task's
+#     service-event log."""
+#     return _merge_task_branch(task, "research accepted")
+
+
+# def on_task_start(task):
+#     """Optional extra: before the FIRST activation of a task. Only
+#     meaningful WITHOUT worktree isolation (with isolation the task
+#     already works on its own branch `drcode/<task-id>` in its own
+#     worktree). MUST be idempotent: an abort leaves a dirty tree on the
+#     branch. Return {"instructions": "..."} to inject text into the
+#     coding agent's first prompt."""
+#     subprocess.run(
+#         ["git", "checkout", "-B", f"task/{task['task']['id']}"], check=True
+#     )
+#     return {
+#         "instructions": f"Commit your work to branch task/{task['task']['id']}."
+#     }
+
+
+# def on_development_done(task):
+#     """Optional extra: development finished, before testing (push,
+#     `gh pr create`, ...). Return {"text": "..."} to append context to
+#     the tester's prompt."""
+
+
+# def on_tester_passed(task):
+#     """Optional extra: right after the tester stamped the task PASSED
+#     and it is finalized (runs on every path to COMPLETED-after-PASSED) —
+#     the unconditional post-verification hook: install / deploy here.
+#     On a review-mode task it runs AFTER on_accepted, so the install
+#     sees the merged main checkout. Research tasks never trigger it
+#     (they skip testing). Return {"text": "..."} for the task's
+#     service-event log.
+#
+#     Install the VERIFIED commit, never "whatever lies in the checkout
+#     right now" — the checkout is a mutating shared resource whose state
+#     is not guaranteed (a half-done merge would ship conflict markers).
+#     The pipeline itself never runs this hook while the main checkout
+#     has MERGE_HEAD set: it skips, stamps task.install_pending and
+#     re-runs the hook once after the conflict is resolved."""
+#     import shutil
+#     import tempfile
+#     branch = (task.get("worktree") or {}).get("branch")
+#     if not branch:
+#         # No isolation: the shared checkout IS the verified tree.
+#         proc = subprocess.run(
+#             ["uv", "tool", "install", ".", "--force"], capture_output=True, text=True
+#         )
+#         return {"text": proc.stdout or proc.stderr}
+#     # Isolation: export the task branch's snapshot into a temporary
+#     # directory (no worktree registration, no race with its removal)
+#     # and install from there.
+#     src = tempfile.mkdtemp(prefix="drcode-install-")
+#     subprocess.run(
+#         f"git archive {branch} | tar -x -C {src}", shell=True, check=True
+#     )
+#     try:
+#         proc = subprocess.run(
+#             ["uv", "tool", "install", src, "--force"], capture_output=True, text=True
+#         )
+#     finally:
+#         shutil.rmtree(src, ignore_errors=True)
+#     return {"text": proc.stdout or proc.stderr}
