@@ -10,9 +10,11 @@ Asserts the documented measured constraints (AGENTS.md, "MoE vs dense/hybrid"):
   * every emitted pattern is anchored (^…$) — llama-quantize matches with
     std::regex_search, unanchored first-match-wins (llama-quant.cpp:694);
   * every quantizable inventory tensor is covered (no silent base-type leaks);
-  * token_embd has zero imatrix coverage -> IQ2_S floor on the imatrix-free
-    SAFE_LADDER, never a sub-IQ2_S deep rung;
-  * the ladder is capped at Q6_K except tiers 1–2 (Q8_0 anchor);
+  * token_embd has zero imatrix coverage -> tier-pinned quant from
+    TIER_TOKEN_EMBD on the imatrix-free SAFE_LADDER (tier1–3 Q8_0 …
+    tier13–15 Q3_K), exempt from the Q6_K ladder cap;
+  * the ladder is capped at Q6_K except tiers 1–2 (Q8_0 anchor) — token_embd
+    excepted per its tier table;
   * output.weight never parks below its Q3_K floor;
   * importance ranking is monotone: the more important group never gets a
     worse type, and flipping the importance ranking flips the allocation.
@@ -38,7 +40,7 @@ from estimate_size import ALWAYS_F32  # noqa: E402
 
 NLAYERS = 16  # zone_size=ceil(1.6)=2: edge 0-1,14-15; near 2-3,12-13; mid 4-11
 
-QUALITY = gdc.DEEP_RUNGS + gdc.LADDER  # ascending quality
+QUALITY = gdc.LADDER  # ascending quality
 
 
 def qrank(qtype):
@@ -178,25 +180,29 @@ class DenseAllocatorTests(unittest.TestCase):
 
     # ── measured constraints ─────────────────────────────────────────────
 
-    def test_token_embd_parked_at_iq2_s_floor(self):
-        # Zero imatrix coverage -> safe ladder, floor priority, on every tier.
-        for tier in ("tier1", "tier7", "tier13"):
+    def test_token_embd_tier_pinned(self):
+        # Zero imatrix coverage by nature (get_rows) -> quality is tier-pinned
+        # from TIER_TOKEN_EMBD, not continuum-binned.
+        for tier in sorted(gdc.TIER_TOKEN_EMBD):
             with self.subTest(tier=tier):
                 t = self.assigned(tier, "token_embd.weight")
-                self.assertEqual(t, "IQ2_S")
+                self.assertEqual(t, gdc.TIER_TOKEN_EMBD[tier])
                 self.assertIn(t, gdc.SAFE_LADDER,
                               "token_embd left the imatrix-free ladder")
-                self.assertNotIn(t, gdc.DEEP_RUNGS,
-                                 "token_embd must never take a sub-IQ2_S rung")
+        # Exempt from the TIER_CAP truncation: tier3 pins Q8_0 while every
+        # other group on tier3 caps at Q6_K.
+        self.assertEqual(self.assigned("tier3", "token_embd.weight"), "Q8_0")
 
     def test_ladder_capped_at_q6_k_except_tier1_2(self):
         for tier in ("tier3", "tier7", "tier13"):
             with self.subTest(tier=tier):
-                types = {q for _, q in self.rules(tier)}
+                # token_embd excluded: it is tier-pinned (TIER_TOKEN_EMBD) and
+                # exempt from the cap by specification.
+                types = {q for pat, q in self.rules(tier)
+                         if "token_embd" not in pat}
                 self.assertNotIn("Q8_0", types,
                                  f"{tier}: Q8_0 above the measured Q6_K cap")
-                allowed = set(gdc.DEEP_RUNGS) | set(
-                    gdc.LADDER[:gdc.LADDER.index("Q6_K") + 1])
+                allowed = set(gdc.LADDER[:gdc.LADDER.index("Q6_K") + 1])
                 self.assertLessEqual(types, allowed)
 
     def test_tier1_tier2_anchor_at_q8_0(self):

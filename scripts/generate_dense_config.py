@@ -65,9 +65,12 @@ Algorithm
 
 Hard constraints (measured, SENSITIVITY.md):
   * token_embd has ZERO imatrix coverage (get_rows, not matmul): very-low-bit
-    types requiring imatrix abort at quantize time (rc=133). token_embd floor:
-    IQ2_S; it is never assigned IQ2_XXS or below, and no-coverage groups are
-    only ever stepped along a K-quant-only "safe ladder".
+    types requiring imatrix abort at quantize time (rc=133), so it never
+    leaves the K-quant-only "safe ladder". Its quality is tier-pinned
+    (TIER_TOKEN_EMBD): tier1–3 → Q8_0, tier4–6 → Q6_K, tier7–9 → Q5_K,
+    tier10–12 → Q4_K, tier13–15 → Q3_K. token_embd is exempt from the
+    TIER_CAP ladder cap (tier3 gets Q8_0 while every other group caps at
+    Q6_K).
   * The deep rungs (IQ1_S/IQ1_M/IQ2_XXS/IQ2_XS) exist only on the covered
     ladder: no-coverage groups are never binned into them (rc=133 touches
     only tensors without an imatrix entry).
@@ -75,8 +78,8 @@ Hard constraints (measured, SENSITIVITY.md):
     curve — never parked below it). The floor clamp can locally override the
     continuum for floored groups; everywhere else rank monotonicity holds.
   * no-coverage groups have no position on the continuum (undefined
-    importance) and stay parked at their SAFE_LADDER floors, so token_embd
-    bottoms out at IQ2_S on every tier.
+    importance) and stay parked at their SAFE_LADDER floors; token_embd is
+    the tier-pinned exception (TIER_TOKEN_EMBD above).
 
 Output is directly consumable by:
     ./scripts/quantize.py --config <out.txt> model.gguf out.gguf
@@ -107,16 +110,21 @@ LADDER = ["IQ1_M", "IQ2_S", "Q3_K", "IQ4_NL", "Q5_K", "Q6_K", "Q8_0"]
 # Ladder for tensors WITHOUT imatrix coverage: only types known to quantize
 # without an importance entry. IQ3_XXS/IQ4_XS are skipped out of caution —
 # IQ2_XXS is measured to abort (rc=133) on the uncovered token_embd, and the
-# IQ3/IQ4 XS variants share the importance-dependent code path.
+# IQ3/IQ4 XS variants share the importance-dependent code path. The head rung
+# IQ1_S is currently unreachable: no-coverage groups park at their Q3_K
+# default floor or, for token_embd, at the TIER_TOKEN_EMBD rung (>= Q3_K) —
+# but any future code binning a no-coverage group below its floor would hit
+# the rc=133 abort, so it stays on the ladder as a guard.
 SAFE_LADDER = ["IQ1_S", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
 
 # Deep rungs below IQ2_S, ascending quality (effective BPW in
 # estimate_size.BPW: IQ1_S 1.5625 … IQ2_XS 2.3125). Sub-IQ2_S types are read
 # through the importance matrix at quantize time — quantizing them WITHOUT an
 # imatrix entry aborts (rc=133) — so they are legal only for groups WITH full
-# imatrix coverage. token_embd (zero coverage) and every other no-coverage
-# group stays on SAFE_LADDER above its IQ2_S floor; only covered groups may
-# be demoted into this band, and only on deep tiers (see allocate()).
+# imatrix coverage. token_embd (zero coverage) stays on SAFE_LADDER at its
+# TIER_TOKEN_EMBD rung and every other no-coverage group at its SAFE_LADDER
+# floor; only covered groups may be demoted into this band, and only on deep
+# tiers (see allocate()).
 #DEEP_RUNGS = ["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS"]
 COVERED_LADDER = LADDER
 
@@ -138,6 +146,20 @@ def tier_quality_floor(tier):
 # tiers measured worse by 6.1σ (benchmark_results/qwen38_27b/SENSITIVITY.md,
 # mini-v2 arm: output at Q8_0 funded by cutting an already-Q3 FFN lost).
 TIER_CAP = {f"tier{t}": ("Q8_0" if t <= 2 else "Q6_K") for t in range(1, 16)}
+
+# Tier-pinned quant for token_embd. token_embd has ZERO imatrix coverage by
+# nature (get_rows, not matmul), so it never rides the importance continuum:
+# instead of a flat floor its quality is a per-tier step down the
+# SAFE_LADDER. Rungs are indexed against the FULL SAFE_LADDER — token_embd is
+# exempt from TIER_CAP (tier3 wants Q8_0 here while every other group caps at
+# Q6_K).
+TIER_TOKEN_EMBD = {
+    **{f"tier{t}": "Q8_0" for t in range(1, 4)},
+    **{f"tier{t}": "Q6_K" for t in range(4, 7)},
+    **{f"tier{t}": "Q5_K" for t in range(7, 10)},
+    **{f"tier{t}": "Q4_K" for t in range(10, 13)},
+    **{f"tier{t}": "Q3_K" for t in range(13, 16)},
+}
 
 # Groups whose first ladder step is above IQ2_S (output.weight is the dearest
 # group on the measured curve — 15.3x token_embd — never park it at the very
@@ -439,7 +461,9 @@ def build_ladders(groups, importance, cap_q="Q6_K"):
     groups, SAFE_LADDER otherwise, both truncated at the cap), floors maps
     group key -> floor ladder index. Floors are tier-independent; on deep
     tiers the continuum itself positions covered groups onto the deep rungs,
-    while no-coverage groups are never binned below their IQ2_S floor.
+    while no-coverage groups are parked at their floors. token_embd is the
+    exception handled in allocate(): as a no-coverage group it gets the full
+    (uncapped) SAFE_LADDER and a tier-pinned rung from TIER_TOKEN_EMBD.
     """
     cap_idx_cov = (COVERED_LADDER.index(cap_q) if cap_q in COVERED_LADDER
                    else len(COVERED_LADDER) - 1)
@@ -459,7 +483,7 @@ def build_ladders(groups, importance, cap_q="Q6_K"):
     return ladders, floors
 
 
-def allocate(groups, importance, cap_q, tier_floor):
+def allocate(groups, importance, cap_q, tier_floor, tier=None):
     """Rank-scale-bin allocation: importance rank → quality continuum → ladder.
 
     Covered groups (with an imatrix entry) are ranked by importance mu in
@@ -477,10 +501,12 @@ def allocate(groups, importance, cap_q, tier_floor):
     excluded by construction.
 
     No-coverage groups have no position on the continuum (undefined
-    importance) and stay parked at their SAFE_LADDER floors. Explicit
-    GROUP_FLOORS entries (output → Q3_K) are enforced as a lower clamp after
-    binning — a measured constraint that may locally override the continuum
-    for floored groups. The MoE -1 convention (ffn_down never below
+    importance) and stay parked at their SAFE_LADDER floors — except
+    token_embd, which is tier-pinned instead (TIER_TOKEN_EMBD, indexed
+    against the full SAFE_LADDER: it is exempt from the *cap_q* truncation).
+    Explicit GROUP_FLOORS entries (output → Q3_K) are enforced as a lower
+    clamp after binning — a measured constraint that may locally override the
+    continuum for floored groups. The MoE -1 convention (ffn_down never below
     ffn_gate/ffn_up of the same zone) is enforced last, by raising ffn_down;
     with no size budget to defend, the convention always wins.
 
@@ -520,6 +546,15 @@ def allocate(groups, importance, cap_q, tier_floor):
     for key in groups:
         if key not in importance:
             levels[key] = floors[key]
+            # token_embd exception: zero coverage by nature (get_rows), so
+            # its quality is tier-pinned (TIER_TOKEN_EMBD) rather than a flat
+            # floor. Indexed against the FULL SAFE_LADDER — it is exempt from
+            # the TIER_CAP truncation build_ladders() applied (tier3 needs
+            # Q8_0 while the cap for every other group is Q6_K), so restore
+            # the uncapped ladder here.
+            if key == ("token_embd",) and tier is not None:
+                ladders[key] = list(SAFE_LADDER)
+                levels[key] = SAFE_LADDER.index(TIER_TOKEN_EMBD[tier])
 
     # MoE -1 convention: ffn_down at/above ffn_gate/ffn_up of its zone.
     for key in list(levels):
@@ -661,7 +696,7 @@ def main(argv=None):
     cap_q = TIER_CAP[args.tier]
     q_floor = tier_quality_floor(args.tier)
     levels, ladders, assignment, positions = allocate(
-        groups, importance, cap_q, q_floor)
+        groups, importance, cap_q, q_floor, tier=args.tier)
     cur_bits = total_bits(tensors, assignment, base_type, mtp_blocks)
 
     est_gb = cur_bits / 8 / 1e9
