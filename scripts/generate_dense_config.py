@@ -102,13 +102,13 @@ F32_FLOOR = 100_000  # norms/biases below this many elements stay F32
 
 # Discrete quant ladder, ascending quality. Effective BPW incl. super-block
 # overhead is in estimate_size.BPW.
-LADDER = ["IQ2_S", "IQ3_XXS", "Q3_K", "IQ4_XS", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
+LADDER = ["IQ1_M", "IQ2_S", "Q3_K", "IQ4_NL", "Q5_K", "Q6_K", "Q8_0"]
 
 # Ladder for tensors WITHOUT imatrix coverage: only types known to quantize
 # without an importance entry. IQ3_XXS/IQ4_XS are skipped out of caution —
 # IQ2_XXS is measured to abort (rc=133) on the uncovered token_embd, and the
 # IQ3/IQ4 XS variants share the importance-dependent code path.
-SAFE_LADDER = ["IQ2_S", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
+SAFE_LADDER = ["IQ1_S", "Q2_K", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
 
 # Deep rungs below IQ2_S, ascending quality (effective BPW in
 # estimate_size.BPW: IQ1_S 1.5625 … IQ2_XS 2.3125). Sub-IQ2_S types are read
@@ -117,8 +117,8 @@ SAFE_LADDER = ["IQ2_S", "Q3_K", "Q4_K", "Q5_K", "Q6_K", "Q8_0"]
 # imatrix coverage. token_embd (zero coverage) and every other no-coverage
 # group stays on SAFE_LADDER above its IQ2_S floor; only covered groups may
 # be demoted into this band, and only on deep tiers (see allocate()).
-DEEP_RUNGS = ["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS"]
-COVERED_LADDER = DEEP_RUNGS + LADDER
+#DEEP_RUNGS = ["IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS"]
+COVERED_LADDER = LADDER
 
 # Tier → quality-continuum lower bound. A tier no longer encodes a size
 # budget (the old TIER_BPW table is gone — see allocate()): it sets how far
@@ -452,7 +452,7 @@ def build_ladders(groups, importance, cap_q="Q6_K"):
         covered = key in importance
         ladder = COVERED_LADDER if covered else SAFE_LADDER
         ladders[key] = ladder[:cap_idx_cov + 1 if covered else cap_idx_safe + 1]
-        floor_q = GROUP_FLOORS.get(role, "IQ2_S")
+        floor_q = GROUP_FLOORS.get(role, "Q3_K")
         if floor_q not in ladders[key]:
             floor_q = ladders[key][0]
         floors[key] = ladders[key].index(floor_q)
